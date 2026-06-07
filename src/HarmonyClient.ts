@@ -338,6 +338,98 @@ export class HarmonyClient extends EventEmitter {
     }
     return response.json()
   }
+
+  async updateRole(
+    serverId: string,
+    roleId: string,
+    opts: {
+      name?: string
+      color?: string | null
+      position?: number
+      permissions?: string
+      mentionable?: boolean
+      hoist?: boolean
+    },
+  ): Promise<any> {
+    const response = await fetch(`${this.apiUrl}/api/v1/servers/${serverId}/roles/${roleId}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bot ${this.botToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(opts),
+    })
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to update role (${response.status})`)
+    }
+    return response.json()
+  }
+
+  async deleteRole(serverId: string, roleId: string): Promise<void> {
+    const response = await fetch(`${this.apiUrl}/api/v1/servers/${serverId}/roles/${roleId}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bot ${this.botToken}` },
+    })
+    if (!response.ok && response.status !== 204) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to delete role (${response.status})`)
+    }
+  }
+
+  async getChannelPermissionOverrides(channelId: string): Promise<any[]> {
+    const response = await fetch(
+      `${this.apiUrl}/api/v1/channels/${channelId}/permission-overrides`,
+      { headers: { 'Authorization': `Bot ${this.botToken}` } },
+    )
+    if (!response.ok) {
+      throw new Error(`Failed to fetch channel overrides: ${response.status}`)
+    }
+    return response.json() as Promise<any[]>
+  }
+
+  async upsertChannelPermissionOverride(
+    channelId: string,
+    body: {
+      target_type: 'role' | 'user'
+      role_id?: string
+      user_id?: string
+      allow_permissions: string
+      deny_permissions: string
+    },
+  ): Promise<any> {
+    const response = await fetch(
+      `${this.apiUrl}/api/v1/channels/${channelId}/permission-overrides`,
+      {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bot ${this.botToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+    )
+    if (response.status === 204) return null
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to upsert channel override (${response.status})`)
+    }
+    return response.json()
+  }
+
+  async deleteChannelPermissionOverrideForRole(channelId: string, roleId: string): Promise<void> {
+    const response = await fetch(
+      `${this.apiUrl}/api/v1/channels/${channelId}/permission-overrides/role/${roleId}`,
+      {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bot ${this.botToken}` },
+      },
+    )
+    if (!response.ok && response.status !== 204) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to delete channel override (${response.status})`)
+    }
+  }
   
   async editMessage(messageId: string, content: string | any[]): Promise<any> {
     const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}`, {

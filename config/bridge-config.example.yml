@@ -44,4 +44,7 @@ settings:
   # you can also toggle it per-invocation with the clone_roles slash option.
   # ADMINISTRATOR is never granted automatically - set it by hand in Harmony.
   cloneRoles: false
+  # Live Discord → Harmony sync for role definitions + channel permission
+  # overrides (not member assignments). Requires Harmony bot manage_channels.
+  syncPermissions: false
 

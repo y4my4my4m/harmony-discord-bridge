@@ -127,6 +127,24 @@ Harmony channels/categories/roles are reused by name).
   Administrator, the cloned Harmony role won't — set that by hand in Harmony.
 - Discord permissions that have no Harmony equivalent are dropped; the mapping
   is best-effort, so review the cloned roles afterwards.
+- When `clone_roles:true`, channel **permission overrides** for mapped channels
+  are also copied (role-based only).
+
+### Permission sync (`syncPermissions`)
+
+Set `settings.syncPermissions: true` for **live Discord → Harmony** updates:
+
+- Server role create / update / delete → matching Harmony roles (tracked in
+  `config/permission-sync.yml`)
+- Channel permission overwrite changes on **mapped** Discord channels → Harmony
+  channel overrides
+- Full reconcile on bridge startup
+
+**Still not synced:** member role assignments (who has which role), per-member
+channel overrides, or Harmony → Discord changes. Assign members manually in
+Harmony.
+
+Requires the Harmony bot to have **Manage Channels** (same as clone-server).
 
 ## Configuration reference
 
@@ -159,6 +177,7 @@ settings:
   syncDeletes: true
   mentionTranslation: true
   cloneRoles: false        # default for /bridge clone-server's clone_roles option
+  syncPermissions: false   # live Discord → Harmony role + channel override sync
 ```
 
 ## Troubleshooting
@@ -214,8 +233,8 @@ re-ingested as user messages.
 - 2000 character Discord limit
 - Custom Discord emojis are synced to Harmony as federated emojis; Harmony custom
   emojis only bridge to Discord if a matching guild emoji name exists
-- Role cloning copies role *definitions* only (not member assignments), and never
-  grants ADMINISTRATOR
+- Role/permission sync copies role *definitions* and channel overrides only (not
+  member assignments), and never grants ADMINISTRATOR
 
 ## Development
 

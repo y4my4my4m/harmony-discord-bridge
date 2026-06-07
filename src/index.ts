@@ -12,13 +12,18 @@ import {
   Routes,
   ChatInputCommandInteraction,
   AutocompleteInteraction,
-  PermissionFlagsBits,
   type Role as DiscordRole
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
 import { MessageTranslator } from './MessageTranslator.js'
 import { ChannelMapper } from './ChannelMapper.js'
+import { PermissionSync } from './PermissionSync.js'
+import { PermissionSyncStore } from './PermissionSyncStore.js'
 import { BoundedMap } from './utils/BoundedMap.js'
+import {
+  discordRoleToHarmonyPermissions,
+  discordColorToHex,
+} from './utils/discordPermissions.js'
 import * as dotenv from 'dotenv'
 
 dotenv.config()
@@ -299,6 +304,9 @@ const harmonyClient = new HarmonyClient(
   config.harmony.gatewayUrl,
   config.harmony.apiUrl
 )
+
+const permissionSyncStore = new PermissionSyncStore('./config/permission-sync.yml')
+const permissionSync = new PermissionSync(harmonyClient, discordClient, mapper, permissionSyncStore)
 
 // =====================================================
 // DISCORD -> HARMONY
@@ -1068,6 +1076,15 @@ discordClient.on('ready', async () => {
       
       // Register slash commands for this guild
       await registerSlashCommands(config.discord.guildId)
+
+      if (config.settings.syncPermissions) {
+        permissionSync.attach()
+        try {
+          await permissionSync.initialSync(guild)
+        } catch (err) {
+          console.error('❌ Permission sync initial reconcile failed:', err)
+        }
+      }
     } catch (error) {
       console.error('❌ Failed to fetch guild members:', error)
     }
@@ -1612,60 +1629,6 @@ async function runBridgeUnlink(command: ChatInputCommandInteraction) {
   })
 }
 
-// Discord permission flag -> Harmony permission bit position. Harmony stores
-// role permissions as a bigint bitmask (see Harmony RoleService PERMISSION_BITS).
-// ADMINISTRATOR (bit 0) is intentionally omitted - the gateway strips it and
-// bots must never mint admin roles. PIN_MESSAGES (bit 23) has no distinct
-// Discord flag (folded into ManageMessages), so it's left unset.
-const DISCORD_TO_HARMONY_PERMISSION_BITS: [bigint, number][] = [
-  [PermissionFlagsBits.ViewChannel, 1],
-  [PermissionFlagsBits.ManageChannels, 2],
-  [PermissionFlagsBits.ManageRoles, 3],
-  [PermissionFlagsBits.ManageGuildExpressions, 4],
-  [PermissionFlagsBits.ViewAuditLog, 5],
-  [PermissionFlagsBits.ManageWebhooks, 6],
-  [PermissionFlagsBits.ManageGuild, 7],
-  [PermissionFlagsBits.CreateInstantInvite, 8],
-  [PermissionFlagsBits.KickMembers, 9],
-  [PermissionFlagsBits.BanMembers, 10],
-  [PermissionFlagsBits.ModerateMembers, 11],
-  [PermissionFlagsBits.SendMessages, 12],
-  [PermissionFlagsBits.SendMessagesInThreads, 13],
-  [PermissionFlagsBits.CreatePublicThreads, 14],
-  [PermissionFlagsBits.CreatePrivateThreads, 15],
-  [PermissionFlagsBits.EmbedLinks, 16],
-  [PermissionFlagsBits.AttachFiles, 17],
-  [PermissionFlagsBits.AddReactions, 18],
-  [PermissionFlagsBits.UseExternalEmojis, 19],
-  [PermissionFlagsBits.MentionEveryone, 20],
-  [PermissionFlagsBits.ManageMessages, 21],
-  [PermissionFlagsBits.ReadMessageHistory, 22],
-  [PermissionFlagsBits.Connect, 24],
-  [PermissionFlagsBits.Speak, 25],
-  [PermissionFlagsBits.Stream, 26],
-  [PermissionFlagsBits.MuteMembers, 27],
-  [PermissionFlagsBits.DeafenMembers, 28],
-  [PermissionFlagsBits.MoveMembers, 29],
-]
-
-/** Map a Discord role's permission set to a Harmony bigint bitmask (as string). */
-function discordRoleToHarmonyPermissions(role: DiscordRole): string {
-  const discordBits = role.permissions.bitfield
-  let mask = 0n
-  for (const [discordFlag, harmonyBit] of DISCORD_TO_HARMONY_PERMISSION_BITS) {
-    if ((discordBits & discordFlag) === discordFlag) {
-      mask |= 1n << BigInt(harmonyBit)
-    }
-  }
-  return mask.toString()
-}
-
-/** Discord stores role color as an int (0 = none); Harmony wants hex or null. */
-function discordColorToHex(color: number): string | null {
-  if (!color) return null
-  return `#${color.toString(16).padStart(6, '0')}`
-}
-
 /**
  * Real (non-@everyone, non-managed) Discord roles worth cloning, highest first.
  * @everyone maps to Harmony's existing default role; managed roles belong to
@@ -1864,7 +1827,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   if (cloneRoles) {
     for (const role of rolesToClone) {
       try {
-        await harmonyClient.createRole(config.harmony.serverId, {
+        const created = await harmonyClient.createRole(config.harmony.serverId, {
           name: role.name,
           color: discordColorToHex(role.color),
           position: role.position,
@@ -1872,10 +1835,18 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
           mentionable: role.mentionable,
           hoist: role.hoist,
         })
+        permissionSyncStore.setMapping(role.id, created.id, role.name)
         rolesCreated++
       } catch (err: any) {
         failures.push(`role \`${role.name}\`: ${err.message}`)
       }
+    }
+    // Map pre-existing Harmony roles by name + sync channel permission overrides.
+    try {
+      await permissionSync.reconcileRoles(guild)
+      await permissionSync.syncAllMappedChannelOverwrites(guild)
+    } catch (err: any) {
+      failures.push(`permission sync: ${err.message}`)
     }
   }
 
@@ -1948,6 +1919,7 @@ process.on('SIGINT', shutdown)
 
 function shutdown() {
   console.log('📥 Shutting down bridge...')
+  permissionSync.detach()
   mapper.stopWatching()
   discordClient.destroy()
   harmonyClient.disconnect()

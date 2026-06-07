@@ -31,6 +31,9 @@ export interface BridgeConfig {
     /** When true, `/bridge clone-server` also recreates Discord roles on
      *  Harmony (default for the clone_roles slash option). Optional. */
     cloneRoles?: boolean
+    /** When true, keep Harmony roles + channel permission overrides in sync
+     *  with Discord (live Discord → Harmony). Does not assign members to roles. */
+    syncPermissions?: boolean
   }
 }
 

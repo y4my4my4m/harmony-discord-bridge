@@ -11,7 +11,9 @@ import {
   REST,
   Routes,
   ChatInputCommandInteraction,
-  AutocompleteInteraction
+  AutocompleteInteraction,
+  PermissionFlagsBits,
+  type Role as DiscordRole
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
 import { MessageTranslator } from './MessageTranslator.js'
@@ -1220,6 +1222,12 @@ async function registerSlashCommands(guildId: string) {
             .setDescription('Also mirror voice channels (default: yes)')
             .setRequired(false)
         )
+        .addBooleanOption(opt =>
+          opt
+            .setName('clone_roles')
+            .setDescription('Also recreate Discord roles on Harmony (default: config setting)')
+            .setRequired(false)
+        )
     )
 
   const commands = [
@@ -1604,11 +1612,77 @@ async function runBridgeUnlink(command: ChatInputCommandInteraction) {
   })
 }
 
+// Discord permission flag -> Harmony permission bit position. Harmony stores
+// role permissions as a bigint bitmask (see Harmony RoleService PERMISSION_BITS).
+// ADMINISTRATOR (bit 0) is intentionally omitted - the gateway strips it and
+// bots must never mint admin roles. PIN_MESSAGES (bit 23) has no distinct
+// Discord flag (folded into ManageMessages), so it's left unset.
+const DISCORD_TO_HARMONY_PERMISSION_BITS: [bigint, number][] = [
+  [PermissionFlagsBits.ViewChannel, 1],
+  [PermissionFlagsBits.ManageChannels, 2],
+  [PermissionFlagsBits.ManageRoles, 3],
+  [PermissionFlagsBits.ManageGuildExpressions, 4],
+  [PermissionFlagsBits.ViewAuditLog, 5],
+  [PermissionFlagsBits.ManageWebhooks, 6],
+  [PermissionFlagsBits.ManageGuild, 7],
+  [PermissionFlagsBits.CreateInstantInvite, 8],
+  [PermissionFlagsBits.KickMembers, 9],
+  [PermissionFlagsBits.BanMembers, 10],
+  [PermissionFlagsBits.ModerateMembers, 11],
+  [PermissionFlagsBits.SendMessages, 12],
+  [PermissionFlagsBits.SendMessagesInThreads, 13],
+  [PermissionFlagsBits.CreatePublicThreads, 14],
+  [PermissionFlagsBits.CreatePrivateThreads, 15],
+  [PermissionFlagsBits.EmbedLinks, 16],
+  [PermissionFlagsBits.AttachFiles, 17],
+  [PermissionFlagsBits.AddReactions, 18],
+  [PermissionFlagsBits.UseExternalEmojis, 19],
+  [PermissionFlagsBits.MentionEveryone, 20],
+  [PermissionFlagsBits.ManageMessages, 21],
+  [PermissionFlagsBits.ReadMessageHistory, 22],
+  [PermissionFlagsBits.Connect, 24],
+  [PermissionFlagsBits.Speak, 25],
+  [PermissionFlagsBits.Stream, 26],
+  [PermissionFlagsBits.MuteMembers, 27],
+  [PermissionFlagsBits.DeafenMembers, 28],
+  [PermissionFlagsBits.MoveMembers, 29],
+]
+
+/** Map a Discord role's permission set to a Harmony bigint bitmask (as string). */
+function discordRoleToHarmonyPermissions(role: DiscordRole): string {
+  const discordBits = role.permissions.bitfield
+  let mask = 0n
+  for (const [discordFlag, harmonyBit] of DISCORD_TO_HARMONY_PERMISSION_BITS) {
+    if ((discordBits & discordFlag) === discordFlag) {
+      mask |= 1n << BigInt(harmonyBit)
+    }
+  }
+  return mask.toString()
+}
+
+/** Discord stores role color as an int (0 = none); Harmony wants hex or null. */
+function discordColorToHex(color: number): string | null {
+  if (!color) return null
+  return `#${color.toString(16).padStart(6, '0')}`
+}
+
+/**
+ * Real (non-@everyone, non-managed) Discord roles worth cloning, highest first.
+ * @everyone maps to Harmony's existing default role; managed roles belong to
+ * bots/integrations and shouldn't be recreated.
+ */
+function cloneableDiscordRoles(guild: { roles: { cache: Map<string, DiscordRole> } }): DiscordRole[] {
+  return Array.from(guild.roles.cache.values())
+    .filter(r => r.name !== '@everyone' && !r.managed)
+    .sort((a, b) => b.position - a.position)
+}
+
 /**
  * `/bridge clone-server` - mirror every (text/voice) Discord channel under
  * its respective category into Harmony, then add bridge mappings. Always
  * additive: existing mappings are preserved and matching Harmony channels
- * are reused when possible (by name).
+ * are reused when possible (by name). With clone_roles enabled, also recreate
+ * Discord roles (additive, matched by name) with mapped permissions.
  *
  * The bot must hold `manage_channels` on the Harmony server; the gateway
  * enforces that at the API layer. On the Discord side we just need to be
@@ -1617,6 +1691,9 @@ async function runBridgeUnlink(command: ChatInputCommandInteraction) {
 async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   const dryRun = command.options.getBoolean('dry_run', false) ?? false
   const includeVoice = command.options.getBoolean('include_voice', false) ?? true
+  // clone_roles option overrides the config default when explicitly provided.
+  const cloneRoles =
+    command.options.getBoolean('clone_roles', false) ?? (config.settings.cloneRoles ?? false)
 
   // Discord can take >3s; defer immediately so we don't blow the interaction.
   await command.deferReply({ ephemeral: true })
@@ -1658,9 +1735,20 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   const alreadyMapped = new Set(mapper.getAllMappings().map(m => m.discord))
   const toCreate = planned.filter(p => !alreadyMapped.has(p.discordId))
 
-  if (toCreate.length === 0) {
+  // Role plan (additive, matched by name) - only when clone_roles is enabled.
+  let rolesToClone: DiscordRole[] = []
+  let existingRoleNames = new Set<string>()
+  if (cloneRoles) {
+    const existingRoles = await harmonyClient.getServerRoles(config.harmony.serverId).catch(() => [])
+    existingRoleNames = new Set(existingRoles.map((r: any) => r.name))
+    rolesToClone = cloneableDiscordRoles(guild).filter(r => !existingRoleNames.has(r.name))
+  }
+
+  if (toCreate.length === 0 && rolesToClone.length === 0) {
     await command.editReply({
-      content: '✅ Nothing to do - every Discord channel already has a mapping.',
+      content: cloneRoles
+        ? '✅ Nothing to do - every Discord channel and role already exists on Harmony.'
+        : '✅ Nothing to do - every Discord channel already has a mapping.',
     })
     return
   }
@@ -1690,6 +1778,13 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
     }
     if (categoriesNeeded.size > 0) {
       lines.unshift(`_Would also create ${categoriesNeeded.size} category/categories: ${Array.from(categoriesNeeded).map(n => `**${n}**`).join(', ')}_`)
+    }
+    if (cloneRoles) {
+      if (rolesToClone.length > 0) {
+        lines.push(`_Would also create ${rolesToClone.length} role(s): ${rolesToClone.map(r => `**${r.name}**`).join(', ')}_`)
+      } else {
+        lines.push('_Roles: all Discord roles already exist on Harmony (by name)._')
+      }
     }
     if (lines.length > 30) {
       // truncate to keep under Discord's 2000-char message limit
@@ -1763,6 +1858,27 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
     }))
   )
 
+  // 3b. Clone roles (additive, matched by name). Discord orders roles with the
+  // highest at the top; we pass position through so Harmony preserves hierarchy.
+  let rolesCreated = 0
+  if (cloneRoles) {
+    for (const role of rolesToClone) {
+      try {
+        await harmonyClient.createRole(config.harmony.serverId, {
+          name: role.name,
+          color: discordColorToHex(role.color),
+          position: role.position,
+          permissions: discordRoleToHarmonyPermissions(role),
+          mentionable: role.mentionable,
+          hoist: role.hoist,
+        })
+        rolesCreated++
+      } catch (err: any) {
+        failures.push(`role \`${role.name}\`: ${err.message}`)
+      }
+    }
+  }
+
   // 4. Report back
   const summary: string[] = []
   summary.push(`✅ Clone complete for **${guild.name}**`)
@@ -1770,6 +1886,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   summary.push(`• Channels reused (matched by name): ${reused}`)
   summary.push(`• Categories created: ${categoriesCreated}`)
   summary.push(`• Mappings written: ${added.length}`)
+  if (cloneRoles) summary.push(`• Roles created: ${rolesCreated}`)
   if (failures.length) {
     summary.push('')
     summary.push(`⚠️ ${failures.length} failure(s):`)

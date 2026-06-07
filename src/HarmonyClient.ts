@@ -290,6 +290,54 @@ export class HarmonyClient extends EventEmitter {
     }
     return response.json()
   }
+
+  async getServerRoles(serverId: string): Promise<any[]> {
+    const response = await fetch(`${this.apiUrl}/api/v1/servers/${serverId}/roles`, {
+      headers: { 'Authorization': `Bot ${this.botToken}` }
+    })
+    if (!response.ok) {
+      throw new Error(`Failed to fetch server roles: ${response.status}`)
+    }
+    return response.json() as Promise<any[]>
+  }
+
+  /**
+   * Create a Harmony server role. `permissions` is a bigint bitmask in string
+   * form (JS numbers can't safely hold 30+ bits). The gateway strips the
+   * ADMINISTRATOR bit defensively - bots never mint admin roles.
+   */
+  async createRole(
+    serverId: string,
+    opts: {
+      name: string
+      color?: string | null
+      position?: number
+      permissions?: string
+      mentionable?: boolean
+      hoist?: boolean
+    },
+  ): Promise<any> {
+    const response = await fetch(`${this.apiUrl}/api/v1/servers/${serverId}/roles`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bot ${this.botToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: opts.name,
+        color: opts.color ?? null,
+        position: opts.position ?? 0,
+        permissions: opts.permissions ?? '0',
+        mentionable: opts.mentionable ?? true,
+        hoist: opts.hoist ?? false,
+      })
+    })
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to create role (${response.status})`)
+    }
+    return response.json()
+  }
   
   async editMessage(messageId: string, content: string | any[]): Promise<any> {
     const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}`, {

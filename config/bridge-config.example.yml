@@ -7,13 +7,14 @@ discord:
 
 # Harmony Bot Configuration
 # gatewayUrl and apiUrl both point at the Harmony bot-gateway (default port 3002).
+# apiUrl is the gateway BASE (the bridge appends /api/v1 itself - do not include it).
 # When hosting the bridge remotely, use your public proxy, e.g.
 #   gatewayUrl: "wss://chat.example.com/bot-gateway/gateway"
-#   apiUrl:     "https://chat.example.com/bot-gateway/api/v1"
+#   apiUrl:     "https://chat.example.com/bot-gateway"
 harmony:
   token: "YOUR_HARMONY_BOT_TOKEN"
   gatewayUrl: "ws://localhost:3002/gateway"
-  apiUrl: "http://localhost:3002/api/v1"
+  apiUrl: "http://localhost:3002"
   serverId: "YOUR_HARMONY_SERVER_UUID"  # Required for Discord autocomplete of Harmony users
   baseUrl: "https://chat.example.com"   # Your Harmony instance URL (for federated mentions)
 
@@ -34,8 +35,13 @@ channelMappings:
 # Bridge Settings
 settings:
   syncAttachments: true    # Bridge file attachments
-  syncReactions: true      # Bridge reactions (now implemented!)
+  syncReactions: true      # Bridge reactions (both directions)
   syncEdits: false         # Bridge message edits (requires message ID mapping)
   syncDeletes: false       # Bridge message deletes (requires message ID mapping)
   mentionTranslation: true # Translate @mentions between platforms
+  # When true, `/bridge clone-server` also recreates Discord roles (name, color,
+  # position, mentionable) on Harmony with mapped permissions. Off by default;
+  # you can also toggle it per-invocation with the clone_roles slash option.
+  # ADMINISTRATOR is never granted automatically - set it by hand in Harmony.
+  cloneRoles: false
 

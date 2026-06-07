@@ -28,6 +28,9 @@ export interface BridgeConfig {
     syncEdits: boolean
     syncDeletes: boolean
     mentionTranslation: boolean
+    /** When true, `/bridge clone-server` also recreates Discord roles on
+     *  Harmony (default for the clone_roles slash option). Optional. */
+    cloneRoles?: boolean
   }
 }
 

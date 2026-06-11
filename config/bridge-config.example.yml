@@ -1,50 +1,40 @@
-# Discord-Harmony Bridge Configuration
+# https://github.com/y4my4my4m/harmony-discord-bridge
+# URL examples are in README.md — uncomment the block that matches your setup.
 
-# Discord Bot Configuration
 discord:
   token: "YOUR_DISCORD_BOT_TOKEN"
   guildId: "YOUR_DISCORD_SERVER_ID"
 
-# Harmony Bot Configuration
-# gatewayUrl and apiUrl both point at the Harmony bot-gateway (default port 3002).
-# apiUrl is the gateway BASE (the bridge appends /api/v1 itself - do not include it).
-# When hosting the bridge remotely, use your public proxy, e.g.
-#   gatewayUrl: "wss://chat.example.com/bot-gateway/gateway"
-#   apiUrl:     "https://chat.example.com/bot-gateway"
 harmony:
   token: "YOUR_HARMONY_BOT_TOKEN"
+  serverId: "YOUR_HARMONY_SERVER_UUID"
+
+  # har.mony.lol, bridge on same server:
   gatewayUrl: "ws://localhost:3002/gateway"
   apiUrl: "http://localhost:3002"
-  serverId: "YOUR_HARMONY_SERVER_UUID"  # Required for Discord autocomplete of Harmony users
-  baseUrl: "https://chat.example.com"   # Your Harmony instance URL (for federated mentions)
+  baseUrl: "https://har.mony.lol"
 
-# Channel Mappings
-# Each mapping connects a Discord channel to a Harmony channel
+  # har.mony.lol, bridge elsewhere:
+  # gatewayUrl: "wss://har.mony.lol/bot-gateway/gateway"
+  # apiUrl: "https://har.mony.lol/bot-gateway"
+  # baseUrl: "https://har.mony.lol"
+
+  # local dev:
+  # gatewayUrl: "ws://localhost:3002/gateway"
+  # apiUrl: "http://localhost:3002"
+  # baseUrl: "http://localhost:5173"
+
 channelMappings:
-  - discord: "1234567890"  # Discord channel ID
-    harmony: "uuid-here"   # Harmony channel ID
-    bidirectional: true    # If false, only Discord -> Harmony
-    name: "general"        # Human-friendly name (optional)
-  
-  # Add more mappings as needed
-  # - discord: "0987654321"
-  #   harmony: "uuid-here-2"
-  #   bidirectional: true
-  #   name: "announcements"
+  - discord: "1234567890"
+    harmony: "uuid-here"
+    bidirectional: true
+    name: "general"
 
-# Bridge Settings
 settings:
-  syncAttachments: true    # Bridge file attachments
-  syncReactions: true      # Bridge reactions (both directions)
-  syncEdits: false         # Bridge message edits (requires message ID mapping)
-  syncDeletes: false       # Bridge message deletes (requires message ID mapping)
-  mentionTranslation: true # Translate @mentions between platforms
-  # When true, `/bridge clone-server` also recreates Discord roles (name, color,
-  # position, mentionable) on Harmony with mapped permissions. Off by default;
-  # you can also toggle it per-invocation with the clone_roles slash option.
-  # ADMINISTRATOR is never granted automatically - set it by hand in Harmony.
+  syncAttachments: true
+  syncReactions: true
+  syncEdits: false
+  syncDeletes: false
+  mentionTranslation: true
   cloneRoles: false
-  # Live Discord → Harmony sync for role definitions + channel permission
-  # overrides (not member assignments). Requires Harmony bot manage_channels.
   syncPermissions: false
-

@@ -10,6 +10,7 @@ import {
   SlashCommandBuilder,
   REST,
   Routes,
+  Events,
   ChatInputCommandInteraction,
   AutocompleteInteraction,
   type Role as DiscordRole
@@ -125,44 +126,47 @@ interface CachedHarmonyUser {
   avatarUrl: string | null
 }
 const harmonyUserCache = new Map<string, CachedHarmonyUser>()
+let harmonyUserCacheTimer: NodeJS.Timeout | null = null
+let discordStartupDone = false
+
+const HARMONY_USER_CACHE_REFRESH_MS = 5 * 60 * 1000
 
 /**
- * Fetch Harmony users for the bridged server
- * Called on startup and periodically
+ * Fetch Harmony server members for `/mention` autocomplete on Discord.
+ * Runs once at startup, then every 5 minutes — not on every gateway reconnect.
  */
-async function refreshHarmonyUserCache() {
-  console.log('🔄 Refreshing Harmony user cache...')
-  
-  // Check if serverId is configured
+async function refreshHarmonyUserCache(options: { verbose?: boolean } = {}) {
+  const verbose = options.verbose ?? false
+  const prevSize = harmonyUserCache.size
+
   if (!config.harmony.serverId) {
     console.error('❌ harmony.serverId not configured in bridge-config.yml!')
-    console.error('   Add: serverId: "YOUR_HARMONY_SERVER_UUID" under harmony section')
     return
   }
-  
+
   const url = `${config.harmony.apiUrl}/api/v1/servers/${config.harmony.serverId}/members?limit=1000`
-  console.log(`📡 Fetching from: ${url}`)
-  
+  if (verbose) {
+    console.log('🔄 Refreshing Harmony user cache...')
+    console.log(`📡 Fetching from: ${url}`)
+  }
+
   try {
     const response = await fetch(url, {
       headers: {
         'Authorization': `Bot ${config.harmony.token}`
       }
     })
-    
-    console.log(`📡 Response status: ${response.status}`)
-    
+
     if (!response.ok) {
       const errorText = await response.text()
       console.error('❌ Failed to fetch Harmony users:', errorText)
       return
     }
-    
+
     const members = await response.json() as any[]
-    console.log(`📡 Received ${members.length} members from API`)
-    
+
     harmonyUserCache.clear()
-    
+
     for (const member of members) {
       if (member.user) {
         harmonyUserCache.set(member.user.id, {
@@ -173,12 +177,14 @@ async function refreshHarmonyUserCache() {
         })
       }
     }
-    
-    console.log(`✅ Harmony user cache: ${harmonyUserCache.size} users`)
-    
-    // Log first few users for debugging
-    const firstUsers = Array.from(harmonyUserCache.values()).slice(0, 3)
-    firstUsers.forEach(u => console.log(`   👤 ${u.displayName} (@${u.username})`))
+
+    if (verbose) {
+      console.log(`✅ Harmony user cache: ${harmonyUserCache.size} users`)
+      const firstUsers = Array.from(harmonyUserCache.values()).slice(0, 3)
+      firstUsers.forEach(u => console.log(`   👤 ${u.displayName} (@${u.username})`))
+    } else if (harmonyUserCache.size !== prevSize) {
+      console.log(`🔄 Harmony user cache: ${prevSize} → ${harmonyUserCache.size} users`)
+    }
   } catch (error) {
     console.error('❌ Error fetching Harmony users:', error)
   }
@@ -207,6 +213,7 @@ function searchHarmonyUsers(query: string): CachedHarmonyUser[] {
 // Track ready states for bridge data registration
 let discordReady = false
 let harmonyReady = false
+let harmonyStartupDone = false
 
 /**
  * Register bridge data with the Harmony gateway
@@ -614,38 +621,41 @@ if (config.settings.syncDeletes) {
 
 harmonyClient.on('ready', async (data: any) => {
   console.log(`✅ Harmony bot connected: ${data.bot.username} (${data.bot.id})`);
-  
-  // Store bot ID for filtering
+
   (harmonyClient as any).botId = data.bot.id;
-  
-  // Subscribe to all mapped Harmony channels and load recent messages for mapping
-  for (const mapping of config.channelMappings) {
-    console.log(`📡 Subscribing to Harmony channel: ${mapping.name || mapping.harmony}`);
-    
-    // Load recent messages to restore message ID mappings
-    try {
-      console.log(`📥 Loading recent messages from ${mapping.name || mapping.harmony}...`);
-      const recentMessages = await harmonyClient.loadRecentMessages(mapping.harmony, 100);
-      
-      let restoredCount = 0;
-      for (const msg of recentMessages) {
-        if (msg.metadata?.discord_message_id && msg.id) {
-          const discordMsgId = msg.metadata.discord_message_id;
-          discordToHarmonyMessages.set(discordMsgId, msg.id);
-          harmonyToDiscordMessages.set(msg.id, discordMsgId);
-          restoredCount++;
+
+  // Harmony gateway reconnects re-emit READY — only restore mappings once.
+  if (!harmonyStartupDone) {
+    harmonyStartupDone = true
+
+    for (const mapping of config.channelMappings) {
+      console.log(`📡 Subscribing to Harmony channel: ${mapping.name || mapping.harmony}`);
+
+      try {
+        console.log(`📥 Loading recent messages from ${mapping.name || mapping.harmony}...`);
+        const recentMessages = await harmonyClient.loadRecentMessages(mapping.harmony, 100);
+
+        let restoredCount = 0;
+        for (const msg of recentMessages) {
+          if (msg.metadata?.discord_message_id && msg.id) {
+            const discordMsgId = msg.metadata.discord_message_id;
+            discordToHarmonyMessages.set(discordMsgId, msg.id);
+            harmonyToDiscordMessages.set(msg.id, discordMsgId);
+            restoredCount++;
+          }
         }
+
+        if (restoredCount > 0) {
+          console.log(`✅ Restored ${restoredCount} message mappings from ${mapping.name || mapping.harmony}`);
+        }
+      } catch (error) {
+        console.error(`❌ Failed to load recent messages from ${mapping.name || mapping.harmony}:`, error);
       }
-      
-      if (restoredCount > 0) {
-        console.log(`✅ Restored ${restoredCount} message mappings from ${mapping.name || mapping.harmony}`);
-      }
-    } catch (error) {
-      console.error(`❌ Failed to load recent messages from ${mapping.name || mapping.harmony}:`, error);
     }
+  } else {
+    console.log('↳ Harmony gateway reconnected (skipping message mapping restore)')
   }
-  
-  // Mark Harmony as ready and register bridge data if Discord is also ready
+
   harmonyReady = true
   registerBridgeDataWithGateway()
 });
@@ -1055,48 +1065,55 @@ discordClient.login(config.discord.token).catch(error => {
   process.exit(1)
 })
 
-discordClient.on('ready', async () => {
+discordClient.on(Events.ClientReady, async () => {
   console.log(`✅ Discord bot connected: ${discordClient.user?.tag}`)
-  
-  // Populate member cache from configured guild
-  if (config.discord.guildId) {
-    try {
-      const guild = await discordClient.guilds.fetch(config.discord.guildId)
-      console.log(`📥 Fetching members for guild: ${guild.name}`)
-      
-      // Fetch all members (required for proper cache population)
-      const members = await guild.members.fetch()
-      members.forEach(member => {
-        if (!member.user.bot) {
-          cacheMember(member)
-        }
-      })
-      
-      console.log(`✅ Cached ${discordMemberCache.size} Discord members for mention lookups`)
-      
-      // Register slash commands for this guild
-      await registerSlashCommands(config.discord.guildId)
 
-      if (config.settings.syncPermissions) {
-        permissionSync.attach()
-        try {
-          await permissionSync.initialSync(guild)
-        } catch (err) {
-          console.error('❌ Permission sync initial reconcile failed:', err)
+  // Discord.js can emit ClientReady again after gateway reconnects. Heavy
+  // startup (member fetch, slash registration, cache timers) must run once.
+  if (!discordStartupDone) {
+    discordStartupDone = true
+
+    if (config.discord.guildId) {
+      try {
+        const guild = await discordClient.guilds.fetch(config.discord.guildId)
+        console.log(`📥 Fetching members for guild: ${guild.name}`)
+
+        const members = await guild.members.fetch()
+        members.forEach(member => {
+          if (!member.user.bot) {
+            cacheMember(member)
+          }
+        })
+
+        console.log(`✅ Cached ${discordMemberCache.size} Discord members for mention lookups`)
+
+        await registerSlashCommands(config.discord.guildId)
+
+        if (config.settings.syncPermissions) {
+          permissionSync.attach()
+          try {
+            await permissionSync.initialSync(guild)
+          } catch (err) {
+            console.error('❌ Permission sync initial reconcile failed:', err)
+          }
         }
+      } catch (error) {
+        console.error('❌ Failed to fetch guild members:', error)
       }
-    } catch (error) {
-      console.error('❌ Failed to fetch guild members:', error)
     }
+
+    await refreshHarmonyUserCache({ verbose: true })
+
+    if (!harmonyUserCacheTimer) {
+      harmonyUserCacheTimer = setInterval(
+        () => { void refreshHarmonyUserCache({ verbose: false }) },
+        HARMONY_USER_CACHE_REFRESH_MS,
+      )
+    }
+  } else {
+    console.log('↳ Discord gateway reconnected (skipping startup cache refresh)')
   }
-  
-  // Fetch Harmony users for autocomplete
-  await refreshHarmonyUserCache()
-  
-  // Refresh Harmony user cache periodically (every 5 minutes)
-  setInterval(refreshHarmonyUserCache, 5 * 60 * 1000)
-  
-  // Mark Discord as ready and register bridge data if Harmony is also ready
+
   discordReady = true
   registerBridgeDataWithGateway()
 })
@@ -1919,6 +1936,10 @@ process.on('SIGINT', shutdown)
 
 function shutdown() {
   console.log('📥 Shutting down bridge...')
+  if (harmonyUserCacheTimer) {
+    clearInterval(harmonyUserCacheTimer)
+    harmonyUserCacheTimer = null
+  }
   permissionSync.detach()
   mapper.stopWatching()
   discordClient.destroy()

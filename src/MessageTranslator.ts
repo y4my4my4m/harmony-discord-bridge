@@ -1,3 +1,61 @@
+/** Split URLs glued without separators (`...pnghttps://...`). */
+function extractGluedHttpUrls(text: string): string[] {
+  if (!text) return []
+  const regex = /https?:\/\/[^\s<>"']+?(?=https?:\/\/|\s|$|>)/g
+  const urls: string[] = []
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(text)) !== null) {
+    let url = match[0]
+    while (url.length > 0 && /[.,;:!?)>\]}]$/.test(url)) {
+      url = url.slice(0, -1)
+    }
+    if (url) urls.push(url)
+  }
+  return urls
+}
+
+function inferAttachmentFileType(name: string, contentType: string, url: string): 'image' | 'video' | 'file' {
+  if (contentType.startsWith('image/')) return 'image'
+  if (contentType.startsWith('video/')) return 'video'
+  const probe = `${name} ${url}`.toLowerCase()
+  if (/\.(jpg|jpeg|png|gif|webp|bmp|svg|avif)(\?|$)/.test(probe)) return 'image'
+  if (/\.(mp4|webm|mov|m4v|avi|mkv|ogv)(\?|$)/.test(probe)) return 'video'
+  return 'file'
+}
+
+function splitGluedUrlsInParts(parts: any[]): any[] {
+  const result: any[] = []
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') continue
+
+    if (part.type === 'url' && part.url) {
+      const split = extractGluedHttpUrls(part.url)
+      if (split.length > 1) {
+        for (const url of split) result.push({ ...part, url })
+        continue
+      }
+    }
+
+    if (part.type === 'text' && part.text) {
+      const urls = extractGluedHttpUrls(part.text)
+      if (urls.length > 1 && urls.join('') === part.text.replace(/\s/g, '')) {
+        for (const url of urls) {
+          const fileType = inferAttachmentFileType('', '', url)
+          if (fileType === 'image' || fileType === 'video') {
+            result.push({ type: 'file', url, fileType, fileName: url.split('/').pop() })
+          } else {
+            result.push({ type: 'url', url, preview: true })
+          }
+        }
+        continue
+      }
+    }
+
+    result.push(part)
+  }
+  return result
+}
+
 export class MessageTranslator {
   private serverId: string | null = null
   private harmonyDomain: string | null = null
@@ -200,17 +258,19 @@ export class MessageTranslator {
       console.log(`📎 D→H ${discordMsg.attachments.size} attachment(s):`)
       discordMsg.attachments.forEach((attachment: any) => {
         const contentType = attachment.contentType || ''
-        const isImage = contentType.startsWith('image/')
-        const isVideo = contentType.startsWith('video/')
-        const fileType = isImage ? 'image' : isVideo ? 'video' : 'file'
-        
+        const fileType = inferAttachmentFileType(
+          attachment.name || '',
+          contentType,
+          attachment.url || '',
+        )
+
         console.log(`   📎 ${attachment.name} (${fileType}) → ${attachment.url}`)
-        
+
         parts.push({
           type: 'file',
           url: attachment.url,
           fileName: attachment.name,
-          fileType: fileType
+          fileType,
         })
       })
     }
@@ -228,7 +288,7 @@ export class MessageTranslator {
       })
     }
     
-    return parts
+    return splitGluedUrlsInParts(parts)
   }
   
   /**
@@ -357,7 +417,9 @@ export class MessageTranslator {
         return ''
       })
       
-      content = parts.filter(Boolean).join('')
+      // Newline between segments so Discord (and Harmony URL parsers) treat
+      // multiple attachment URLs as separate links instead of one invalid URL.
+      content = parts.filter(Boolean).join('\n')
     } else if (harmonyMsg.content) {
       // Fallback to simple content string
       content = harmonyMsg.content

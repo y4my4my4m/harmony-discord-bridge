@@ -21,8 +21,6 @@ import { ChannelMapper } from './ChannelMapper.js'
 import { PermissionSync } from './PermissionSync.js'
 import { PermissionSyncStore } from './PermissionSyncStore.js'
 import { BoundedMap } from './utils/BoundedMap.js'
-import { applyInstanceAttachmentPolicy } from './attachmentMirror.js'
-import { refreshInstanceBridgeSettings } from './instanceSettings.js'
 import {
   discordRoleToHarmonyPermissions,
   discordColorToHex,
@@ -332,9 +330,9 @@ discordClient.on('messageCreate', async (msg: DiscordMessage) => {
   if (!mapper.shouldBridgeFromDiscord(msg.channelId)) return
   
   try {
-    await refreshInstanceBridgeSettings(config.harmony.apiUrl, config.harmony.token)
-    let contentParts = translator.discordToHarmonyParts(msg)
-    contentParts = await applyInstanceAttachmentPolicy(contentParts, harmonyClient, config.settings.syncAttachments)
+    // Translate message content using MessageParts format. Attachment storage
+    // policy (link/mirror) is applied server-side by the bot-gateway.
+    const contentParts = translator.discordToHarmonyParts(msg)
 
     // Extract Discord user metadata for puppeting
     const metadata = translator.extractDiscordUserMetadata(msg)
@@ -577,9 +575,8 @@ if (config.settings.syncEdits) {
         return
       }
       
-      await refreshInstanceBridgeSettings(config.harmony.apiUrl, config.harmony.token)
-      let contentParts = translator.discordToHarmonyParts(newMsg)
-      contentParts = await applyInstanceAttachmentPolicy(contentParts, harmonyClient, config.settings.syncAttachments)
+      // Translate the new content (attachment policy applied server-side)
+      const contentParts = translator.discordToHarmonyParts(newMsg)
 
       await harmonyClient.editMessage(harmonyMessageId, contentParts)
       console.log(`✅ Discord -> Harmony edit: Message ${harmonyMessageId}`)
@@ -1105,13 +1102,9 @@ discordClient.on(Events.ClientReady, async () => {
       }
     }
 
-    await refreshInstanceBridgeSettings(config.harmony.apiUrl, config.harmony.token)
     await refreshHarmonyUserCache({ verbose: true })
 
     if (!harmonyUserCacheTimer) {
-      setInterval(() => {
-        void refreshInstanceBridgeSettings(config.harmony.apiUrl, config.harmony.token)
-      }, 60_000)
       harmonyUserCacheTimer = setInterval(
         () => { void refreshHarmonyUserCache({ verbose: false }) },
         HARMONY_USER_CACHE_REFRESH_MS,

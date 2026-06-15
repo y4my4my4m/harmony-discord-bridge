@@ -207,24 +207,6 @@ export class HarmonyClient extends EventEmitter {
     return response.json()
   }
 
-  async mirrorMedia(url: string, fileName?: string): Promise<string> {
-    const response = await fetch(`${this.apiUrl}/api/v1/media/mirror`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bot ${this.botToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ url, fileName }),
-    })
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({})) as any
-      throw new Error(errorData.error || `Mirror failed (${response.status})`)
-    }
-    const data = await response.json() as { url?: string }
-    if (!data.url) throw new Error('Mirror response missing url')
-    return data.url
-  }
-
   async silentUpdateMessageContent(messageId: string, content: any[]): Promise<void> {
     const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}/content-silent`, {
       method: 'PATCH',

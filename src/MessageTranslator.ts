@@ -271,6 +271,12 @@ export class MessageTranslator {
           url: attachment.url,
           fileName: attachment.name,
           fileType,
+          bridgeRef: {
+            source: 'discord',
+            discordChannelId: discordMsg.channelId,
+            discordMessageId: discordMsg.id,
+            discordAttachmentId: attachment.id,
+          },
         })
       })
     }

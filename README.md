@@ -128,6 +128,22 @@ settings:
 `syncPermissions: true` mirrors Discord role/channel override changes into
 Harmony live. Still doesn't sync who has which role.
 
+## Attachments
+
+Discord CDN links expire (~24–72h). There is no permanent unsigned Discord URL.
+
+**Instance admins** set policy in Admin Panel → Configuration → Chat →
+**Bridge attachments** (`bridge_attachment_mode`):
+
+| Mode | What it does |
+|------|----------------|
+| **link** (default) | Store Discord CDN URL as-is. Breaks when it expires. |
+| **mirror** | Copy into `user_media` on ingest. Permanent, but **uses your disk**. |
+
+Bot owners cannot enable mirror — bot-gateway rejects `/media/mirror` unless the instance mode is `mirror`.
+
+Harmony-native uploads already use public `user_media` URLs (no expiry).
+
 ## When it breaks
 
 **Can't connect** — wrong `gatewayUrl`/`apiUrl` for your setup. Try

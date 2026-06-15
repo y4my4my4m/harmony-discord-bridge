@@ -32,9 +32,9 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Bridge Harmony replies to Discord threads or reply references
 
 ### Attachment handling notes
-- Currently just sharing URLs (no re-upload), so no size limits apply
-- [ ] Discord CDN URLs can expire - consider proxying or caching for old messages
-- [ ] Harmony storage URLs might need authentication - verify they're publicly accessible
+- Discord CDN URLs in messages expire (~24–72h); Discord has no permanent public link
+- [ ] On-demand proxy (stream from Discord at view time, no storage) vs optional mirror
+- [ ] Store attachment IDs + refresh URL from Discord API when loading old messages
 
 ---
 

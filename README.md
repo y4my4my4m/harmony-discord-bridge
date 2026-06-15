@@ -138,11 +138,19 @@ Discord CDN links expire (~24–72h). There is no permanent unsigned Discord URL
 | Mode | What it does |
 |------|----------------|
 | **link** (default) | Store Discord CDN URL as-is. Breaks when it expires. |
+| **refresh** | Store the CDN URL, then re-sign it **on demand** when a user views an expired attachment. No disk use, no "edited" badge. |
 | **mirror** | Copy into `user_media` on ingest. Permanent, but **uses your disk**. |
 
-The policy is enforced **server-side** by the bot-gateway: the bridge always
-forwards the original Discord URL, and the gateway mirrors it into `user_media`
-when (and only when) the instance mode is `mirror`. Bot owners cannot override it.
+The policy is enforced **server-side** by the bot-gateway. The bridge always
+forwards the original Discord URL; the gateway then:
+
+- **mirror** — copies it into `user_media` on ingest.
+- **refresh** — when the frontend reports an expired attachment, the gateway
+  asks the bridge to re-sign the URL(s) via Discord's `attachments/refresh-urls`
+  and silently patches the message. Requests are coalesced so simultaneous
+  viewers produce a single Discord call.
+
+Bot owners cannot override the instance policy.
 
 Harmony-native uploads already use public `user_media` URLs (no expiry).
 

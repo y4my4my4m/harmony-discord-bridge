@@ -137,6 +137,10 @@ export class HarmonyClient extends EventEmitter {
         this.emit('messageDelete', data)
         break
         
+      case 'REFRESH_ATTACHMENTS':
+        this.emit('refreshAttachments', data)
+        break
+
       case 'MESSAGE_REACTION_ADD':
         this.emit('reactionAdd', data)
         break

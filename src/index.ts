@@ -21,6 +21,7 @@ import { ChannelMapper } from './ChannelMapper.js'
 import { PermissionSync } from './PermissionSync.js'
 import { PermissionSyncStore } from './PermissionSyncStore.js'
 import { BoundedMap } from './utils/BoundedMap.js'
+import { refreshDiscordAttachmentParts } from './refreshAttachments.js'
 import {
   discordRoleToHarmonyPermissions,
   discordColorToHex,
@@ -975,6 +976,28 @@ async function resolveDiscordEmojiForReaction(
   if (guildEmoji) return guildEmoji.identifier
   return null
 }
+
+// On-demand attachment URL refresh (instance bridge_attachment_mode = 'refresh').
+// The gateway forwards a request when a user views a bridged message whose Discord
+// CDN URL has expired; we re-sign via Discord and silently patch the message.
+const recentlyRefreshedMessages = new Set<string>()
+harmonyClient.on('refreshAttachments', async (data: any) => {
+  const messageId = data?.messageId
+  const content = data?.content
+  if (!messageId || !Array.isArray(content)) return
+  if (recentlyRefreshedMessages.has(messageId)) return
+  recentlyRefreshedMessages.add(messageId)
+  setTimeout(() => recentlyRefreshedMessages.delete(messageId), 15_000)
+
+  try {
+    const newContent = await refreshDiscordAttachmentParts(content, config.discord.token)
+    if (!newContent) return
+    await harmonyClient.silentUpdateMessageContent(messageId, newContent)
+    console.log(`🔄 Refreshed expired attachment URLs for message ${messageId}`)
+  } catch (error: any) {
+    console.error(`⚠️ Attachment refresh failed for ${messageId}: ${error?.message || error}`)
+  }
+})
 
 harmonyClient.on('reactionAdd', async (data: any) => {
   if (data.metadata?.bridge_source === 'discord') return // loop prevention

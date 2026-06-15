@@ -32,9 +32,10 @@ channelMappings:
 
 settings:
   syncAttachments: true   # include attachments in bridged messages
-  # Attachment storage policy (link / mirror) is set by the INSTANCE ADMIN in
-  # the Harmony Admin Panel — not here. Mirror mode copies files into
-  # user_media (permanent, but grows disk usage). Default is link.
+  # Attachment policy (link / refresh / mirror) is set by the INSTANCE ADMIN in
+  # the Harmony Admin Panel — not here. refresh re-signs expired Discord URLs on
+  # demand (no disk); mirror copies files into user_media (permanent, but grows
+  # disk usage). Default is link.
   syncReactions: true
   syncEdits: false
   syncDeletes: false

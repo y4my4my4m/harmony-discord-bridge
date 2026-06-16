@@ -29,6 +29,10 @@ import {
   discordColorToHex,
 } from './utils/discordPermissions.js'
 import { joinLinesWithinDiscordLimit } from './utils/discordMessage.js'
+import {
+  buildDiscordStructurePlan,
+  syncDiscordStructureOrderToHarmony,
+} from './discordChannelOrder.js'
 import { formatHarmonyDisplayNameForDiscord, formatHarmonyUserAutocompleteLabel, formatHarmonyUserHandle } from './utils/discordDisplayName.js'
 import * as dotenv from 'dotenv'
 
@@ -1451,6 +1455,17 @@ async function registerSlashCommands(guildId: string) {
             .setRequired(false)
         )
     )
+    .addSubcommand(sub =>
+      sub
+        .setName('sync-order')
+        .setDescription('Sync Harmony category/channel order from Discord (mapped channels only)')
+        .addBooleanOption(opt =>
+          opt
+            .setName('include_voice')
+            .setDescription('Include voice channels when syncing order (default: yes)')
+            .setRequired(false)
+        )
+    )
 
   const commands = [
     addUserOptions(
@@ -1723,6 +1738,9 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
       case 'clone-server':
         await runBridgeCloneServer(command)
         break
+      case 'sync-order':
+        await runBridgeSyncOrder(command)
+        break
       default:
         await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
     }
@@ -1864,35 +1882,10 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   const guild = command.guild!
   await guild.channels.fetch() // refresh cache
 
-  // Build the work plan ----------------------------------------------------
-  type PlannedChannel = {
-    discordId: string
-    discordName: string
-    harmonyType: 0 | 1
-    discordCategoryId: string | null
-    discordCategoryName: string | null
-  }
-
-  const planned: PlannedChannel[] = []
-  const planCategories = new Map<string, string>() // discordCategoryId -> name
-
-  for (const ch of guild.channels.cache.values()) {
-    if (ch.type === ChannelType.GuildCategory) {
-      planCategories.set(ch.id, ch.name)
-      continue
-    }
-    if (ch.type !== ChannelType.GuildText && ch.type !== ChannelType.GuildVoice) continue
-    if (ch.type === ChannelType.GuildVoice && !includeVoice) continue
-
-    const parent = ch.parentId ? guild.channels.cache.get(ch.parentId) : null
-    planned.push({
-      discordId: ch.id,
-      discordName: ch.name,
-      harmonyType: ch.type === ChannelType.GuildVoice ? 1 : 0,
-      discordCategoryId: ch.parentId ?? null,
-      discordCategoryName: parent?.name ?? null,
-    })
-  }
+  const { categories: discordCategories, channels: planned } = buildDiscordStructurePlan(
+    guild,
+    includeVoice,
+  )
 
   // Filter out anything already mapped - clone-server is strictly additive.
   const alreadyMapped = new Set(mapper.getAllMappings().map(m => m.discord))
@@ -1933,13 +1926,13 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
     ]
     const categoriesNeeded = new Set<string>()
     for (const p of toCreate) {
-      const reuse = harmonyChannelByName.get(p.discordName)
+      const reuse = harmonyChannelByName.get(p.name)
       const action = reuse ? `reuse Harmony \`${reuse.id.slice(0, 8)}...\`` : 'create Harmony channel'
       const cat = p.discordCategoryName ? `under category **${p.discordCategoryName}**` : ''
       if (p.discordCategoryName && !categoryIdByName.has(p.discordCategoryName)) {
         categoriesNeeded.add(p.discordCategoryName)
       }
-      lines.push(`• \`#${p.discordName}\` → ${action} ${cat}`.trimEnd())
+      lines.push(`• \`#${p.name}\` (order ${p.position}) → ${action} ${cat}`.trimEnd())
     }
     if (categoriesNeeded.size > 0) {
       lines.splice(
@@ -1963,38 +1956,54 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   let created = 0
   let reused = 0
   let categoriesCreated = 0
+  let categoriesOrderUpdated = 0
   const failures: string[] = []
   const newMappings: { discord: string; harmony: string; name?: string }[] = []
 
+  // 1. Ensure Harmony categories exist and match Discord order.
+  for (const cat of discordCategories) {
+    try {
+      const existing = categoryIdByName.get(cat.name)
+      if (existing) {
+        await harmonyClient.updateCategory(config.harmony.serverId, existing, {
+          order: cat.position,
+        })
+        categoriesOrderUpdated++
+      } else {
+        const newCat = await harmonyClient.createCategory(
+          config.harmony.serverId,
+          cat.name,
+          cat.position,
+        )
+        if (newCat.id) {
+          categoryIdByName.set(cat.name, newCat.id)
+        }
+        categoriesCreated++
+      }
+    } catch (err: any) {
+      failures.push(`category \`${cat.name}\`: ${err.message}`)
+    }
+  }
+
   for (const p of toCreate) {
     try {
-      // 1. Resolve / create Harmony category
       let harmonyCategoryId: string | null = null
       if (p.discordCategoryName) {
-        const existing = categoryIdByName.get(p.discordCategoryName)
-        if (existing) {
-          harmonyCategoryId = existing
-        } else {
-          const newCat = await harmonyClient.createCategory(config.harmony.serverId, p.discordCategoryName)
-          harmonyCategoryId = newCat.id
-          if (newCat.id && p.discordCategoryName) {
-            categoryIdByName.set(p.discordCategoryName, newCat.id)
-          }
-          categoriesCreated++
-        }
+        harmonyCategoryId = categoryIdByName.get(p.discordCategoryName) ?? null
       }
 
-      // 2. Reuse-by-name OR create channel
+      // 2. Reuse-by-name OR create channel (with Discord position as Harmony order).
       let harmonyChannelId: string
-      const reuse = harmonyChannelByName.get(p.discordName)
+      const reuse = harmonyChannelByName.get(p.name)
       if (reuse) {
         harmonyChannelId = reuse.id
         reused++
       } else {
         const newCh = await harmonyClient.createChannel(config.harmony.serverId, {
-          name: p.discordName,
+          name: p.name,
           type: p.harmonyType,
           categoryId: harmonyCategoryId,
+          order: p.position,
         })
         harmonyChannelId = newCh.id
         created++
@@ -2003,10 +2012,10 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
       newMappings.push({
         discord: p.discordId,
         harmony: harmonyChannelId,
-        name: p.discordName,
+        name: p.name,
       })
     } catch (err: any) {
-      failures.push(`\`#${p.discordName}\`: ${err.message}`)
+      failures.push(`\`#${p.name}\`: ${err.message}`)
     }
   }
 
@@ -2049,13 +2058,32 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
     }
   }
 
+  // 3c. Sync channel/category order for every mapped channel (new + existing).
+  let orderSync = { categoriesUpdated: 0, channelsUpdated: 0, failures: [] as string[] }
+  try {
+    orderSync = await syncDiscordStructureOrderToHarmony({
+      guild,
+      serverId: config.harmony.serverId,
+      harmonyClient,
+      getHarmonyChannelId: (discordId) => mapper.getHarmonyChannel(discordId),
+      includeVoice,
+    })
+    failures.push(...orderSync.failures)
+  } catch (err: any) {
+    failures.push(`order sync: ${err.message}`)
+  }
+
   // 4. Report back
   const summary: string[] = []
   summary.push(`✅ Clone complete for **${guild.name}**`)
   summary.push(`• Channels created: ${created}`)
   summary.push(`• Channels reused (matched by name): ${reused}`)
   summary.push(`• Categories created: ${categoriesCreated}`)
+  summary.push(`• Category orders updated: ${categoriesOrderUpdated}`)
   summary.push(`• Mappings written: ${added.length}`)
+  summary.push(
+    `• Order synced: ${orderSync.categoriesUpdated} categor${orderSync.categoriesUpdated === 1 ? 'y' : 'ies'}, ${orderSync.channelsUpdated} channel(s)`,
+  )
   if (cloneRoles) summary.push(`• Roles created: ${rolesCreated}`)
   if (failures.length) {
     summary.push('')
@@ -2064,6 +2092,55 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   }
 
   await command.editReply({ content: joinLinesWithinDiscordLimit(summary) })
+}
+
+/**
+ * `/bridge sync-order` — update Harmony category/channel `order` (and channel
+ * parent categories) from Discord for all mapped channels. Use after an
+ * earlier clone that didn't preserve order, or when Discord layout changes.
+ */
+async function runBridgeSyncOrder(command: ChatInputCommandInteraction) {
+  const includeVoice = command.options.getBoolean('include_voice', false) ?? true
+
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  await guild.channels.fetch()
+
+  const mappings = mapper.getAllMappings()
+  if (mappings.length === 0) {
+    await command.editReply({
+      content: '❌ No channel mappings configured. Run `/bridge clone-server` or `/bridge link` first.',
+    })
+    return
+  }
+
+  try {
+    const result = await syncDiscordStructureOrderToHarmony({
+      guild,
+      serverId: config.harmony.serverId,
+      harmonyClient,
+      getHarmonyChannelId: (discordId) => mapper.getHarmonyChannel(discordId),
+      includeVoice,
+    })
+
+    const lines = [
+      `✅ Order sync complete for **${guild.name}**`,
+      `• Categories updated: ${result.categoriesUpdated}`,
+      `• Mapped channels updated: ${result.channelsUpdated}`,
+    ]
+    if (result.failures.length > 0) {
+      lines.push('')
+      lines.push(`⚠️ ${result.failures.length} failure(s):`)
+      lines.push(...result.failures.slice(0, 15).map(f => `  • ${f}`))
+      if (result.failures.length > 15) {
+        lines.push(`  • …and ${result.failures.length - 15} more`)
+      }
+    }
+    await command.editReply({ content: joinLinesWithinDiscordLimit(lines) })
+  } catch (err: any) {
+    await command.editReply({ content: `❌ Order sync failed: ${err.message}` })
+  }
 }
 
 // Start Harmony client

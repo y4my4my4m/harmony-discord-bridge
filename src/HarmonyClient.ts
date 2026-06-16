@@ -320,6 +320,52 @@ export class HarmonyClient extends EventEmitter {
     return response.json()
   }
 
+  async updateCategory(
+    serverId: string,
+    categoryId: string,
+    opts: { order?: number; name?: string },
+  ): Promise<any> {
+    const response = await fetch(
+      `${this.apiUrl}/api/v1/servers/${serverId}/categories/${categoryId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bot ${this.botToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(opts),
+      },
+    )
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to update category (${response.status})`)
+    }
+    return response.json()
+  }
+
+  async updateChannel(
+    channelId: string,
+    opts: { order?: number; categoryId?: string | null },
+  ): Promise<any> {
+    const body: Record<string, unknown> = {}
+    if (typeof opts.order === 'number') body.order = opts.order
+    if (opts.categoryId !== undefined) body.category_id = opts.categoryId
+
+    const response = await fetch(`${this.apiUrl}/api/v1/channels/${channelId}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bot ${this.botToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to update channel (${response.status})`)
+    }
+    return response.json()
+  }
+
   async getServerRoles(serverId: string): Promise<any[]> {
     const response = await fetch(`${this.apiUrl}/api/v1/servers/${serverId}/roles`, {
       headers: { 'Authorization': `Bot ${this.botToken}` }

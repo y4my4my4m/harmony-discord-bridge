@@ -1456,12 +1456,12 @@ async function registerSlashCommands(guildId: string) {
     addUserOptions(
       new SlashCommandBuilder()
         .setName('mention')
-        .setDescription('Mention Harmony users (Harmony only — use normal chat for Discord-visible messages)')
+        .setDescription('Mention Harmony user(s) with a message (visible in Discord + Harmony)')
     ),
     addUserOptions(
       new SlashCommandBuilder()
         .setName('m')
-        .setDescription('Quick Harmony mention (Harmony only — type @user in chat for Discord)')
+        .setDescription('Quick mention a Harmony user with a message')
     ),
     bridgeCommand,
   ]
@@ -1620,30 +1620,42 @@ discordClient.on('interactionCreate', async (interaction) => {
         bridge_source: 'discord'
       }
       
+      await command.deferReply()
+
       try {
-        await harmonyClient.sendMessage(
+        const result = await harmonyClient.sendMessage(
           harmonyChannelId,
           contentParts,
           discordMetadata
         )
+        const harmonyMessageId = result?.id ?? result?.message?.id
 
         console.log(`✅ Slash command sent to Harmony`)
 
-        const mentionList = mentionedUsers
+        const mentionDisplay = mentionedUsers
           .map(u => formatHarmonyUserHandle(u.username, u.domain, u.isLocal))
-          .join(', ')
-        await command.reply({
-          content: mentionList
-            ? `✅ Mentioned ${mentionList} in Harmony. For a normal Discord message others can see, type \`@user your text\` in this channel instead of /m.`
-            : '✅ Sent to Harmony. For a normal Discord message others can see, type your message in this channel instead of /m.',
-          flags: MessageFlags.Ephemeral,
+          .join(' ')
+        const discordDisplayText = message
+          ? `${mentionDisplay} ${message}`.trim()
+          : mentionDisplay
+
+        const replyMsg = await command.editReply({
+          content: discordDisplayText || '✅ Sent to Harmony',
         })
+
+        // Map slash reply ↔ Harmony for reply threading (best-effort).
+        const discordMessageId = typeof replyMsg === 'object' && replyMsg && 'id' in replyMsg
+          ? replyMsg.id
+          : null
+        if (harmonyMessageId && discordMessageId) {
+          discordToHarmonyMessages.set(discordMessageId, harmonyMessageId)
+          harmonyToDiscordMessages.set(harmonyMessageId, discordMessageId)
+        }
       } catch (error: any) {
         console.error('❌ Failed to send message:', error)
-        await command.reply({
+        await command.editReply({
           content: `❌ Failed to send: ${error.message}`,
-          flags: MessageFlags.Ephemeral
-        })
+        }).catch(() => {})
       }
     } else if (command.commandName === 'bridge') {
       await handleBridgeCommand(command)

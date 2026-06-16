@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
+import { dirname } from 'path'
 import { parse, stringify } from 'yaml'
 
 export interface RoleMapping {
@@ -17,7 +18,7 @@ export class PermissionSyncStore {
   private path: string
   private data: StoreData
 
-  constructor(path: string = './config/permission-sync.yml') {
+  constructor(path: string = './data/permission-sync.yml') {
     this.path = path
     this.data = this.load()
   }
@@ -31,6 +32,10 @@ export class PermissionSyncStore {
   }
 
   private save() {
+    const dir = dirname(this.path)
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true })
+    }
     writeFileSync(this.path, stringify(this.data), 'utf8')
   }
 

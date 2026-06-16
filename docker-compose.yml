@@ -15,5 +15,5 @@ services:
     container_name: harmony-discord-bridge
     restart: unless-stopped
     volumes:
-      # Mounted read-only; the bridge hot-reloads channel mappings on change.
-      - ./config:/app/config:ro
+      - ./config:/app/config
+      - ./data:/app/data

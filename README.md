@@ -15,6 +15,19 @@ docker compose up -d
 docker compose logs -f
 ```
 
+**Without Docker:**
+
+```bash
+cp config/bridge-config.example.yml config/bridge-config.yml
+npm ci && npm run build
+npm start
+```
+
+`config/` holds your editable config (`bridge-config.yml`). `data/` holds
+runtime state the bridge writes itself (e.g. `permission-sync.yml` when
+`syncPermissions: true`). Both folders ship in the repo; only their contents
+are gitignored.
+
 Config hot-reloads when you edit `bridge-config.yml`.
 
 ## URLs
@@ -105,8 +118,8 @@ channelMappings:
 
 `/mention` / `/m` — ping Harmony users from Discord (autocomplete).
 
-`/bridge` — manage mappings from Discord (needs Manage Server; mutating stuff
-needs server owner). Subcommands: `status`, `link`, `unlink`, `clone-server`.
+`/bridge` — manage mappings from Discord (needs **Administrator**). Subcommands:
+`status`, `link`, `unlink`, `clone-server`.
 
 `clone-server` copies Discord channels (and optionally roles) into Harmony.
 Additive only — safe to re-run. Doesn't copy member role assignments (no account
@@ -126,7 +139,8 @@ settings:
 ```
 
 `syncPermissions: true` mirrors Discord role/channel override changes into
-Harmony live. Still doesn't sync who has which role.
+Harmony live. Still doesn't sync who has which role. Mappings are persisted to
+`data/permission-sync.yml` (created automatically).
 
 ## Attachments
 

@@ -24,7 +24,7 @@ RUN npm ci --only=production
 
 COPY --from=builder /app/dist ./dist
 
-# Config is mounted at runtime
-VOLUME ["/app/config"]
+# Config + runtime state are mounted at runtime
+VOLUME ["/app/config", "/app/data"]
 
 CMD ["node", "dist/index.js"]

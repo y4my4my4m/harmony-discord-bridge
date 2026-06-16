@@ -13,6 +13,7 @@ import {
   Events,
   ChatInputCommandInteraction,
   AutocompleteInteraction,
+  PermissionFlagsBits,
   type Role as DiscordRole
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
@@ -313,7 +314,7 @@ const harmonyClient = new HarmonyClient(
   config.harmony.apiUrl
 )
 
-const permissionSyncStore = new PermissionSyncStore('./config/permission-sync.yml')
+const permissionSyncStore = new PermissionSyncStore('./data/permission-sync.yml')
 const permissionSync = new PermissionSync(harmonyClient, discordClient, mapper, permissionSyncStore)
 
 // =====================================================
@@ -1228,14 +1229,13 @@ async function registerSlashCommands(guildId: string) {
   }
   
   // /bridge ... subcommands for admins to manage mappings without YAML edits.
-  // Discord renders these as a single command with picker UX. We gate
-  // execution to the guild owner + Harmony server owner inside the handler;
-  // visibility we coarse-gate by setting `setDefaultMemberPermissions` to
-  // `ManageGuild` so it doesn't clutter normal members' command palette.
+  // Discord renders these as a single command with picker UX. Execution is
+  // gated to members with Administrator inside the handler; visibility uses the
+  // same permission so it doesn't clutter normal members' command palette.
   const bridgeCommand = new SlashCommandBuilder()
     .setName('bridge')
     .setDescription('Manage the Harmony bridge for this server')
-    .setDefaultMemberPermissions('32') // PermissionFlagsBits.ManageGuild
+    .setDefaultMemberPermissions('8') // PermissionFlagsBits.Administrator
     .addSubcommand(sub =>
       sub
         .setName('status')
@@ -1506,34 +1506,36 @@ discordClient.on('interactionCreate', async (interaction) => {
 // =====================================================
 // /bridge slash command handlers
 // =====================================================
-//
-// Owner gate is enforced PER SUBCOMMAND (not at registration) so that:
-//   - Discord guild owners still see the command in the picker (we use
-//     Discord's `ManageGuild` perm for visibility), but
-//   - we additionally verify they are ALSO the Harmony server owner before
-//     mutating any state. This is the "two-key" rule the user asked for:
-//     bridge configuration requires owner consent on both sides.
+// Gate: Discord Administrator. Harmony side is enforced by bot permissions on
+// the configured server (manage_channels etc.) — no cross-platform account link.
 
 async function handleBridgeCommand(command: ChatInputCommandInteraction) {
-  // Owner gate. Discord side first (cheap), then Harmony side (network).
   const guild = command.guild
   if (!guild) {
     await command.reply({ content: '❌ This command can only be used in a server.', ephemeral: true })
     return
   }
-  if (guild.ownerId !== command.user.id) {
+
+  const member = command.member
+  if (!member) {
     await command.reply({
-      content: '❌ Only the **Discord server owner** can manage the bridge.',
+      content: '❌ Could not verify your permissions.',
+      ephemeral: true,
+    })
+    return
+  }
+  const perms = member.permissions
+  const isAdmin = typeof perms === 'string'
+    ? (BigInt(perms) & PermissionFlagsBits.Administrator) === PermissionFlagsBits.Administrator
+    : perms.has(PermissionFlagsBits.Administrator)
+  if (!isAdmin) {
+    await command.reply({
+      content: '❌ You need the **Administrator** permission to manage the bridge.',
       ephemeral: true,
     })
     return
   }
 
-  // Harmony side: we only know our configured serverId. Verify the invoker
-  // is its owner by looking up the Harmony user that this Discord user is
-  // mapped to (via puppeted user metadata) - for now, require the Harmony
-  // server owner to also be the one configuring it from Discord. We compare
-  // against the configured `harmony.serverId` and its owner via the bot API.
   if (!config.harmony.serverId) {
     await command.reply({
       content: '❌ `harmony.serverId` is not set in bridge-config.yml.',
@@ -1542,13 +1544,8 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
     return
   }
 
-  // We can't infer "is this Discord user also the Harmony server owner"
-  // because there's no SSO/account link between the two platforms in
-  // general. The Discord-owner gate above is the operational answer; the
-  // bot's `manage_channels` permission on the Harmony side (granted by the
-  // Harmony server owner at install time) is the Harmony-side gate. If the
-  // bot lacks that perm, every clone/link call below will hard-fail with 403
-  // - which is exactly what we want.
+  // Bot `manage_channels` on the Harmony side (granted at install) is the
+  // Harmony gate. Without it, clone/link calls below fail with 403.
 
   const sub = command.options.getSubcommand(true)
 

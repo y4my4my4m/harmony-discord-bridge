@@ -50,8 +50,6 @@ if (!harmonyBaseUrl.hostname || harmonyBaseUrl.hostname === 'localhost') {
 
 const translator = new MessageTranslator()
 translator.setHarmonyDomain(harmonyBaseUrl.hostname)
-
-// Webhook cache for puppeting
 const webhookCache = new Map<string, Webhook>()
 /** Channels where we already warned about missing Manage Webhooks. */
 const webhookPermissionWarned = new Set<string>()
@@ -233,6 +231,32 @@ function searchHarmonyUsers(query: string): CachedHarmonyUser[] {
   
   return results
 }
+
+function findHarmonyMember(username: string, domain: string | null = null): CachedHarmonyUser | null {
+  const lowerUser = username.toLowerCase()
+  for (const user of harmonyUserCache.values()) {
+    if (user.username.toLowerCase() !== lowerUser) continue
+    if (domain) {
+      if (user.domain?.toLowerCase() === domain.toLowerCase()) return user
+      continue
+    }
+    if (user.isLocal) return user
+  }
+  return null
+}
+
+function harmonyUserToMentionPart(user: CachedHarmonyUser) {
+  return {
+    type: 'mention',
+    userId: user.id,
+    username: user.username,
+    domain: user.domain || harmonyBaseUrl.hostname,
+    isLocal: user.isLocal,
+    displayName: user.displayName,
+  }
+}
+
+translator.setHarmonyMemberLookup((username, domain) => findHarmonyMember(username, domain))
 
 // Track ready states for bridge data registration
 let discordReady = false
@@ -1432,12 +1456,12 @@ async function registerSlashCommands(guildId: string) {
     addUserOptions(
       new SlashCommandBuilder()
         .setName('mention')
-        .setDescription('Mention Harmony user(s) with a message')
+        .setDescription('Mention Harmony users (Harmony only — use normal chat for Discord-visible messages)')
     ),
     addUserOptions(
       new SlashCommandBuilder()
         .setName('m')
-        .setDescription('Quick mention Harmony user(s)')
+        .setDescription('Quick Harmony mention (Harmony only — type @user in chat for Discord)')
     ),
     bridgeCommand,
   ]
@@ -1518,20 +1542,12 @@ discordClient.on('interactionCreate', async (interaction) => {
       // Build content parts: mentions first, then message
       const contentParts: any[] = []
       const mentionedUsers: CachedHarmonyUser[] = []
-      const harmonyDomain = new URL(config.harmony.baseUrl).hostname
       
       // Add all user mentions
       for (const userId of userIds) {
         const harmonyUser = harmonyUserCache.get(userId)
         if (harmonyUser) {
-          contentParts.push({
-            type: 'mention',
-            userId: harmonyUser.id,
-            username: harmonyUser.username,
-            domain: harmonyUser.domain || harmonyDomain,
-            isLocal: harmonyUser.isLocal,
-            displayName: harmonyUser.displayName,
-          })
+          contentParts.push(harmonyUserToMentionPart(harmonyUser))
           mentionedUsers.push(harmonyUser)
           console.log(`🔔 Adding mention: ${formatHarmonyUserHandle(
             harmonyUser.username,
@@ -1604,53 +1620,30 @@ discordClient.on('interactionCreate', async (interaction) => {
         bridge_source: 'discord'
       }
       
-      await command.deferReply({ flags: MessageFlags.Ephemeral })
-
       try {
-        const discordChannel = command.channel as TextChannel
-
-        const result = await harmonyClient.sendMessage(
+        await harmonyClient.sendMessage(
           harmonyChannelId,
           contentParts,
           discordMetadata
         )
-        const harmonyMessageId = result?.id ?? result?.message?.id
 
         console.log(`✅ Slash command sent to Harmony`)
 
-        const mentionDisplay = mentionedUsers
+        const mentionList = mentionedUsers
           .map(u => formatHarmonyUserHandle(u.username, u.domain, u.isLocal))
-          .join(' ')
-        const discordDisplayText = message
-          ? `${mentionDisplay} ${message}`.trim()
-          : mentionDisplay
-
-        if (discordDisplayText) {
-          const outbound = await sendHarmonyToDiscord(discordChannel, {
-            content: discordDisplayText,
-            username: formatHarmonyDisplayNameForDiscord(
-              member?.displayName || command.user.username,
-              command.user.username,
-            ),
-            avatarURL: command.user.displayAvatarURL({ size: 256 }),
-          })
-
-          if (harmonyMessageId && outbound?.discordMessageId) {
-            discordToHarmonyMessages.set(outbound.discordMessageId, harmonyMessageId)
-            harmonyToDiscordMessages.set(harmonyMessageId, outbound.discordMessageId)
-            console.log(
-              `📌 Stored /m mapping: Discord ${outbound.discordMessageId} <-> Harmony ${harmonyMessageId}`,
-            )
-          }
-        }
-
-        // Visible message is the webhook post; drop ephemeral ack so the channel isn't empty.
-        await command.deleteReply().catch(() => {})
+          .join(', ')
+        await command.reply({
+          content: mentionList
+            ? `✅ Mentioned ${mentionList} in Harmony. For a normal Discord message others can see, type \`@user your text\` in this channel instead of /m.`
+            : '✅ Sent to Harmony. For a normal Discord message others can see, type your message in this channel instead of /m.',
+          flags: MessageFlags.Ephemeral,
+        })
       } catch (error: any) {
         console.error('❌ Failed to send message:', error)
-        await command.editReply({
+        await command.reply({
           content: `❌ Failed to send: ${error.message}`,
-        }).catch(() => {})
+          flags: MessageFlags.Ephemeral
+        })
       }
     } else if (command.commandName === 'bridge') {
       await handleBridgeCommand(command)

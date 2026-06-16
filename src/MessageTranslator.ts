@@ -56,9 +56,18 @@ function splitGluedUrlsInParts(parts: any[]): any[] {
   return result
 }
 
+export interface HarmonyMentionLookup {
+  id: string
+  username: string
+  displayName: string
+  domain: string | null
+  isLocal: boolean
+}
+
 export class MessageTranslator {
   private serverId: string | null = null
   private harmonyDomain: string | null = null
+  private harmonyMemberLookup: ((username: string, domain: string | null) => HarmonyMentionLookup | null) | null = null
   
   /**
    * Set the server ID for emoji lookups
@@ -76,6 +85,38 @@ export class MessageTranslator {
       throw new Error('Harmony domain is required')
     }
     this.harmonyDomain = domain
+  }
+
+  /** Resolve @user / @user@domain plain-text mentions against the Harmony member cache. */
+  setHarmonyMemberLookup(
+    lookup: (username: string, domain: string | null) => HarmonyMentionLookup | null,
+  ) {
+    this.harmonyMemberLookup = lookup
+  }
+
+  private buildHarmonyMentionPart(
+    username: string,
+    domain: string | null,
+    lookup: HarmonyMentionLookup | null,
+  ) {
+    if (lookup) {
+      return {
+        type: 'mention',
+        userId: lookup.id,
+        username: lookup.username,
+        domain: lookup.domain || this.getHarmonyDomain(),
+        isLocal: lookup.isLocal,
+        displayName: lookup.displayName,
+      }
+    }
+    return {
+      type: 'mention',
+      userId: `unresolved-${username}`,
+      username,
+      domain: domain || null,
+      isLocal: !domain,
+      displayName: username,
+    }
   }
   
   /**
@@ -204,7 +245,8 @@ export class MessageTranslator {
       // These are typed manually in Discord (not using Discord's autocomplete)
       // Convert them to proper mention parts so they appear as mentions in Harmony
       const processedParts: any[] = []
-      const plainMentionRegex = /@([a-zA-Z0-9_-]+)(?!\S)/g
+      // @user or @user@domain (federated) typed as plain text in Discord chat
+      const plainMentionRegex = /@([a-zA-Z0-9_-]+)(?:@([a-zA-Z0-9._-]+))?(?!\w)/g
       
       for (const part of parts) {
         if (part.type === 'text') {
@@ -219,17 +261,14 @@ export class MessageTranslator {
             }
             
             const username = mentionMatch[1]
-            console.log(`🔔 D→H Plain mention detected: @${username} (Harmony user)`)
-            
-            // Create mention part for Harmony user
-            processedParts.push({
-              type: 'mention',
-              userId: `unresolved-${username}`, // Will be resolved by Harmony
-              username: username,
-              domain: null, // Local user
-              isLocal: true,
-              displayName: username
-            })
+            const federatedDomain = mentionMatch[2] || null
+            const lookup = this.harmonyMemberLookup?.(username, federatedDomain) ?? null
+            console.log(
+              `🔔 D→H Plain mention: @${username}${federatedDomain ? `@${federatedDomain}` : ''}`
+              + (lookup ? ` → ${lookup.id}` : ' (unresolved)'),
+            )
+
+            processedParts.push(this.buildHarmonyMentionPart(username, federatedDomain, lookup))
             
             textLastIndex = plainMentionRegex.lastIndex
           }

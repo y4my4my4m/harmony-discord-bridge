@@ -211,6 +211,16 @@ export class HarmonyClient extends EventEmitter {
     return response.json()
   }
 
+  async getMessage(messageId: string): Promise<any | null> {
+    const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}`, {
+      headers: {
+        Authorization: `Bot ${this.botToken}`,
+      },
+    })
+    if (!response.ok) return null
+    return response.json()
+  }
+
   async silentUpdateMessageContent(messageId: string, content: any[]): Promise<void> {
     const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}/content-silent`, {
       method: 'PATCH',

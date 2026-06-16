@@ -29,7 +29,7 @@ import {
   discordColorToHex,
 } from './utils/discordPermissions.js'
 import { joinLinesWithinDiscordLimit } from './utils/discordMessage.js'
-import { formatHarmonyDisplayNameForDiscord } from './utils/discordDisplayName.js'
+import { formatHarmonyDisplayNameForDiscord, formatHarmonyUserAutocompleteLabel, formatHarmonyUserHandle } from './utils/discordDisplayName.js'
 import * as dotenv from 'dotenv'
 
 dotenv.config()
@@ -136,6 +136,8 @@ interface CachedHarmonyUser {
   id: string
   username: string
   displayName: string
+  domain: string | null
+  isLocal: boolean
   avatarUrl: string | null
 }
 const harmonyUserCache = new Map<string, CachedHarmonyUser>()
@@ -182,11 +184,15 @@ async function refreshHarmonyUserCache(options: { verbose?: boolean } = {}) {
 
     for (const member of members) {
       if (member.user) {
+        const username = member.user.username || 'unknown'
+        const isLocal = member.user.is_local !== false
         harmonyUserCache.set(member.user.id, {
           id: member.user.id,
-          username: member.user.username || 'unknown',
-          displayName: member.user.display_name || member.user.username || 'Unknown',
-          avatarUrl: member.user.avatar || null
+          username,
+          displayName: formatHarmonyDisplayNameForDiscord(member.user.display_name, username),
+          domain: member.user.domain ?? null,
+          isLocal,
+          avatarUrl: member.user.avatar || null,
         })
       }
     }
@@ -194,7 +200,9 @@ async function refreshHarmonyUserCache(options: { verbose?: boolean } = {}) {
     if (verbose) {
       console.log(`✅ Harmony user cache: ${harmonyUserCache.size} users`)
       const firstUsers = Array.from(harmonyUserCache.values()).slice(0, 3)
-      firstUsers.forEach(u => console.log(`   👤 ${u.displayName} (@${u.username})`))
+      firstUsers.forEach(u => console.log(
+        `   👤 ${u.displayName} (${formatHarmonyUserHandle(u.username, u.domain, u.isLocal)})`,
+      ))
     } else if (harmonyUserCache.size !== prevSize) {
       console.log(`🔄 Harmony user cache: ${prevSize} → ${harmonyUserCache.size} users`)
     }
@@ -211,9 +219,12 @@ function searchHarmonyUsers(query: string): CachedHarmonyUser[] {
   const results: CachedHarmonyUser[] = []
   
   for (const user of harmonyUserCache.values()) {
+    const handle = formatHarmonyUserHandle(user.username, user.domain, user.isLocal).toLowerCase()
     if (
       user.username.toLowerCase().includes(lowerQuery) ||
-      user.displayName.toLowerCase().includes(lowerQuery)
+      user.displayName.toLowerCase().includes(lowerQuery) ||
+      handle.includes(lowerQuery) ||
+      (user.domain && user.domain.toLowerCase().includes(lowerQuery))
     ) {
       results.push(user)
       if (results.length >= 25) break // Discord autocomplete limit
@@ -315,9 +326,54 @@ interface OutboundDiscordMessage {
 /** Post a Harmony-originated message to Discord. Webhook first (puppeting), else bot send. */
 async function sendHarmonyToDiscord(
   channel: TextChannel,
-  opts: { content: string; username: string; avatarURL?: string },
+  opts: { content: string; username: string; avatarURL?: string; replyToDiscordMessageId?: string },
 ): Promise<OutboundDiscordMessage | null> {
+  const me = channel.client.user
   const webhook = await getOrCreateWebhook(channel.id)
+
+  // Replies: try webhook + message_reference (keeps puppeting when supported), else bot send.
+  if (opts.replyToDiscordMessageId) {
+    if (webhook) {
+      try {
+        const response = await fetch(`${webhook.url}?wait=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: opts.content,
+            username: opts.username,
+            avatar_url: opts.avatarURL,
+            allowed_mentions: { parse: [] },
+            message_reference: {
+              message_id: opts.replyToDiscordMessageId,
+              fail_if_not_exists: false,
+            },
+          }),
+        })
+        if (response.ok) {
+          const sent = await response.json() as { id?: string }
+          if (sent?.id) return { discordMessageId: sent.id, viaWebhook: true }
+        }
+      } catch {
+        // Fall through to bot send with native reply.
+      }
+    }
+
+    if (me && channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
+      const sent = await channel.send({
+        content: opts.content,
+        allowedMentions: { parse: [] },
+        reply: {
+          messageReference: opts.replyToDiscordMessageId,
+          failIfNotExists: false,
+        },
+      })
+      return { discordMessageId: sent.id, viaWebhook: false }
+    }
+
+    console.error(`❌ Cannot reply in #${channel.name}: need Send Messages`)
+    return null
+  }
+
   if (webhook) {
     const sent = await webhook.send({
       content: opts.content,
@@ -329,7 +385,6 @@ async function sendHarmonyToDiscord(
     return { discordMessageId: sent.id, viaWebhook: true }
   }
 
-  const me = channel.client.user
   if (!me) {
     console.error('❌ Discord client not ready')
     return null
@@ -418,6 +473,25 @@ const harmonyClient = new HarmonyClient(
   config.harmony.gatewayUrl,
   config.harmony.apiUrl
 )
+
+/** Map a Harmony reply parent to its Discord message ID (in-memory map + metadata fallback). */
+async function resolveParentDiscordId(harmonyReplyToId: string): Promise<string | null> {
+  const mapped = harmonyToDiscordMessages.get(harmonyReplyToId)
+  if (mapped) return mapped
+
+  try {
+    const parent = await harmonyClient.getMessage(harmonyReplyToId)
+    const discordId = parent?.metadata?.discord_message_id
+    if (discordId && parent?.id) {
+      discordToHarmonyMessages.set(discordId, parent.id)
+      harmonyToDiscordMessages.set(parent.id, discordId)
+      return discordId
+    }
+  } catch {
+    // Parent lookup failed — send without reply reference.
+  }
+  return null
+}
 
 const permissionSyncStore = new PermissionSyncStore('./data/permission-sync.yml')
 const permissionSync = new PermissionSync(harmonyClient, discordClient, mapper, permissionSyncStore)
@@ -844,36 +918,22 @@ harmonyClient.on('messageCreate', async (msg: any) => {
       return
     }
 
-    let finalContent = contentText
+    let replyToDiscordMessageId: string | undefined
     if (msg.reply_to) {
-      const parentDiscordId = harmonyToDiscordMessages.get(msg.reply_to)
-      try {
-        if (parentDiscordId) {
-          const parentMsg = await discordChannel.messages.fetch(parentDiscordId).catch(() => null)
-          if (parentMsg) {
-            const snippet = (parentMsg.content || '[no text]')
-              .replace(/\n/g, ' ')
-              .slice(0, 80)
-            const replyAuthor = parentMsg.author?.username
-              ? `**@${parentMsg.author.username}**`
-              : 'message'
-            finalContent = `> ${replyAuthor}: ${snippet}${parentMsg.content && parentMsg.content.length > 80 ? '...' : ''}\n${contentText}`
-          } else {
-            finalContent = `> *replying to an earlier message*\n${contentText}`
-          }
-        } else {
-          finalContent = `> *replying to an earlier message*\n${contentText}`
-        }
-      } catch {
-        // Ignore - fall back to unprefixed content.
+      const parentDiscordId = await resolveParentDiscordId(msg.reply_to)
+      if (parentDiscordId) {
+        replyToDiscordMessageId = parentDiscordId
+      } else {
+        console.log(`⚠️ Harmony reply parent ${msg.reply_to} has no Discord mapping; sending without reply reference`)
       }
     }
 
     console.log(`🔨 Sending to Discord as ${uniqueUsername}...`)
     const outbound = await sendHarmonyToDiscord(discordChannel, {
-      content: finalContent,
+      content: contentText,
       username: uniqueUsername,
       avatarURL: avatarURL,
+      replyToDiscordMessageId,
     })
 
     if (!outbound) {
@@ -1413,9 +1473,14 @@ discordClient.on('interactionCreate', async (interaction) => {
       
       await autocomplete.respond(
         matches.map(user => ({
-          name: `${user.displayName} (@${user.username})`,
-          value: user.id
-        }))
+          name: formatHarmonyUserAutocompleteLabel(
+            user.displayName,
+            user.username,
+            user.domain,
+            user.isLocal,
+          ),
+          value: user.id,
+        })),
       )
     }
     return
@@ -1452,6 +1517,7 @@ discordClient.on('interactionCreate', async (interaction) => {
       // Build content parts: mentions first, then message
       const contentParts: any[] = []
       const mentionedUsers: CachedHarmonyUser[] = []
+      const harmonyDomain = new URL(config.harmony.baseUrl).hostname
       
       // Add all user mentions
       for (const userId of userIds) {
@@ -1461,12 +1527,16 @@ discordClient.on('interactionCreate', async (interaction) => {
             type: 'mention',
             userId: harmonyUser.id,
             username: harmonyUser.username,
-            domain: null,
-            isLocal: true,
-            displayName: harmonyUser.displayName
+            domain: harmonyUser.domain || harmonyDomain,
+            isLocal: harmonyUser.isLocal,
+            displayName: harmonyUser.displayName,
           })
           mentionedUsers.push(harmonyUser)
-          console.log(`🔔 Adding mention: @${harmonyUser.username}`)
+          console.log(`🔔 Adding mention: ${formatHarmonyUserHandle(
+            harmonyUser.username,
+            harmonyUser.domain,
+            harmonyUser.isLocal,
+          )}`)
         }
       }
       
@@ -1518,11 +1588,6 @@ discordClient.on('interactionCreate', async (interaction) => {
         }
       }
       
-      // Build Discord display text - extract domain from config baseUrl
-      const harmonyDomain = new URL(config.harmony.baseUrl).hostname
-      const mentionDisplay = mentionedUsers.map(u => `@${u.username}@${harmonyDomain}`).join(' ')
-      const discordDisplayText = message ? `${mentionDisplay} ${message}` : mentionDisplay
-      
       console.log(`📤 Sending ${contentParts.length} parts to Harmony`)
       
       // Get Discord user metadata for attribution
@@ -1539,8 +1604,10 @@ discordClient.on('interactionCreate', async (interaction) => {
       }
       
       try {
-        // Send directly to Harmony with proper mention parts
-        const harmonyMsg = await harmonyClient.sendMessage(
+        // Post to Harmony only. The message is attributed to the Discord user via
+        // discord_user metadata; bridge_source:'discord' prevents a Harmony→Discord
+        // echo. Posting again on Discord via webhook looked like the APP bot sent it.
+        await harmonyClient.sendMessage(
           harmonyChannelId,
           contentParts,
           discordMetadata
@@ -1548,27 +1615,9 @@ discordClient.on('interactionCreate', async (interaction) => {
         
         console.log(`✅ Slash command sent to Harmony`)
         
-        // Also send to Discord channel so other Discord users see it
-        const outbound = await sendHarmonyToDiscord(
-          (await discordClient.channels.fetch(command.channelId)) as TextChannel,
-          {
-            content: discordDisplayText,
-            username: formatHarmonyDisplayNameForDiscord(
-              member?.displayName || command.user.username,
-              command.user.username,
-            ),
-            avatarURL: command.user.displayAvatarURL(),
-          },
-        )
-
-        if (harmonyMsg?.id && outbound) {
-          discordToHarmonyMessages.set(outbound.discordMessageId, harmonyMsg.id)
-          harmonyToDiscordMessages.set(harmonyMsg.id, outbound.discordMessageId)
-          harmonyDiscordViaWebhook.set(harmonyMsg.id, outbound.viaWebhook)
-        }
-        
-        // Acknowledge the command
-        const mentionList = mentionedUsers.map(u => `@${u.username}`).join(', ')
+        const mentionList = mentionedUsers
+          .map(u => formatHarmonyUserHandle(u.username, u.domain, u.isLocal))
+          .join(', ')
         await command.reply({ 
           content: `✅ Mentioned ${mentionList} in Harmony`, 
           flags: MessageFlags.Ephemeral 

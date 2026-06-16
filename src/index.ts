@@ -248,31 +248,32 @@ function registerBridgeDataWithGateway() {
     console.log(`⏳ Bridge data registration waiting: Discord=${discordReady}, Harmony=${harmonyReady}`)
     return
   }
-  
-  // Build channel data with members for each mapping
+
+  const members = Array.from(discordMemberDetails.values()).map(m => ({
+    id: m.id,
+    username: m.username,
+    displayName: m.displayName,
+    avatarUrl: m.avatarUrl,
+    source: 'discord' as const,
+  }))
+
   const channels = config.channelMappings.map(mapping => ({
     harmonyChannelId: mapping.harmony,
     discordChannelId: mapping.discord,
-    members: Array.from(discordMemberDetails.values()).map(m => ({
-      id: m.id,
-      username: m.username,
-      displayName: m.displayName,
-      avatarUrl: m.avatarUrl,
-      source: 'discord' as const
-    }))
   }))
-  
+
   console.log('╔════════════════════════════════════════╗')
   console.log('║   🌉 Registering Bridge Data          ║')
   console.log('╠════════════════════════════════════════╣')
   console.log(`║   Channels: ${channels.length}`)
-  console.log(`║   Discord Members: ${discordMemberDetails.size}`)
+  console.log(`║   Discord members (guild): ${members.length}`)
+  console.log(`║   Harmony members (autocomplete): ${harmonyUserCache.size}`)
   channels.forEach(ch => {
     console.log(`║   📍 ${ch.harmonyChannelId.substring(0, 8)}... <-> Discord ${ch.discordChannelId}`)
   })
   console.log('╚════════════════════════════════════════╝')
-  
-  harmonyClient.registerBridgeData(channels)
+
+  harmonyClient.registerBridgeData(channels, members)
 }
 
 // Get or create webhook for channel (for puppeting)
@@ -1603,31 +1604,53 @@ discordClient.on('interactionCreate', async (interaction) => {
         bridge_source: 'discord'
       }
       
+      await command.deferReply({ flags: MessageFlags.Ephemeral })
+
       try {
-        // Post to Harmony only. The message is attributed to the Discord user via
-        // discord_user metadata; bridge_source:'discord' prevents a Harmony→Discord
-        // echo. Posting again on Discord via webhook looked like the APP bot sent it.
-        await harmonyClient.sendMessage(
+        const discordChannel = command.channel as TextChannel
+
+        const result = await harmonyClient.sendMessage(
           harmonyChannelId,
           contentParts,
           discordMetadata
         )
-        
+        const harmonyMessageId = result?.id ?? result?.message?.id
+
         console.log(`✅ Slash command sent to Harmony`)
-        
-        const mentionList = mentionedUsers
+
+        const mentionDisplay = mentionedUsers
           .map(u => formatHarmonyUserHandle(u.username, u.domain, u.isLocal))
-          .join(', ')
-        await command.reply({ 
-          content: `✅ Mentioned ${mentionList} in Harmony`, 
-          flags: MessageFlags.Ephemeral 
-        })
+          .join(' ')
+        const discordDisplayText = message
+          ? `${mentionDisplay} ${message}`.trim()
+          : mentionDisplay
+
+        if (discordDisplayText) {
+          const outbound = await sendHarmonyToDiscord(discordChannel, {
+            content: discordDisplayText,
+            username: formatHarmonyDisplayNameForDiscord(
+              member?.displayName || command.user.username,
+              command.user.username,
+            ),
+            avatarURL: command.user.displayAvatarURL({ size: 256 }),
+          })
+
+          if (harmonyMessageId && outbound?.discordMessageId) {
+            discordToHarmonyMessages.set(outbound.discordMessageId, harmonyMessageId)
+            harmonyToDiscordMessages.set(harmonyMessageId, outbound.discordMessageId)
+            console.log(
+              `📌 Stored /m mapping: Discord ${outbound.discordMessageId} <-> Harmony ${harmonyMessageId}`,
+            )
+          }
+        }
+
+        // Visible message is the webhook post; drop ephemeral ack so the channel isn't empty.
+        await command.deleteReply().catch(() => {})
       } catch (error: any) {
         console.error('❌ Failed to send message:', error)
-        await command.reply({
+        await command.editReply({
           content: `❌ Failed to send: ${error.message}`,
-          flags: MessageFlags.Ephemeral
-        })
+        }).catch(() => {})
       }
     } else if (command.commandName === 'bridge') {
       await handleBridgeCommand(command)

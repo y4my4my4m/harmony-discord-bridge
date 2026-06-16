@@ -657,33 +657,45 @@ export class HarmonyClient extends EventEmitter {
    * This sends channel mappings and Discord member data to the gateway
    * so the frontend can query bridged users for autosuggest
    */
-  registerBridgeData(channels: Array<{
-    harmonyChannelId: string
-    discordChannelId: string
-    members: Array<{
+  registerBridgeData(
+    channels: Array<{
+      harmonyChannelId: string
+      discordChannelId: string
+      members?: Array<{
+        id: string
+        username: string
+        displayName: string
+        avatarUrl: string
+        source: 'discord'
+      }>
+    }>,
+    sharedMembers?: Array<{
       id: string
       username: string
       displayName: string
       avatarUrl: string
       source: 'discord'
-    }>
-  }>) {
+    }>,
+  ) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.error('❌ Cannot register bridge data - WebSocket not connected')
       console.error(`   WebSocket state: ${this.ws?.readyState}`)
       return
     }
-    
-    const totalMembers = channels.reduce((sum, ch) => sum + ch.members.length, 0)
+
+    const guildMembers = sharedMembers ?? channels.find(ch => ch.members?.length)?.members ?? []
     console.log(`📡 Sending REGISTER_BRIDGE_DATA to gateway:`)
     console.log(`   Channels: ${channels.length}`)
-    console.log(`   Total members: ${totalMembers}`)
-    
+    console.log(`   Discord members (unique): ${guildMembers.length}`)
+
     const payload = {
       op: 6, // REGISTER_BRIDGE_DATA
-      d: { channels }
+      d: {
+        channels,
+        members: guildMembers,
+      },
     }
-    
+
     this.ws.send(JSON.stringify(payload))
     console.log(`✅ Bridge data sent to gateway`)
   }

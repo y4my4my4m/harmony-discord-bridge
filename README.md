@@ -91,7 +91,13 @@ the URL or server settings. Bot needs read + send on the target server; manage
 channels if you want `/bridge clone-server`.
 
 Invite the Discord bot with scopes `bot` + `applications.commands`. Permissions:
-view/send/read history, reactions, manage webhooks (for avatar puppeting).
+view/send/read history, reactions, **manage webhooks** (for Harmony avatar puppeting).
+
+Harmony→Discord tries webhooks first; if **Manage Webhooks** is missing on a channel
+(e.g. channel overwrite denies it), it falls back to posting as the bot with
+`**Name**: message` — still needs **Send Messages** on that channel. Discord shows
+a blue **APP** badge on webhook/bot posts; that label is controlled by Discord and
+cannot be renamed to "Harmony".
 
 Example config:
 

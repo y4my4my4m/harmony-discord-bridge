@@ -29,6 +29,7 @@ import {
   discordColorToHex,
 } from './utils/discordPermissions.js'
 import { joinLinesWithinDiscordLimit } from './utils/discordMessage.js'
+import { formatHarmonyDisplayNameForDiscord } from './utils/discordDisplayName.js'
 import * as dotenv from 'dotenv'
 
 dotenv.config()
@@ -52,6 +53,14 @@ translator.setHarmonyDomain(harmonyBaseUrl.hostname)
 
 // Webhook cache for puppeting
 const webhookCache = new Map<string, Webhook>()
+/** Channels where we already warned about missing Manage Webhooks. */
+const webhookPermissionWarned = new Set<string>()
+/** Harmony message id → Discord copy sent via webhook (else bot fallback). */
+const harmonyDiscordViaWebhook = new Map<string, boolean>()
+
+function isMissingWebhookPermission(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && (err as { code: number }).code === 50013
+}
 
 // Message ID mappings between Discord and Harmony.
 //
@@ -284,9 +293,103 @@ async function getOrCreateWebhook(channelId: string): Promise<Webhook | null> {
     webhookCache.set(channelId, webhook)
     return webhook
   } catch (error) {
+    if (isMissingWebhookPermission(error)) {
+      if (!webhookPermissionWarned.has(channelId)) {
+        webhookPermissionWarned.add(channelId)
+        console.warn(
+          `⚠️ Channel ${channelId}: missing **Manage Webhooks** — Harmony→Discord will fall back to bot send (no avatar puppeting). Re-invite the bot with Manage Webhooks, or fix channel overwrites for the bot role.`,
+        )
+      }
+      return null
+    }
     console.error(`❌ Failed to get/create webhook for ${channelId}:`, error)
     return null
   }
+}
+
+interface OutboundDiscordMessage {
+  discordMessageId: string
+  viaWebhook: boolean
+}
+
+/** Post a Harmony-originated message to Discord. Webhook first (puppeting), else bot send. */
+async function sendHarmonyToDiscord(
+  channel: TextChannel,
+  opts: { content: string; username: string; avatarURL?: string },
+): Promise<OutboundDiscordMessage | null> {
+  const webhook = await getOrCreateWebhook(channel.id)
+  if (webhook) {
+    const sent = await webhook.send({
+      content: opts.content,
+      username: opts.username,
+      avatarURL: opts.avatarURL,
+      allowedMentions: { parse: [] },
+    })
+    if (!sent?.id) return null
+    return { discordMessageId: sent.id, viaWebhook: true }
+  }
+
+  const me = channel.client.user
+  if (!me) {
+    console.error('❌ Discord client not ready')
+    return null
+  }
+  if (!channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
+    console.error(
+      `❌ Cannot send to #${channel.name}: need Send Messages (and Manage Webhooks for avatar puppeting)`,
+    )
+    return null
+  }
+
+  const sent = await channel.send({
+    content: `**${opts.username}**: ${opts.content}`,
+    allowedMentions: { parse: [] },
+  })
+  return { discordMessageId: sent.id, viaWebhook: false }
+}
+
+async function editHarmonyOnDiscord(
+  channel: TextChannel,
+  discordMessageId: string,
+  viaWebhook: boolean,
+  content: string,
+  username?: string,
+): Promise<void> {
+  if (viaWebhook) {
+    const webhook = await getOrCreateWebhook(channel.id)
+    if (webhook) {
+      await webhook.editMessage(discordMessageId, { content })
+      return
+    }
+  }
+
+  const me = channel.client.user
+  if (!me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages)) {
+    throw new Error('Cannot edit bridged message (need Manage Webhooks or Manage Messages)')
+  }
+  await channel.messages.edit(discordMessageId, {
+    content: username ? `**${username}**: ${content}` : content,
+  })
+}
+
+async function deleteHarmonyOnDiscord(
+  channel: TextChannel,
+  discordMessageId: string,
+  viaWebhook: boolean,
+): Promise<void> {
+  if (viaWebhook) {
+    const webhook = await getOrCreateWebhook(channel.id)
+    if (webhook) {
+      await webhook.deleteMessage(discordMessageId)
+      return
+    }
+  }
+
+  const me = channel.client.user
+  if (!me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages)) {
+    throw new Error('Cannot delete bridged message (need Manage Webhooks or Manage Messages)')
+  }
+  await channel.messages.delete(discordMessageId)
 }
 
 // (Future use: Generate unique username to avoid collisions with Discord users)
@@ -729,47 +832,22 @@ harmonyClient.on('messageCreate', async (msg: any) => {
     
     console.log(`✅ Got Discord channel in guild: ${discordChannel.guild.name}`);
     
-    // Get webhook for puppeting
-    console.log(`🔨 Getting webhook...`);
-    const webhook = await getOrCreateWebhook(discordChannelId)
-    
-    if (!webhook) {
-      console.error('❌ Could not get webhook, message not sent')
-      return
-    }
-    
-    console.log(`✅ Got webhook: ${webhook.name}`);
-    
-    // Generate unique username (simple suffix)
-    const baseUsername = msg.author?.display_name || msg.author?.username || 'Harmony User'
-    const uniqueUsername = `${baseUsername} [H]` // Simple suffix for Harmony users
-    console.log(`✅ Username: ${uniqueUsername}`);
-    
-    // Avatar URL is now fully-qualified by the bot gateway
-    // Discord won't be able to fetch localhost URLs, so skip avatar in local dev
+    const uniqueUsername = formatHarmonyDisplayNameForDiscord(
+      msg.author?.display_name,
+      msg.author?.username,
+    )
     const avatarURL = msg.author?.avatar?.startsWith('http://localhost') ? undefined : msg.author?.avatar
-    
-    // Convert Harmony MessageParts to Discord format (with member cache for mention lookups)
+
     const contentText = translator.harmonyToDiscord(msg, discordMemberCache)
     if (!contentText || contentText.trim() === '') {
       console.error('❌ Message content is empty after translation, cannot send to Discord')
       return
     }
-    
-    console.log(`🎨 Puppeting as ${uniqueUsername} with avatar: ${avatarURL || 'default'}`)
-    console.log(`📝 Message content: "${contentText}"`)
 
-    // Reply threading: Harmony message has reply_to → look up the Discord
-    // counterpart and post a Discord-flavored quote header so users see the
-    // context. Webhooks can't post real "Replying to X" UI blocks via
-    // discord.js, so we use the standard `> @user message snippet` form
-    // (https://discord.com/developers/docs/resources/message#message-object
-    //  - webhooks don't support `message_reference`).
     let finalContent = contentText
     if (msg.reply_to) {
       const parentDiscordId = harmonyToDiscordMessages.get(msg.reply_to)
       try {
-        // Best-effort: fetch the original Discord message for a snippet.
         if (parentDiscordId) {
           const parentMsg = await discordChannel.messages.fetch(parentDiscordId).catch(() => null)
           if (parentMsg) {
@@ -791,22 +869,26 @@ harmonyClient.on('messageCreate', async (msg: any) => {
       }
     }
 
-    const webhookResult = await webhook.send({
+    console.log(`🔨 Sending to Discord as ${uniqueUsername}...`)
+    const outbound = await sendHarmonyToDiscord(discordChannel, {
       content: finalContent,
       username: uniqueUsername,
       avatarURL: avatarURL,
-      allowedMentions: { parse: [] }, // Prevent mention abuse
     })
-    
-    // Store message ID mapping for reactions
-    if (webhookResult?.id && msg.id) {
-      harmonyToDiscordMessages.set(msg.id, webhookResult.id)
-      discordToHarmonyMessages.set(webhookResult.id, msg.id)
-      console.log(`📌 Stored message mapping: Harmony ${msg.id} <-> Discord ${webhookResult.id}`)
+
+    if (!outbound) {
+      console.error('❌ Could not send message to Discord')
+      return
     }
-    
-    console.log(`✅ Webhook sent! Message ID: ${webhookResult.id}`)
-    console.log(`✅ Harmony -> Discord (puppeted): ${uniqueUsername} in #${discordChannelId}`)
+
+    if (msg.id) {
+      harmonyToDiscordMessages.set(msg.id, outbound.discordMessageId)
+      discordToHarmonyMessages.set(outbound.discordMessageId, msg.id)
+      harmonyDiscordViaWebhook.set(msg.id, outbound.viaWebhook)
+      console.log(`📌 Stored message mapping: Harmony ${msg.id} <-> Discord ${outbound.discordMessageId}`)
+    }
+
+    console.log(`✅ Harmony -> Discord (${outbound.viaWebhook ? 'webhook' : 'bot fallback'}): ${uniqueUsername} in #${discordChannelId}`)
   } catch (error) {
     console.error('❌ Failed to bridge Harmony -> Discord:', error)
   }
@@ -870,19 +952,20 @@ harmonyClient.on('messageUpdate', async (msg: any) => {
       return
     }
     
-    const webhook = await getOrCreateWebhook(discordChannelId)
-    if (!webhook) {
-      console.error('❌ Could not get webhook')
-      return
-    }
-    
-    // Convert content (with member cache for mention lookups)
     const contentText = translator.harmonyToDiscord(msg, discordMemberCache)
-    
-    // Edit the webhook message
-    await webhook.editMessage(discordMessageId, {
-      content: contentText
-    })
+    const viaWebhook = harmonyDiscordViaWebhook.get(msg.id) ?? true
+    const uniqueUsername = formatHarmonyDisplayNameForDiscord(
+      msg.author?.display_name,
+      msg.author?.username,
+    )
+
+    await editHarmonyOnDiscord(
+      discordChannel,
+      discordMessageId,
+      viaWebhook,
+      contentText,
+      viaWebhook ? undefined : uniqueUsername,
+    )
     
     console.log(`✅ Harmony -> Discord edit: Message ${discordMessageId}`)
   } catch (error) {
@@ -936,21 +1019,16 @@ harmonyClient.on('messageDelete', async (msg: any) => {
       return
     }
     
-    const webhook = await getOrCreateWebhook(discordChannelId)
-    if (!webhook) {
-      console.error('❌ Could not get webhook')
-      return
-    }
-    
-    // Delete the webhook message
-    console.log(`🗑️ Attempting to delete Discord message ${discordMessageId} via webhook...`)
-    await webhook.deleteMessage(discordMessageId)
+    const viaWebhook = harmonyDiscordViaWebhook.get(msg.id) ?? true
+    console.log(`🗑️ Attempting to delete Discord message ${discordMessageId}...`)
+    await deleteHarmonyOnDiscord(discordChannel, discordMessageId, viaWebhook)
     
     console.log(`✅ Harmony -> Discord delete SUCCESS: Message ${discordMessageId} deleted from Discord`)
     
     // Clean up mapping
     harmonyToDiscordMessages.delete(msg.id)
     discordToHarmonyMessages.delete(discordMessageId)
+    harmonyDiscordViaWebhook.delete(msg.id)
   } catch (error) {
     console.error('❌ Failed to bridge delete Harmony -> Discord:', error)
   }
@@ -1471,19 +1549,22 @@ discordClient.on('interactionCreate', async (interaction) => {
         console.log(`✅ Slash command sent to Harmony`)
         
         // Also send to Discord channel so other Discord users see it
-        const webhook = await getOrCreateWebhook(command.channelId)
-        if (webhook) {
-          const webhookMsg = await webhook.send({
+        const outbound = await sendHarmonyToDiscord(
+          (await discordClient.channels.fetch(command.channelId)) as TextChannel,
+          {
             content: discordDisplayText,
-            username: (member?.displayName || command.user.username) + ' [H]',
-            avatarURL: command.user.displayAvatarURL()
-          })
-          
-          // Store message mapping
-          if (harmonyMsg?.id && webhookMsg?.id) {
-            discordToHarmonyMessages.set(webhookMsg.id, harmonyMsg.id)
-            harmonyToDiscordMessages.set(harmonyMsg.id, webhookMsg.id)
-          }
+            username: formatHarmonyDisplayNameForDiscord(
+              member?.displayName || command.user.username,
+              command.user.username,
+            ),
+            avatarURL: command.user.displayAvatarURL(),
+          },
+        )
+
+        if (harmonyMsg?.id && outbound) {
+          discordToHarmonyMessages.set(outbound.discordMessageId, harmonyMsg.id)
+          harmonyToDiscordMessages.set(harmonyMsg.id, outbound.discordMessageId)
+          harmonyDiscordViaWebhook.set(harmonyMsg.id, outbound.viaWebhook)
         }
         
         // Acknowledge the command

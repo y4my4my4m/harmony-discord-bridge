@@ -42,3 +42,6 @@ settings:
   mentionTranslation: true
   cloneRoles: false
   syncPermissions: false
+  # Mirror Discord presence + custom status in Harmony member list (default: true).
+  # Requires "Server Members Intent" + "Presence Intent" in the Discord dev portal.
+  syncPresence: true

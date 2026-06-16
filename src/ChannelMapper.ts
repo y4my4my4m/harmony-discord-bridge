@@ -34,6 +34,9 @@ export interface BridgeConfig {
     /** When true, keep Harmony roles + channel permission overrides in sync
      *  with Discord (live Discord → Harmony). Does not assign members to roles. */
     syncPermissions?: boolean
+    /** Mirror Discord online/idle/dnd/offline + custom status into Harmony UI.
+     *  Default true. Requires Guild Presences privileged intent on the bot. */
+    syncPresence?: boolean
   }
 }
 

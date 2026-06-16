@@ -742,6 +742,8 @@ export class HarmonyClient extends EventEmitter {
       }>
       joinedAt?: string | null
       createdAt?: string | null
+      presenceStatus?: 'online' | 'away' | 'busy' | 'offline'
+      customStatus?: { text: string; emoji: string | null } | null
       source: 'discord'
     }>,
   ) {

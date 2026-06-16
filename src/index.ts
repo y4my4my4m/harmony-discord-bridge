@@ -15,6 +15,7 @@ import {
   AutocompleteInteraction,
   PermissionFlagsBits,
   MessageFlags,
+  ActivityType,
   type Role as DiscordRole
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
@@ -105,6 +106,8 @@ interface CachedDiscordMember {
   roles: BridgedDiscordRoleInfo[]
   joinedAt: string | null
   createdAt: string | null
+  presenceStatus: 'online' | 'away' | 'busy' | 'offline'
+  customStatus: { text: string; emoji: string | null } | null
 }
 const discordMemberDetails = new Map<string, CachedDiscordMember>()
 
@@ -135,6 +138,40 @@ function mapMemberRoles(member: GuildMember): {
   return { harmonyRoleIds, roles }
 }
 
+function isSyncPresenceEnabled(): boolean {
+  return config.settings.syncPresence !== false
+}
+
+function extractMemberPresence(member: GuildMember): {
+  presenceStatus: 'online' | 'away' | 'busy' | 'offline'
+  customStatus: { text: string; emoji: string | null } | null
+} {
+  if (!isSyncPresenceEnabled()) {
+    return { presenceStatus: 'offline', customStatus: null }
+  }
+
+  const discordStatus = member.presence?.status ?? 'offline'
+  let presenceStatus: 'online' | 'away' | 'busy' | 'offline'
+  if (discordStatus === 'online') presenceStatus = 'online'
+  else if (discordStatus === 'idle') presenceStatus = 'away'
+  else if (discordStatus === 'dnd') presenceStatus = 'busy'
+  else presenceStatus = 'offline'
+
+  const customActivity = member.presence?.activities?.find(
+    a => a.type === ActivityType.Custom,
+  )
+  if (!customActivity) {
+    return { presenceStatus, customStatus: null }
+  }
+
+  const text = customActivity.state?.trim() ?? ''
+  const emoji = customActivity.emoji?.name ?? null
+  if (!text && !emoji) {
+    return { presenceStatus, customStatus: null }
+  }
+  return { presenceStatus, customStatus: { text, emoji } }
+}
+
 /**
  * Get all cached Discord members (for autosuggest API)
  */
@@ -157,6 +194,7 @@ function cacheMember(member: GuildMember) {
   discordMemberCache.set(username, member.id)
 
   const { harmonyRoleIds, roles } = mapMemberRoles(member)
+  const { presenceStatus, customStatus } = extractMemberPresence(member)
   const bannerUrl = member.user.bannerURL({ size: 512 }) ?? null
 
   discordMemberDetails.set(member.id, {
@@ -170,6 +208,8 @@ function cacheMember(member: GuildMember) {
     roles,
     joinedAt: member.joinedAt?.toISOString() ?? null,
     createdAt: member.user.createdAt.toISOString(),
+    presenceStatus,
+    customStatus,
   })
 }
 
@@ -338,6 +378,8 @@ function registerBridgeDataWithGateway() {
     roles: m.roles,
     joinedAt: m.joinedAt,
     createdAt: m.createdAt,
+    presenceStatus: m.presenceStatus,
+    customStatus: m.customStatus,
     source: 'discord' as const,
   }))
 
@@ -358,6 +400,17 @@ function registerBridgeDataWithGateway() {
   console.log('╚════════════════════════════════════════╝')
 
   harmonyClient.registerBridgeData(channels, members)
+}
+
+let bridgeDataRegisterTimer: NodeJS.Timeout | null = null
+
+/** Debounce full bridge-data pushes (presence updates can be very frequent). */
+function scheduleBridgeDataRegistration() {
+  if (bridgeDataRegisterTimer) clearTimeout(bridgeDataRegisterTimer)
+  bridgeDataRegisterTimer = setTimeout(() => {
+    bridgeDataRegisterTimer = null
+    registerBridgeDataWithGateway()
+  }, 1500)
 }
 
 // Get or create webhook for channel (for puppeting)
@@ -547,7 +600,8 @@ const discordClient = new DiscordClient({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.GuildMembers  // Required for member cache
+    GatewayIntentBits.GuildMembers,  // Required for member cache
+    GatewayIntentBits.GuildPresences, // Optional presence sync (syncPresence, default on)
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 })
@@ -1326,7 +1380,7 @@ discordClient.on(Events.ClientReady, async () => {
         const guild = await discordClient.guilds.fetch(config.discord.guildId)
         console.log(`📥 Fetching members for guild: ${guild.name}`)
 
-        const members = await guild.members.fetch()
+        const members = await guild.members.fetch({ withPresences: isSyncPresenceEnabled() })
         members.forEach(member => {
           if (!member.user.bot) {
             cacheMember(member)
@@ -1403,6 +1457,22 @@ discordClient.on('guildMemberUpdate', (oldMember, newMember) => {
   }
   cacheMember(newMember)
   registerBridgeDataWithGateway()
+})
+
+discordClient.on('presenceUpdate', (_oldPresence, newPresence) => {
+  if (!isSyncPresenceEnabled()) return
+  const member = newPresence.member
+  if (!member || member.user.bot) return
+  if (member.guild.id !== config.discord.guildId) return
+
+  const cached = discordMemberDetails.get(member.id)
+  if (!cached) {
+    cacheMember(member)
+  } else {
+    const { presenceStatus, customStatus } = extractMemberPresence(member)
+    discordMemberDetails.set(member.id, { ...cached, presenceStatus, customStatus })
+  }
+  scheduleBridgeDataRegistration()
 })
 
 // =====================================================

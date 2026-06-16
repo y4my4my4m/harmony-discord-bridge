@@ -14,6 +14,7 @@ import {
   ChatInputCommandInteraction,
   AutocompleteInteraction,
   PermissionFlagsBits,
+  MessageFlags,
   type Role as DiscordRole
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
@@ -27,6 +28,7 @@ import {
   discordRoleToHarmonyPermissions,
   discordColorToHex,
 } from './utils/discordPermissions.js'
+import { joinLinesWithinDiscordLimit } from './utils/discordMessage.js'
 import * as dotenv from 'dotenv'
 
 dotenv.config()
@@ -1364,7 +1366,7 @@ discordClient.on('interactionCreate', async (interaction) => {
       if (!harmonyChannelId) {
         await command.reply({ 
           content: '❌ This channel is not bridged to Harmony.', 
-          ephemeral: true 
+          flags: MessageFlags.Ephemeral 
         })
         return
       }
@@ -1488,13 +1490,13 @@ discordClient.on('interactionCreate', async (interaction) => {
         const mentionList = mentionedUsers.map(u => `@${u.username}`).join(', ')
         await command.reply({ 
           content: `✅ Mentioned ${mentionList} in Harmony`, 
-          ephemeral: true 
+          flags: MessageFlags.Ephemeral 
         })
       } catch (error: any) {
         console.error('❌ Failed to send message:', error)
         await command.reply({
           content: `❌ Failed to send: ${error.message}`,
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         })
       }
     } else if (command.commandName === 'bridge') {
@@ -1512,7 +1514,7 @@ discordClient.on('interactionCreate', async (interaction) => {
 async function handleBridgeCommand(command: ChatInputCommandInteraction) {
   const guild = command.guild
   if (!guild) {
-    await command.reply({ content: '❌ This command can only be used in a server.', ephemeral: true })
+    await command.reply({ content: '❌ This command can only be used in a server.', flags: MessageFlags.Ephemeral })
     return
   }
 
@@ -1520,7 +1522,7 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
   if (!member) {
     await command.reply({
       content: '❌ Could not verify your permissions.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
     return
   }
@@ -1531,7 +1533,7 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
   if (!isAdmin) {
     await command.reply({
       content: '❌ You need the **Administrator** permission to manage the bridge.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
     return
   }
@@ -1539,7 +1541,7 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
   if (!config.harmony.serverId) {
     await command.reply({
       content: '❌ `harmony.serverId` is not set in bridge-config.yml.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
     return
   }
@@ -1564,15 +1566,15 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
         await runBridgeCloneServer(command)
         break
       default:
-        await command.reply({ content: `❌ Unknown subcommand: ${sub}`, ephemeral: true })
+        await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
     }
   } catch (err: any) {
     console.error(`❌ /bridge ${sub} failed:`, err)
     const msg = `❌ \`/bridge ${sub}\` failed: ${err?.message || 'unknown error'}`
     if (command.deferred || command.replied) {
-      await command.followUp({ content: msg, ephemeral: true })
+      await command.followUp({ content: msg, flags: MessageFlags.Ephemeral })
     } else {
-      await command.reply({ content: msg, ephemeral: true })
+      await command.reply({ content: msg, flags: MessageFlags.Ephemeral })
     }
   }
 }
@@ -1599,7 +1601,10 @@ async function runBridgeStatus(command: ChatInputCommandInteraction) {
     }
   }
 
-  await command.reply({ content: lines.join('\n'), ephemeral: true })
+  await command.reply({
+    content: joinLinesWithinDiscordLimit(lines),
+    flags: MessageFlags.Ephemeral,
+  })
 }
 
 async function runBridgeLink(command: ChatInputCommandInteraction) {
@@ -1612,7 +1617,7 @@ async function runBridgeLink(command: ChatInputCommandInteraction) {
   if (existingHarmony) {
     await command.reply({
       content: `❌ This Discord channel is already bridged to \`${existingHarmony.slice(0, 8)}...\`. Run \`/bridge unlink\` first.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
     return
   }
@@ -1624,14 +1629,14 @@ async function runBridgeLink(command: ChatInputCommandInteraction) {
     if (!target) {
       await command.reply({
         content: `❌ Harmony channel \`${harmonyChannelId}\` not found in the configured server.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       })
       return
     }
   } catch (err: any) {
     await command.reply({
       content: `❌ Could not verify Harmony channel: ${err.message}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
     return
   }
@@ -1640,10 +1645,10 @@ async function runBridgeLink(command: ChatInputCommandInteraction) {
     mapper.addMapping(discordChannelId, harmonyChannelId, bidirectional)
     await command.reply({
       content: `✅ Linked <#${discordChannelId}> ↔ Harmony \`${harmonyChannelId.slice(0, 8)}...\` (${bidirectional ? 'bidirectional' : 'Discord → Harmony only'}).`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
   } catch (err: any) {
-    await command.reply({ content: `❌ Failed to link: ${err.message}`, ephemeral: true })
+    await command.reply({ content: `❌ Failed to link: ${err.message}`, flags: MessageFlags.Ephemeral })
   }
 }
 
@@ -1653,7 +1658,7 @@ async function runBridgeUnlink(command: ChatInputCommandInteraction) {
   if (!existingHarmony) {
     await command.reply({
       content: '❌ This Discord channel isn\'t bridged.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     })
     return
   }
@@ -1662,7 +1667,7 @@ async function runBridgeUnlink(command: ChatInputCommandInteraction) {
     content: removed
       ? `✅ Unlinked <#${discordChannelId}>.`
       : '❌ Nothing was removed.',
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   })
 }
 
@@ -1696,7 +1701,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
     command.options.getBoolean('clone_roles', false) ?? (config.settings.cloneRoles ?? false)
 
   // Discord can take >3s; defer immediately so we don't blow the interaction.
-  await command.deferReply({ ephemeral: true })
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
 
   const guild = command.guild!
   await guild.channels.fetch() // refresh cache
@@ -1765,7 +1770,9 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
 
   // Dry-run report
   if (dryRun) {
-    const lines: string[] = ['**Dry run** - these actions would be taken:']
+    const lines: string[] = [
+      `**Dry run** - ${toCreate.length} channel(s) would be processed:`,
+    ]
     const categoriesNeeded = new Set<string>()
     for (const p of toCreate) {
       const reuse = harmonyChannelByName.get(p.discordName)
@@ -1774,10 +1781,14 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
       if (p.discordCategoryName && !categoryIdByName.has(p.discordCategoryName)) {
         categoriesNeeded.add(p.discordCategoryName)
       }
-      lines.push(`• \`#${p.discordName}\` → ${action} ${cat}`)
+      lines.push(`• \`#${p.discordName}\` → ${action} ${cat}`.trimEnd())
     }
     if (categoriesNeeded.size > 0) {
-      lines.unshift(`_Would also create ${categoriesNeeded.size} category/categories: ${Array.from(categoriesNeeded).map(n => `**${n}**`).join(', ')}_`)
+      lines.splice(
+        1,
+        0,
+        `_Would also create ${categoriesNeeded.size} categor${categoriesNeeded.size === 1 ? 'y' : 'ies'}: ${Array.from(categoriesNeeded).map(n => `**${n}**`).join(', ')}_`,
+      )
     }
     if (cloneRoles) {
       if (rolesToClone.length > 0) {
@@ -1786,14 +1797,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
         lines.push('_Roles: all Discord roles already exist on Harmony (by name)._')
       }
     }
-    if (lines.length > 30) {
-      // truncate to keep under Discord's 2000-char message limit
-      const truncated = lines.slice(0, 30)
-      truncated.push(`_...and ${lines.length - 30} more_`)
-      await command.editReply({ content: truncated.join('\n') })
-    } else {
-      await command.editReply({ content: lines.join('\n') })
-    }
+    await command.editReply({ content: joinLinesWithinDiscordLimit(lines) })
     return
   }
 
@@ -1898,11 +1902,10 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   if (failures.length) {
     summary.push('')
     summary.push(`⚠️ ${failures.length} failure(s):`)
-    summary.push(...failures.slice(0, 10).map(f => `  • ${f}`))
-    if (failures.length > 10) summary.push(`  • _...and ${failures.length - 10} more_`)
+    summary.push(...failures.map(f => `  • ${f}`))
   }
 
-  await command.editReply({ content: summary.join('\n') })
+  await command.editReply({ content: joinLinesWithinDiscordLimit(summary) })
 }
 
 // Start Harmony client

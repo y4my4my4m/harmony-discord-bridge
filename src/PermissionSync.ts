@@ -61,6 +61,10 @@ export class PermissionSync {
     this.attached = false
   }
 
+  private isProtectedHarmonyRole(role: { is_default?: boolean; is_admin?: boolean }): boolean {
+    return !!(role.is_default || role.is_admin)
+  }
+
   /** Full reconcile on startup (roles by name + all mapped channel overwrites). */
   async initialSync(guild: Guild) {
     if (!this.isEnabled()) return
@@ -97,12 +101,8 @@ export class PermissionSync {
     if (!this.isEnabled() || newRole.guild.id !== this.guildId) return
     if (newRole.managed) return
     if (newRole.id === newRole.guild.id) {
-      // @everyone — sync default role permissions only
-      try {
-        await this.syncEveryoneRole(newRole)
-      } catch (err) {
-        console.error('🔐 Failed to sync @everyone role:', err)
-      }
+      // @everyone base permissions cannot be changed via bot API (default role).
+      // Per-channel @everyone overrides are still synced in syncChannelOverwrites.
       return
     }
     try {
@@ -156,38 +156,61 @@ export class PermissionSync {
     }
   }
 
-  private async ensureDefaultRoleMapped(guild: Guild) {
-    const everyone = guild.roles.everyone
+  private async ensureDefaultRoleMapped(_guild: Guild) {
     if (this.store.getDefaultHarmonyRoleId()) return
 
     const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
     const defaultRole = harmonyRoles.find((r: any) => r.is_default)
     if (defaultRole) {
       this.store.setDefaultHarmonyRoleId(defaultRole.id)
-      await this.syncEveryoneRole(everyone)
     }
-  }
-
-  private async syncEveryoneRole(everyone: Role) {
-    const defaultId = this.store.getDefaultHarmonyRoleId()
-    if (!defaultId) return
-    await this.harmony.updateRole(this.serverId, defaultId, {
-      permissions: discordRoleToHarmonyPermissions(everyone),
-    })
   }
 
   /** Match Discord roles to Harmony roles by stored mapping or by name. */
   async reconcileRoles(guild: Guild): Promise<void> {
     const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
-    const harmonyByName = new Map(harmonyRoles.map((r: any) => [r.name, r]))
+    const harmonyById = new Map(harmonyRoles.map((r: any) => [r.id, r]))
+    const harmonyByName = new Map(
+      harmonyRoles
+        .filter((r: any) => !this.isProtectedHarmonyRole(r))
+        .map((r: any) => [r.name, r]),
+    )
 
     for (const role of guild.roles.cache.values()) {
       if (role.managed) continue
-      if (role.id === guild.id) continue // @everyone handled separately
+      if (role.id === guild.id) continue // @everyone — channel overrides only
 
-      const existingId = this.store.getHarmonyRoleId(role.id)
-      if (existingId) {
-        await this.harmony.updateRole(this.serverId, existingId, {
+      try {
+        const existingId = this.store.getHarmonyRoleId(role.id)
+        if (existingId) {
+          const existing = harmonyById.get(existingId)
+          if (existing && this.isProtectedHarmonyRole(existing)) continue
+
+          await this.harmony.updateRole(this.serverId, existingId, {
+            name: role.name,
+            color: discordColorToHex(role.color),
+            position: role.position,
+            permissions: discordRoleToHarmonyPermissions(role),
+            mentionable: role.mentionable,
+            hoist: role.hoist,
+          })
+          continue
+        }
+
+        const byName = harmonyByName.get(role.name)
+        if (byName) {
+          this.store.setMapping(role.id, byName.id, role.name)
+          await this.harmony.updateRole(this.serverId, byName.id, {
+            color: discordColorToHex(role.color),
+            position: role.position,
+            permissions: discordRoleToHarmonyPermissions(role),
+            mentionable: role.mentionable,
+            hoist: role.hoist,
+          })
+          continue
+        }
+
+        const created = await this.harmony.createRole(this.serverId, {
           name: role.name,
           color: discordColorToHex(role.color),
           position: role.position,
@@ -195,31 +218,10 @@ export class PermissionSync {
           mentionable: role.mentionable,
           hoist: role.hoist,
         })
-        continue
+        this.store.setMapping(role.id, created.id, role.name)
+      } catch (err) {
+        console.error(`🔐 Failed to sync role "${role.name}":`, err)
       }
-
-      const byName = harmonyByName.get(role.name)
-      if (byName) {
-        this.store.setMapping(role.id, byName.id, role.name)
-        await this.harmony.updateRole(this.serverId, byName.id, {
-          color: discordColorToHex(role.color),
-          position: role.position,
-          permissions: discordRoleToHarmonyPermissions(role),
-          mentionable: role.mentionable,
-          hoist: role.hoist,
-        })
-        continue
-      }
-
-      const created = await this.harmony.createRole(this.serverId, {
-        name: role.name,
-        color: discordColorToHex(role.color),
-        position: role.position,
-        permissions: discordRoleToHarmonyPermissions(role),
-        mentionable: role.mentionable,
-        hoist: role.hoist,
-      })
-      this.store.setMapping(role.id, created.id, role.name)
     }
   }
 
@@ -228,7 +230,9 @@ export class PermissionSync {
 
     if (!harmonyRoleId) {
       const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
-      const byName = harmonyRoles.find((r: any) => r.name === role.name)
+      const byName = harmonyRoles.find(
+        (r: any) => r.name === role.name && !this.isProtectedHarmonyRole(r),
+      )
       if (byName?.id) {
         harmonyRoleId = byName.id as string
         this.store.setMapping(role.id, harmonyRoleId, role.name)
@@ -245,6 +249,12 @@ export class PermissionSync {
     }
 
     if (harmonyRoleId) {
+      const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
+      const existing = harmonyRoles.find((r: any) => r.id === harmonyRoleId)
+      if (existing && this.isProtectedHarmonyRole(existing)) {
+        return harmonyRoleId
+      }
+
       await this.harmony.updateRole(this.serverId, harmonyRoleId, payload)
       return harmonyRoleId
     }

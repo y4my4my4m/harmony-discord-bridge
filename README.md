@@ -139,7 +139,9 @@ settings:
 ```
 
 `syncPermissions: true` mirrors Discord role/channel override changes into
-Harmony live. Still doesn't sync who has which role. Mappings are persisted to
+Harmony live. Still doesn't sync who has which role. Harmony's built-in
+**default** and **admin** roles are never modified via the bot API (channel-level
+`@everyone` overrides still sync). Mappings are persisted to
 `data/permission-sync.yml` (created automatically).
 
 ## Attachments

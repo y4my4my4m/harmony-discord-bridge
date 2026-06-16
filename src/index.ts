@@ -41,6 +41,7 @@ dotenv.config()
 // Initialize components
 const mapper = new ChannelMapper('./config/bridge-config.yml')
 const config = mapper.getConfig()
+const permissionSyncStore = new PermissionSyncStore('./data/permission-sync.yml')
 
 // Validate required configuration
 if (!config.harmony?.baseUrl) {
@@ -85,14 +86,54 @@ const harmonyToDiscordMessages = new BoundedMap<string, string>(MESSAGE_MAPPING_
 // =====================================================
 // Cache Discord members for mention lookups: lowercase username -> Discord ID
 const discordMemberCache = new Map<string, string>()
-// Also store full member info for autosuggest API
+export interface BridgedDiscordRoleInfo {
+  id: string
+  name: string
+  color: string | null
+  position: number
+}
+
+// Also store full member info for autosuggest API + member sidebar/profile
 interface CachedDiscordMember {
   id: string
   username: string
   displayName: string
   avatarUrl: string
+  bannerUrl: string | null
+  accentColor: string | null
+  harmonyRoleIds: string[]
+  roles: BridgedDiscordRoleInfo[]
+  joinedAt: string | null
+  createdAt: string | null
 }
 const discordMemberDetails = new Map<string, CachedDiscordMember>()
+
+function mapMemberRoles(member: GuildMember): {
+  harmonyRoleIds: string[]
+  roles: BridgedDiscordRoleInfo[]
+} {
+  const harmonyRoleIds: string[] = []
+  for (const role of member.roles.cache.values()) {
+    const harmonyId =
+      permissionSyncStore.getHarmonyRoleId(role.id)
+      ?? (role.id === member.guild.id ? permissionSyncStore.getDefaultHarmonyRoleId() : undefined)
+    if (harmonyId && !harmonyRoleIds.includes(harmonyId)) {
+      harmonyRoleIds.push(harmonyId)
+    }
+  }
+
+  const roles = member.roles.cache
+    .filter(r => r.id !== member.guild.id)
+    .sort((a, b) => b.position - a.position)
+    .map(r => ({
+      id: r.id,
+      name: r.name,
+      color: r.hexColor === '#000000' ? null : r.hexColor,
+      position: r.position,
+    }))
+
+  return { harmonyRoleIds, roles }
+}
 
 /**
  * Get all cached Discord members (for autosuggest API)
@@ -114,12 +155,21 @@ export function getDiscordMemberIdCache(): Map<string, string> {
 function cacheMember(member: GuildMember) {
   const username = member.user.username.toLowerCase()
   discordMemberCache.set(username, member.id)
-  
+
+  const { harmonyRoleIds, roles } = mapMemberRoles(member)
+  const bannerUrl = member.user.bannerURL({ size: 512 }) ?? null
+
   discordMemberDetails.set(member.id, {
     id: member.id,
     username: member.user.username,
     displayName: member.displayName || member.user.username,
-    avatarUrl: member.user.displayAvatarURL({ size: 128 })
+    avatarUrl: member.user.displayAvatarURL({ size: 128 }),
+    bannerUrl,
+    accentColor: member.user.hexAccentColor ?? null,
+    harmonyRoleIds,
+    roles,
+    joinedAt: member.joinedAt?.toISOString() ?? null,
+    createdAt: member.user.createdAt.toISOString(),
   })
 }
 
@@ -282,6 +332,12 @@ function registerBridgeDataWithGateway() {
     username: m.username,
     displayName: m.displayName,
     avatarUrl: m.avatarUrl,
+    bannerUrl: m.bannerUrl,
+    accentColor: m.accentColor,
+    harmonyRoleIds: m.harmonyRoleIds,
+    roles: m.roles,
+    joinedAt: m.joinedAt,
+    createdAt: m.createdAt,
     source: 'discord' as const,
   }))
 
@@ -522,7 +578,6 @@ async function resolveParentDiscordId(harmonyReplyToId: string): Promise<string 
   return null
 }
 
-const permissionSyncStore = new PermissionSyncStore('./data/permission-sync.yml')
 const permissionSync = new PermissionSync(harmonyClient, discordClient, mapper, permissionSyncStore)
 
 // =====================================================
@@ -1329,18 +1384,25 @@ discordClient.on('guildMemberRemove', (member) => {
 })
 
 discordClient.on('guildMemberUpdate', (oldMember, newMember) => {
-  // Update cache if username or display name changed
-  if (oldMember.user.username !== newMember.user.username || 
-      oldMember.displayName !== newMember.displayName) {
-    // Remove old entry
+  if (newMember.user.bot) return
+
+  const rolesChanged =
+    oldMember.roles.cache.size !== newMember.roles.cache.size
+    || !oldMember.roles.cache.equals(newMember.roles.cache)
+  const profileChanged =
+    oldMember.user.username !== newMember.user.username
+    || oldMember.displayName !== newMember.displayName
+    || oldMember.user.avatar !== newMember.user.avatar
+    || oldMember.user.banner !== newMember.user.banner
+    || oldMember.user.hexAccentColor !== newMember.user.hexAccentColor
+
+  if (!rolesChanged && !profileChanged) return
+
+  if (oldMember.user.username !== newMember.user.username) {
     uncacheMemberById(oldMember.id, oldMember.user.username)
-    // Add new entry if not a bot
-    if (!newMember.user.bot) {
-      cacheMember(newMember)
-    }
-    // Re-register bridge data with updated members
-    registerBridgeDataWithGateway()
   }
+  cacheMember(newMember)
+  registerBridgeDataWithGateway()
 })
 
 // =====================================================

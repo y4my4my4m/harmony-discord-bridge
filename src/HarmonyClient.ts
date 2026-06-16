@@ -712,6 +712,17 @@ export class HarmonyClient extends EventEmitter {
         username: string
         displayName: string
         avatarUrl: string
+        bannerUrl?: string | null
+        accentColor?: string | null
+        harmonyRoleIds?: string[]
+        roles?: Array<{
+          id: string
+          name: string
+          color: string | null
+          position: number
+        }>
+        joinedAt?: string | null
+        createdAt?: string | null
         source: 'discord'
       }>
     }>,
@@ -720,6 +731,17 @@ export class HarmonyClient extends EventEmitter {
       username: string
       displayName: string
       avatarUrl: string
+      bannerUrl?: string | null
+      accentColor?: string | null
+      harmonyRoleIds?: string[]
+      roles?: Array<{
+        id: string
+        name: string
+        color: string | null
+        position: number
+      }>
+      joinedAt?: string | null
+      createdAt?: string | null
       source: 'discord'
     }>,
   ) {

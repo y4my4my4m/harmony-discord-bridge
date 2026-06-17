@@ -468,7 +468,7 @@ function webhookReplySucceeded(sent: { type?: number; message_reference?: { mess
   return sent.type === DISCORD_MESSAGE_TYPE_REPLY || !!sent.message_reference?.message_id
 }
 
-/** Execute webhook with the bot REST client (includes app auth — required for reply threading). */
+/** Execute webhook with the bot REST client (includes app auth). */
 async function executeWebhookMessage(
   webhook: Webhook,
   body: Record<string, unknown>,
@@ -479,6 +479,55 @@ async function executeWebhookMessage(
   ) as Promise<{ id: string; type?: number; message_reference?: { message_id?: string } | null }>
 }
 
+async function messageHasReplyReference(
+  channel: TextChannel,
+  messageId: string,
+  sent?: { type?: number; message_reference?: { message_id?: string } | null },
+): Promise<boolean> {
+  if (sent && webhookReplySucceeded(sent)) return true
+  const fetched = await channel.messages.fetch(messageId).catch(() => null)
+  return !!fetched?.reference?.messageId
+}
+
+/** Try a single puppeted webhook reply; delete the message if Discord sent it flat. */
+async function tryWebhookReply(
+  webhook: Webhook,
+  channel: TextChannel,
+  opts: { content: string; username: string; avatarURL?: string; replyToDiscordMessageId: string },
+): Promise<OutboundDiscordMessage | null> {
+  try {
+    console.log(
+      `↩️ Webhook reply in #${channel.name} → Discord msg ${opts.replyToDiscordMessageId}`,
+    )
+    const sent = await executeWebhookMessage(webhook, {
+      content: opts.content,
+      username: opts.username,
+      avatar_url: opts.avatarURL,
+      allowed_mentions: { parse: [] as const, replied_user: false },
+      message_reference: {
+        message_id: opts.replyToDiscordMessageId,
+        channel_id: channel.id,
+        guild_id: channel.guildId ?? undefined,
+        fail_if_not_exists: false,
+      },
+    })
+    if (!sent?.id) return null
+
+    if (await messageHasReplyReference(channel, sent.id, sent)) {
+      return { discordMessageId: sent.id, viaWebhook: true }
+    }
+
+    console.warn(`⚠️ Webhook ${sent.id} posted flat (no reply reference) — deleting`)
+    await webhook.deleteMessage(sent.id).catch(err => {
+      console.warn(`⚠️ Could not delete flat webhook message ${sent.id}:`, err)
+    })
+    return null
+  } catch (err) {
+    console.warn('⚠️ Webhook reply failed:', err)
+    return null
+  }
+}
+
 /** Post a Harmony-originated message to Discord. Webhook first (puppeting), else bot send. */
 async function sendHarmonyToDiscord(
   channel: TextChannel,
@@ -487,64 +536,36 @@ async function sendHarmonyToDiscord(
   const me = channel.client.user
   const webhook = await getOrCreateWebhook(channel.id)
 
-  // Replies: webhook only — one puppeted message with native reply UI. Uses the bot REST
-  // client (not anonymous fetch) so Discord can validate message_reference against the
-  // bot's Read Message History permission on application-owned webhooks.
   if (opts.replyToDiscordMessageId) {
-    if (!webhook) {
-      console.error(`❌ Cannot reply in #${channel.name}: webhook unavailable`)
-      return null
+    if (webhook) {
+      const puppeted = await tryWebhookReply(webhook, channel, {
+        content: opts.content,
+        username: opts.username,
+        avatarURL: opts.avatarURL,
+        replyToDiscordMessageId: opts.replyToDiscordMessageId,
+      })
+      if (puppeted) return puppeted
     }
 
-    const baseBody = {
-      content: opts.content,
-      username: opts.username,
-      avatar_url: opts.avatarURL,
-      allowed_mentions: { parse: [] as const, replied_user: false },
+    // Discord often ignores message_reference on execute-webhook when replying to a
+    // native user message (parent wasn't sent by this webhook). Bot send still threads.
+    if (me && channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
+      console.log(
+        `↩️ Webhook reply unavailable; sending via bot in #${channel.name} ` +
+        `(ref ${opts.replyToDiscordMessageId})`,
+      )
+      const sent = await channel.send({
+        content: opts.content,
+        allowedMentions: { parse: [] },
+        reply: {
+          messageReference: opts.replyToDiscordMessageId,
+          failIfNotExists: false,
+        },
+      })
+      return { discordMessageId: sent.id, viaWebhook: false }
     }
 
-    const referenceAttempts: Record<string, unknown>[] = [
-      {
-        message_id: opts.replyToDiscordMessageId,
-        channel_id: channel.id,
-        guild_id: channel.guildId ?? undefined,
-        fail_if_not_exists: true,
-      },
-      {
-        message_id: opts.replyToDiscordMessageId,
-        fail_if_not_exists: true,
-      },
-    ]
-
-    for (const message_reference of referenceAttempts) {
-      try {
-        console.log(
-          `↩️ Webhook reply in #${channel.name} → Discord msg ${opts.replyToDiscordMessageId}`,
-        )
-        const sent = await executeWebhookMessage(webhook, {
-          ...baseBody,
-          message_reference,
-        })
-        if (sent?.id) {
-          let replyOk = webhookReplySucceeded(sent)
-          if (!replyOk) {
-            const fetched = await channel.messages.fetch(sent.id).catch(() => null)
-            replyOk = !!fetched?.reference?.messageId
-          }
-          if (replyOk) {
-            return { discordMessageId: sent.id, viaWebhook: true }
-          }
-          console.warn(`⚠️ Webhook ${sent.id} sent but did not thread as a reply`)
-        }
-      } catch (err) {
-        console.warn('⚠️ Webhook reply attempt failed:', err)
-      }
-    }
-
-    console.error(
-      `❌ Could not send puppeted reply in #${channel.name} ` +
-      `(parent Discord msg ${opts.replyToDiscordMessageId})`,
-    )
+    console.error(`❌ Cannot reply in #${channel.name}: webhook and bot send both unavailable`)
     return null
   }
 

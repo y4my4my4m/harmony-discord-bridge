@@ -499,13 +499,28 @@ async function sendHarmonyToDiscord(
         })
         if (response.ok) {
           const sent = await response.json() as { id?: string; type?: number; message_reference?: { message_id?: string } | null }
-          if (sent?.id && webhookReplySucceeded(sent)) {
-            return { discordMessageId: sent.id, viaWebhook: true }
-          }
           if (sent?.id) {
+            let replyOk = webhookReplySucceeded(sent)
+            if (!replyOk) {
+              // Execute-webhook responses sometimes omit reference even when the
+              // client shows a reply — confirm via fetch before giving up.
+              const fetched = await channel.messages.fetch(sent.id).catch(() => null)
+              replyOk = !!fetched?.reference?.messageId
+            }
+            if (replyOk) {
+              return { discordMessageId: sent.id, viaWebhook: true }
+            }
+
+            // Webhook accepted the payload but sent a flat message — delete it so
+            // the bot fallback below doesn't duplicate the bridged reply.
             console.warn(
-              `⚠️ Webhook reply for ${sent.id} has no message_reference in response; falling back to bot send`,
+              `⚠️ Webhook reply for ${sent.id} did not thread; deleting before bot fallback`,
             )
+            try {
+              await webhook.deleteMessage(sent.id)
+            } catch (deleteErr) {
+              console.warn(`⚠️ Could not delete flat webhook message ${sent.id}:`, deleteErr)
+            }
           }
         } else {
           const errText = await response.text().catch(() => '')
@@ -517,6 +532,10 @@ async function sendHarmonyToDiscord(
     }
 
     if (me && channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
+      console.log(
+        `↩️ Sending Discord reply via bot in #${channel.name} ` +
+        `(ref ${opts.replyToDiscordMessageId}, channel ${channel.id})`,
+      )
       const sent = await channel.send({
         content: opts.content,
         allowedMentions: { parse: [] },

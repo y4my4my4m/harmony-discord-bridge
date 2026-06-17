@@ -1058,8 +1058,8 @@ discordClient.on('messageReactionRemove', async (reaction, user) => {
       return
     }
     
-    // Remove reaction from Harmony message
-    await harmonyClient.removeReaction(harmonyChannelId, harmonyMessageId, emojiIdentifier)
+    // Remove reaction from Harmony message (scoped to this Discord user)
+    await harmonyClient.removeReaction(harmonyChannelId, harmonyMessageId, emojiIdentifier, user.id)
     console.log(`✅ Discord -> Harmony reaction removed: ${emojiIdentifier} from message ${harmonyMessageId}`)
   } catch (error: any) {
     console.error('❌ Failed to bridge reaction removal Discord -> Harmony:', error.message)

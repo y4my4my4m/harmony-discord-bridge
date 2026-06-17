@@ -666,16 +666,23 @@ export class HarmonyClient extends EventEmitter {
   }
 
   
-  async removeReaction(channelId: string, messageId: string, emoji: string, _userId?: string): Promise<any> {
-    // Note: Bot API doesn't need channelId or userId - bot removes its own reaction
+  async removeReaction(
+    channelId: string,
+    messageId: string,
+    emoji: string,
+    discordUserId?: string,
+  ): Promise<any> {
     const url = `${this.apiUrl}/api/v1/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`
-    
+
     const response = await fetch(url, {
       method: 'DELETE',
       headers: {
         'Authorization': `Bot ${this.botToken}`,
-        'Content-Type': 'application/json'
-      }
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(
+        discordUserId ? { discord_user_id: discordUserId } : {},
+      ),
     })
     
     if (!response.ok) {

@@ -461,6 +461,13 @@ interface OutboundDiscordMessage {
   viaWebhook: boolean
 }
 
+/** Discord API message type for replies. */
+const DISCORD_MESSAGE_TYPE_REPLY = 19
+
+function webhookReplySucceeded(sent: { type?: number; message_reference?: { message_id?: string } | null }): boolean {
+  return sent.type === DISCORD_MESSAGE_TYPE_REPLY || !!sent.message_reference?.message_id
+}
+
 /** Post a Harmony-originated message to Discord. Webhook first (puppeting), else bot send. */
 async function sendHarmonyToDiscord(
   channel: TextChannel,
@@ -469,7 +476,8 @@ async function sendHarmonyToDiscord(
   const me = channel.client.user
   const webhook = await getOrCreateWebhook(channel.id)
 
-  // Replies: try webhook + message_reference (keeps puppeting when supported), else bot send.
+  // Replies: webhook first (keeps username/avatar puppeting). message_reference needs
+  // the parent message id AND the Discord channel id (same channel as the webhook).
   if (opts.replyToDiscordMessageId) {
     if (webhook) {
       try {
@@ -483,19 +491,28 @@ async function sendHarmonyToDiscord(
             allowed_mentions: { parse: [] },
             message_reference: {
               message_id: opts.replyToDiscordMessageId,
+              channel_id: channel.id,
+              guild_id: channel.guildId ?? undefined,
               fail_if_not_exists: false,
             },
           }),
         })
         if (response.ok) {
-          const sent = await response.json() as { id?: string }
-          if (sent?.id) return { discordMessageId: sent.id, viaWebhook: true }
+          const sent = await response.json() as { id?: string; type?: number; message_reference?: { message_id?: string } | null }
+          if (sent?.id && webhookReplySucceeded(sent)) {
+            return { discordMessageId: sent.id, viaWebhook: true }
+          }
+          if (sent?.id) {
+            console.warn(
+              `⚠️ Webhook reply for ${sent.id} has no message_reference in response; falling back to bot send`,
+            )
+          }
         } else {
           const errText = await response.text().catch(() => '')
           console.warn(`⚠️ Webhook reply failed (${response.status}): ${errText.slice(0, 200)}`)
         }
-      } catch {
-        // Fall through to bot send with native reply.
+      } catch (err) {
+        console.warn('⚠️ Webhook reply request failed:', err)
       }
     }
 
@@ -511,7 +528,7 @@ async function sendHarmonyToDiscord(
       return { discordMessageId: sent.id, viaWebhook: false }
     }
 
-    console.error(`❌ Cannot reply in #${channel.name}: need Send Messages`)
+    console.error(`❌ Cannot reply in #${channel.name}: need webhook or Send Messages`)
     return null
   }
 
@@ -622,7 +639,10 @@ async function resolveParentDiscordId(
   harmonyChannelId: string,
 ): Promise<string | null> {
   const mapped = harmonyToDiscordMessages.get(harmonyReplyToId)
-  if (mapped) return mapped
+  if (mapped) {
+    console.log(`🔗 Reply parent from cache: Harmony ${harmonyReplyToId} -> Discord ${mapped}`)
+    return mapped
+  }
 
   try {
     const parent = await harmonyClient.getMessage(harmonyReplyToId)
@@ -630,10 +650,17 @@ async function resolveParentDiscordId(
     if (discordId && parent?.id) {
       discordToHarmonyMessages.set(discordId, parent.id)
       harmonyToDiscordMessages.set(parent.id, discordId)
+      console.log(`🔗 Reply parent from metadata: Harmony ${parent.id} -> Discord ${discordId}`)
       return discordId
     }
-  } catch {
-    // Parent lookup failed — try channel lookup below.
+    if (parent) {
+      console.warn(
+        `⚠️ Harmony reply parent ${harmonyReplyToId} has no metadata.discord_message_id`,
+        { bridge_source: parent.metadata?.bridge_source },
+      )
+    }
+  } catch (err) {
+    console.warn(`⚠️ getMessage failed for reply parent ${harmonyReplyToId}:`, err)
   }
 
   // Parent may have been evicted from the in-memory map; search by stored metadata.
@@ -644,10 +671,11 @@ async function resolveParentDiscordId(
       const discordId = found.metadata.discord_message_id
       discordToHarmonyMessages.set(discordId, found.id)
       harmonyToDiscordMessages.set(found.id, discordId)
+      console.log(`🔗 Reply parent from recent scan: Harmony ${found.id} -> Discord ${discordId}`)
       return discordId
     }
-  } catch {
-    // Fall through.
+  } catch (err) {
+    console.warn(`⚠️ Recent message scan failed for reply parent ${harmonyReplyToId}:`, err)
   }
 
   return null

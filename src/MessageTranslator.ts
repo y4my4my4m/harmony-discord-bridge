@@ -14,6 +14,93 @@ function extractGluedHttpUrls(text: string): string[] {
   return urls
 }
 
+/** Compare URLs ignoring fragments, query strings, and trailing slashes. */
+function normalizeUrlForDedup(url: string): string {
+  try {
+    const u = new URL(url)
+    const path = u.pathname.replace(/\/+$/, '')
+    return `${u.protocol}//${u.host}${path}` || `${u.protocol}//${u.host}`
+  } catch {
+    return url.replace(/#.*$/, '').replace(/\?.*$/, '').replace(/\/+$/, '')
+  }
+}
+
+function collectNormalizedUrls(parts: any[]): Set<string> {
+  const urls = new Set<string>()
+  for (const part of parts) {
+    if (part.type === 'text' && part.text) {
+      for (const url of extractGluedHttpUrls(part.text)) {
+        urls.add(normalizeUrlForDedup(url))
+      }
+    } else if (part.type === 'url' && part.url) {
+      urls.add(normalizeUrlForDedup(part.url))
+    }
+  }
+  return urls
+}
+
+function isUrlAlreadyRepresented(parts: any[], candidateUrl: string): boolean {
+  const normalized = normalizeUrlForDedup(candidateUrl)
+  return collectNormalizedUrls(parts).has(normalized)
+}
+
+/** Split prose into text + url parts (Discord `<https://...>` suppresses preview). */
+function splitTextForUrlParts(text: string): any[] {
+  if (!text) return []
+
+  const regex = /https?:\/\/[^\s<>"']+?(?=https?:\/\/|\s|$|>)/g
+  const parts: any[] = []
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = regex.exec(text)) !== null) {
+    const suppressed = match.index > 0 && text[match.index - 1] === '<'
+    let segmentStart = match.index
+    let segmentEnd = match.index + match[0].length
+    let url = match[0]
+    while (url.length > 0 && /[.,;:!?)>\]}]$/.test(url)) {
+      url = url.slice(0, -1)
+      segmentEnd -= 1
+    }
+    if (!url) continue
+
+    if (suppressed) {
+      segmentStart -= 1
+      if (segmentEnd < text.length && text[segmentEnd] === '>') {
+        segmentEnd += 1
+      }
+    }
+
+    if (segmentStart > lastIndex) {
+      const before = text.slice(lastIndex, segmentStart)
+      if (before) parts.push({ type: 'text', text: before })
+    }
+
+    parts.push({ type: 'url', url, preview: !suppressed })
+    lastIndex = segmentEnd
+  }
+
+  if (lastIndex < text.length) {
+    const tail = text.slice(lastIndex)
+    if (tail) parts.push({ type: 'text', text: tail })
+  }
+
+  return parts.length > 0 ? parts : [{ type: 'text', text }]
+}
+
+/** Expand text parts into separate url parts so URLs aren't duplicated via embeds. */
+function expandTextPartsWithUrls(parts: any[]): any[] {
+  const result: any[] = []
+  for (const part of parts) {
+    if (part.type === 'text' && part.text) {
+      result.push(...splitTextForUrlParts(part.text))
+    } else {
+      result.push(part)
+    }
+  }
+  return result
+}
+
 function inferAttachmentFileType(name: string, contentType: string, url: string): 'image' | 'video' | 'file' {
   if (contentType.startsWith('image/')) return 'image'
   if (contentType.startsWith('video/')) return 'video'
@@ -291,6 +378,15 @@ export class MessageTranslator {
         parts.push(...processedParts)
       }
     }
+
+    // Split inline URLs out of text so we don't also add Discord's auto-embed URL
+    // as a second url part (Harmony coalesces text+url without a separator, gluing
+    // them into one broken link like `https://site/#fraghttps://site/`).
+    if (parts.length > 0) {
+      const expanded = expandTextPartsWithUrls(parts)
+      parts.length = 0
+      parts.push(...expanded)
+    }
     
     // Attachments as proper file parts (images, videos, files)
     if (discordMsg.attachments && discordMsg.attachments.size > 0) {
@@ -320,16 +416,20 @@ export class MessageTranslator {
       })
     }
     
-    // Embeds (links with previews) - only for rich embeds with URLs
+    // Embeds: Discord auto-generates link-preview embeds for URLs already in content.
+    // Skip duplicate embed URLs — Harmony link previews handle the url part we kept.
     if (discordMsg.embeds && discordMsg.embeds.length > 0) {
       discordMsg.embeds.forEach((embed: any) => {
-        if (embed.url) {
-          parts.push({
-            type: 'url',
-            url: embed.url,
-            preview: true
-          })
+        if (!embed.url) return
+        if (isUrlAlreadyRepresented(parts, embed.url)) {
+          console.log(`⏭️ D→H Skipping duplicate embed URL: ${embed.url}`)
+          return
         }
+        parts.push({
+          type: 'url',
+          url: embed.url,
+          preview: true,
+        })
       })
     }
     

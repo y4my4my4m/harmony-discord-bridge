@@ -24,6 +24,11 @@ import { ChannelMapper } from './ChannelMapper.js'
 import { PermissionSync } from './PermissionSync.js'
 import { PermissionSyncStore } from './PermissionSyncStore.js'
 import { BoundedMap } from './utils/BoundedMap.js'
+import {
+  buildDiscordJumpLink,
+  formatHarmonyReplyForDiscord,
+  isDiscordUserAlreadyMentioned,
+} from './utils/replyFormatter.js'
 import { refreshDiscordAttachmentParts } from './refreshAttachments.js'
 import {
   discordRoleToHarmonyPermissions,
@@ -461,120 +466,128 @@ interface OutboundDiscordMessage {
   viaWebhook: boolean
 }
 
-/** Discord API message type for replies. */
-const DISCORD_MESSAGE_TYPE_REPLY = 19
-
-function webhookReplySucceeded(sent: { type?: number; message_reference?: { message_id?: string } | null }): boolean {
-  return sent.type === DISCORD_MESSAGE_TYPE_REPLY || !!sent.message_reference?.message_id
+interface OutboundDiscordContent {
+  content: string
+  mentionUserIds: string[]
 }
 
-/** Execute webhook with the bot REST client (includes app auth). */
-async function executeWebhookMessage(
-  webhook: Webhook,
-  body: Record<string, unknown>,
-): Promise<{ id: string; type?: number; message_reference?: { message_id?: string } | null }> {
-  return discordClient.rest.post(
-    `${Routes.webhook(webhook.id, webhook.token!)}?wait=true`,
-    { body },
-  ) as Promise<{ id: string; type?: number; message_reference?: { message_id?: string } | null }>
-}
-
-async function messageHasReplyReference(
-  channel: TextChannel,
-  messageId: string,
-  sent?: { type?: number; message_reference?: { message_id?: string } | null },
-): Promise<boolean> {
-  if (sent && webhookReplySucceeded(sent)) return true
-  const fetched = await channel.messages.fetch(messageId).catch(() => null)
-  return !!fetched?.reference?.messageId
-}
-
-/** Try a single puppeted webhook reply; delete the message if Discord sent it flat. */
-async function tryWebhookReply(
-  webhook: Webhook,
-  channel: TextChannel,
-  opts: { content: string; username: string; avatarURL?: string; replyToDiscordMessageId: string },
-): Promise<OutboundDiscordMessage | null> {
+/** Resolve a Discord @mention for the parent message author, unless already in the reply. */
+async function resolveReplyParentAuthorMention(
+  harmonyParentId: string,
+  parentDiscordMessageId: string,
+  discordChannel: TextChannel,
+  replyContent: string,
+  replyContentRaw?: unknown[],
+): Promise<{ mention: string | null; userId: string | null }> {
+  let parent: any = null
   try {
-    console.log(
-      `↩️ Webhook reply in #${channel.name} → Discord msg ${opts.replyToDiscordMessageId}`,
-    )
-    const sent = await executeWebhookMessage(webhook, {
-      content: opts.content,
-      username: opts.username,
-      avatar_url: opts.avatarURL,
-      allowed_mentions: { parse: [] as const, replied_user: false },
-      message_reference: {
-        message_id: opts.replyToDiscordMessageId,
-        channel_id: channel.id,
-        guild_id: channel.guildId ?? undefined,
-        fail_if_not_exists: false,
-      },
-    })
-    if (!sent?.id) return null
+    parent = await harmonyClient.getMessage(harmonyParentId)
+  } catch {
+    // Parent lookup is best-effort; jump link still works without a mention.
+  }
 
-    if (await messageHasReplyReference(channel, sent.id, sent)) {
-      return { discordMessageId: sent.id, viaWebhook: true }
+  let discordUserId: string | null = null
+  const usernames: string[] = []
+
+  if (parent?.metadata?.discord_user?.id) {
+    discordUserId = String(parent.metadata.discord_user.id)
+    if (parent.metadata.discord_user.username) {
+      usernames.push(parent.metadata.discord_user.username)
     }
+  } else if (parent?.author?.username) {
+    usernames.push(parent.author.username)
+    if (parent.author.display_name) usernames.push(parent.author.display_name)
+    const cached = discordMemberCache.get(parent.author.username.toLowerCase())
+    if (cached) discordUserId = cached
+  }
 
-    console.warn(`⚠️ Webhook ${sent.id} posted flat (no reply reference) — deleting`)
-    await webhook.deleteMessage(sent.id).catch(err => {
-      console.warn(`⚠️ Could not delete flat webhook message ${sent.id}:`, err)
-    })
-    return null
-  } catch (err) {
-    console.warn('⚠️ Webhook reply failed:', err)
-    return null
+  if (!discordUserId) {
+    try {
+      const dMsg = await discordChannel.messages.fetch(parentDiscordMessageId)
+      if (!dMsg.webhookId) {
+        discordUserId = dMsg.author.id
+        usernames.push(dMsg.author.username, dMsg.author.displayName ?? '')
+      }
+    } catch {
+      // Ignore — mention is optional.
+    }
+  }
+
+  if (!discordUserId) return { mention: null, userId: null }
+
+  if (
+    isDiscordUserAlreadyMentioned(
+      discordUserId,
+      replyContent,
+      replyContentRaw,
+      usernames,
+      parent?.author?.id,
+    )
+  ) {
+    return { mention: null, userId: null }
+  }
+
+  return { mention: `<@${discordUserId}>`, userId: discordUserId }
+}
+
+/** Build Discord content for a Harmony message, including link+mention reply formatting. */
+async function buildHarmonyOutboundDiscordContent(
+  msg: any,
+  discordChannel: TextChannel,
+): Promise<OutboundDiscordContent> {
+  const contentText = translator.harmonyToDiscord(msg, discordMemberCache)
+  if (!contentText || contentText.trim() === '') {
+    return { content: contentText, mentionUserIds: [] }
+  }
+
+  if (!msg.reply_to || !discordChannel.guildId) {
+    return { content: contentText, mentionUserIds: [] }
+  }
+
+  const parentDiscordId = await resolveParentDiscordId(msg.reply_to, msg.channel_id)
+  if (!parentDiscordId) {
+    console.log(`⚠️ Harmony reply parent ${msg.reply_to} has no Discord mapping; sending without reply link`)
+    return { content: contentText, mentionUserIds: [] }
+  }
+
+  const jumpLink = buildDiscordJumpLink(discordChannel.guildId, discordChannel.id, parentDiscordId)
+  const { mention, userId } = await resolveReplyParentAuthorMention(
+    msg.reply_to,
+    parentDiscordId,
+    discordChannel,
+    contentText,
+    msg.content_raw,
+  )
+
+  console.log(
+    `↩️ Reply format: ${jumpLink}` +
+    (mention ? ` + ${mention}` : ' (parent already mentioned or unknown)'),
+  )
+
+  return {
+    content: formatHarmonyReplyForDiscord(jumpLink, mention, contentText),
+    mentionUserIds: userId ? [userId] : [],
   }
 }
 
 /** Post a Harmony-originated message to Discord. Webhook first (puppeting), else bot send. */
 async function sendHarmonyToDiscord(
   channel: TextChannel,
-  opts: { content: string; username: string; avatarURL?: string; replyToDiscordMessageId?: string },
+  opts: { content: string; username: string; avatarURL?: string; mentionUserIds?: string[] },
 ): Promise<OutboundDiscordMessage | null> {
   const me = channel.client.user
   const webhook = await getOrCreateWebhook(channel.id)
-
-  if (opts.replyToDiscordMessageId) {
-    if (webhook) {
-      const puppeted = await tryWebhookReply(webhook, channel, {
-        content: opts.content,
-        username: opts.username,
-        avatarURL: opts.avatarURL,
-        replyToDiscordMessageId: opts.replyToDiscordMessageId,
-      })
-      if (puppeted) return puppeted
-    }
-
-    // Discord often ignores message_reference on execute-webhook when replying to a
-    // native user message (parent wasn't sent by this webhook). Bot send still threads.
-    if (me && channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
-      console.log(
-        `↩️ Webhook reply unavailable; sending via bot in #${channel.name} ` +
-        `(ref ${opts.replyToDiscordMessageId})`,
-      )
-      const sent = await channel.send({
-        content: opts.content,
-        allowedMentions: { parse: [] },
-        reply: {
-          messageReference: opts.replyToDiscordMessageId,
-          failIfNotExists: false,
-        },
-      })
-      return { discordMessageId: sent.id, viaWebhook: false }
-    }
-
-    console.error(`❌ Cannot reply in #${channel.name}: webhook and bot send both unavailable`)
-    return null
-  }
+  const allowedMentions =
+    opts.mentionUserIds && opts.mentionUserIds.length > 0
+      ? { parse: [] as const, users: opts.mentionUserIds }
+      : { parse: [] as const }
 
   if (webhook) {
     const sent = await webhook.send({
       content: opts.content,
       username: opts.username,
       avatarURL: opts.avatarURL,
-      allowedMentions: { parse: [] },
+      allowedMentions,
     })
     if (!sent?.id) return null
     return { discordMessageId: sent.id, viaWebhook: true }
@@ -593,7 +606,7 @@ async function sendHarmonyToDiscord(
 
   const sent = await channel.send({
     content: `**${opts.username}**: ${opts.content}`,
-    allowedMentions: { parse: [] },
+    allowedMentions,
   })
   return { discordMessageId: sent.id, viaWebhook: false }
 }
@@ -604,11 +617,17 @@ async function editHarmonyOnDiscord(
   viaWebhook: boolean,
   content: string,
   username?: string,
+  mentionUserIds?: string[],
 ): Promise<void> {
+  const allowedMentions =
+    mentionUserIds && mentionUserIds.length > 0
+      ? { parse: [] as const, users: mentionUserIds }
+      : { parse: [] as const }
+
   if (viaWebhook) {
     const webhook = await getOrCreateWebhook(channel.id)
     if (webhook) {
-      await webhook.editMessage(discordMessageId, { content })
+      await webhook.editMessage(discordMessageId, { content, allowedMentions })
       return
     }
   }
@@ -619,6 +638,7 @@ async function editHarmonyOnDiscord(
   }
   await channel.messages.edit(discordMessageId, {
     content: username ? `**${username}**: ${content}` : content,
+    allowedMentions,
   })
 }
 
@@ -1157,29 +1177,18 @@ harmonyClient.on('messageCreate', async (msg: any) => {
     )
     const avatarURL = msg.author?.avatar?.startsWith('http://localhost') ? undefined : msg.author?.avatar
 
-    const contentText = translator.harmonyToDiscord(msg, discordMemberCache)
-    if (!contentText || contentText.trim() === '') {
+    const outboundContent = await buildHarmonyOutboundDiscordContent(msg, discordChannel)
+    if (!outboundContent.content || outboundContent.content.trim() === '') {
       console.error('❌ Message content is empty after translation, cannot send to Discord')
       return
     }
 
-    let replyToDiscordMessageId: string | undefined
-    if (msg.reply_to) {
-      const parentDiscordId = await resolveParentDiscordId(msg.reply_to, msg.channel_id)
-      if (parentDiscordId) {
-        replyToDiscordMessageId = parentDiscordId
-        console.log(`🔗 Reply mapping: Harmony ${msg.reply_to} -> Discord ${parentDiscordId}`)
-      } else {
-        console.log(`⚠️ Harmony reply parent ${msg.reply_to} has no Discord mapping; sending without reply reference`)
-      }
-    }
-
     console.log(`🔨 Sending to Discord as ${uniqueUsername}...`)
     const outbound = await sendHarmonyToDiscord(discordChannel, {
-      content: contentText,
+      content: outboundContent.content,
       username: uniqueUsername,
       avatarURL: avatarURL,
-      replyToDiscordMessageId,
+      mentionUserIds: outboundContent.mentionUserIds,
     })
 
     if (!outbound) {
@@ -1268,7 +1277,7 @@ harmonyClient.on('messageUpdate', async (msg: any) => {
       return
     }
     
-    const contentText = translator.harmonyToDiscord(msg, discordMemberCache)
+    const outboundContent = await buildHarmonyOutboundDiscordContent(msg, discordChannel)
     const viaWebhook = harmonyDiscordViaWebhook.get(msg.id) ?? true
     const uniqueUsername = formatHarmonyDisplayNameForDiscord(
       msg.author?.display_name,
@@ -1279,8 +1288,9 @@ harmonyClient.on('messageUpdate', async (msg: any) => {
       discordChannel,
       discordMessageId,
       viaWebhook,
-      contentText,
+      outboundContent.content,
       viaWebhook ? undefined : uniqueUsername,
+      outboundContent.mentionUserIds,
     )
     
     console.log(`✅ Harmony -> Discord edit: Message ${discordMessageId}`)

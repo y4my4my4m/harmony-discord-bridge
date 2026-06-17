@@ -490,6 +490,9 @@ async function sendHarmonyToDiscord(
         if (response.ok) {
           const sent = await response.json() as { id?: string }
           if (sent?.id) return { discordMessageId: sent.id, viaWebhook: true }
+        } else {
+          const errText = await response.text().catch(() => '')
+          console.warn(`⚠️ Webhook reply failed (${response.status}): ${errText.slice(0, 200)}`)
         }
       } catch {
         // Fall through to bot send with native reply.
@@ -614,7 +617,10 @@ const harmonyClient = new HarmonyClient(
 )
 
 /** Map a Harmony reply parent to its Discord message ID (in-memory map + metadata fallback). */
-async function resolveParentDiscordId(harmonyReplyToId: string): Promise<string | null> {
+async function resolveParentDiscordId(
+  harmonyReplyToId: string,
+  harmonyChannelId: string,
+): Promise<string | null> {
   const mapped = harmonyToDiscordMessages.get(harmonyReplyToId)
   if (mapped) return mapped
 
@@ -627,8 +633,45 @@ async function resolveParentDiscordId(harmonyReplyToId: string): Promise<string 
       return discordId
     }
   } catch {
-    // Parent lookup failed — send without reply reference.
+    // Parent lookup failed — try channel lookup below.
   }
+
+  // Parent may have been evicted from the in-memory map; search by stored metadata.
+  try {
+    const recent = await harmonyClient.loadRecentMessages(harmonyChannelId, 100)
+    const found = recent.find(m => m.id === harmonyReplyToId && m.metadata?.discord_message_id)
+    if (found?.metadata?.discord_message_id) {
+      const discordId = found.metadata.discord_message_id
+      discordToHarmonyMessages.set(discordId, found.id)
+      harmonyToDiscordMessages.set(found.id, discordId)
+      return discordId
+    }
+  } catch {
+    // Fall through.
+  }
+
+  return null
+}
+
+/** Map a Discord reply parent to its Harmony message ID (in-memory map + metadata fallback). */
+async function resolveParentHarmonyId(
+  discordParentId: string,
+  harmonyChannelId: string,
+): Promise<string | null> {
+  const mapped = discordToHarmonyMessages.get(discordParentId)
+  if (mapped) return mapped
+
+  try {
+    const parent = await harmonyClient.lookupMessageByDiscordId(harmonyChannelId, discordParentId)
+    if (parent?.id) {
+      discordToHarmonyMessages.set(discordParentId, parent.id)
+      harmonyToDiscordMessages.set(parent.id, discordParentId)
+      return parent.id
+    }
+  } catch {
+    // Lookup failed — send without reply reference.
+  }
+
   return null
 }
 
@@ -666,10 +709,8 @@ discordClient.on('messageCreate', async (msg: DiscordMessage) => {
     let replyTo: string | null = null
     const discordParentId = msg.reference?.messageId
     if (discordParentId) {
-      const mapped = discordToHarmonyMessages.get(discordParentId)
-      if (mapped) {
-        replyTo = mapped
-      } else {
+      replyTo = await resolveParentHarmonyId(discordParentId, harmonyChannelId)
+      if (!replyTo) {
         console.log(`⚠️ Discord reply parent ${discordParentId} not in mapping; sending as plain message`)
       }
     }
@@ -987,6 +1028,7 @@ harmonyClient.on('messageCreate', async (msg: any) => {
     isBot: msg.author?.bot,
     bridge_source: msg.metadata?.bridge_source,
     discord_message_id: msg.metadata?.discord_message_id,
+    reply_to: msg.reply_to,
     channelId: msg.channel_id,
     content: msg.content,
     content_raw: msg.content_raw
@@ -1058,9 +1100,10 @@ harmonyClient.on('messageCreate', async (msg: any) => {
 
     let replyToDiscordMessageId: string | undefined
     if (msg.reply_to) {
-      const parentDiscordId = await resolveParentDiscordId(msg.reply_to)
+      const parentDiscordId = await resolveParentDiscordId(msg.reply_to, msg.channel_id)
       if (parentDiscordId) {
         replyToDiscordMessageId = parentDiscordId
+        console.log(`🔗 Reply mapping: Harmony ${msg.reply_to} -> Discord ${parentDiscordId}`)
       } else {
         console.log(`⚠️ Harmony reply parent ${msg.reply_to} has no Discord mapping; sending without reply reference`)
       }
@@ -1084,6 +1127,16 @@ harmonyClient.on('messageCreate', async (msg: any) => {
       discordToHarmonyMessages.set(outbound.discordMessageId, msg.id)
       harmonyDiscordViaWebhook.set(msg.id, outbound.viaWebhook)
       console.log(`📌 Stored message mapping: Harmony ${msg.id} <-> Discord ${outbound.discordMessageId}`)
+
+      // Persist Discord message ID in Harmony metadata so reply chains survive restarts.
+      try {
+        await harmonyClient.mergeMessageMetadata(msg.id, {
+          discord_message_id: outbound.discordMessageId,
+          bridge_source: 'harmony',
+        })
+      } catch (err) {
+        console.warn(`⚠️ Failed to persist discord_message_id on Harmony message ${msg.id}:`, err)
+      }
     }
 
     console.log(`✅ Harmony -> Discord (${outbound.viaWebhook ? 'webhook' : 'bot fallback'}): ${uniqueUsername} in #${discordChannelId}`)

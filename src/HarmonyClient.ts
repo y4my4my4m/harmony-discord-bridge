@@ -221,6 +221,34 @@ export class HarmonyClient extends EventEmitter {
     return response.json()
   }
 
+  async lookupMessageByDiscordId(channelId: string, discordMessageId: string): Promise<any | null> {
+    const response = await fetch(
+      `${this.apiUrl}/api/v1/channels/${channelId}/messages/lookup?discord_message_id=${encodeURIComponent(discordMessageId)}`,
+      {
+        headers: {
+          Authorization: `Bot ${this.botToken}`,
+        },
+      },
+    )
+    if (!response.ok) return null
+    return response.json()
+  }
+
+  async mergeMessageMetadata(messageId: string, metadata: Record<string, unknown>): Promise<void> {
+    const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}/metadata`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bot ${this.botToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ metadata }),
+    })
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({})) as any
+      throw new Error(errorData.error || `Failed to merge metadata (${response.status})`)
+    }
+  }
+
   async silentUpdateMessageContent(messageId: string, content: any[]): Promise<void> {
     const response = await fetch(`${this.apiUrl}/api/v1/messages/${messageId}/content-silent`, {
       method: 'PATCH',

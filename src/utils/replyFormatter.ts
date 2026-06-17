@@ -2,6 +2,43 @@ export function buildDiscordJumpLink(guildId: string, channelId: string, message
   return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`
 }
 
+const DISCORD_JUMP_LINK_RE =
+  /^https:\/\/discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)\s*(?:\r?\n|$)/
+
+export interface ParsedDiscordJumpLink {
+  guildId: string
+  channelId: string
+  messageId: string
+  /** Length of the matched prefix in the original string (from index 0). */
+  consumedLength: number
+}
+
+/** Parse a leading Discord message jump link (Harmony→Discord reply format). */
+export function parseDiscordJumpLink(text: string): ParsedDiscordJumpLink | null {
+  const trimmed = text.trimStart()
+  const leadingWhitespace = text.length - trimmed.length
+  const match = trimmed.match(DISCORD_JUMP_LINK_RE)
+  if (!match) return null
+  return {
+    guildId: match[1],
+    channelId: match[2],
+    messageId: match[3],
+    consumedLength: leadingWhitespace + match[0].length,
+  }
+}
+
+/** Remove a leading jump-link line from bridged reply content. */
+export function stripDiscordJumpLinkLine(text: string): string {
+  const parsed = parseDiscordJumpLink(text)
+  if (!parsed) return text
+  return text.slice(parsed.consumedLength).trimStart()
+}
+
+/** Remove a leading `<@id>` Discord mention (Discord auto-adds these on replies). */
+export function stripDiscordUserMentionPrefix(text: string, discordUserId: string): string {
+  return text.replace(new RegExp(`^\\s*<@!?${discordUserId}>\\s*`), '')
+}
+
 export function isDiscordUserAlreadyMentioned(
   discordUserId: string,
   content: string,

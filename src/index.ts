@@ -28,6 +28,9 @@ import {
   buildDiscordJumpLink,
   formatHarmonyReplyForDiscord,
   isDiscordUserAlreadyMentioned,
+  parseDiscordJumpLink,
+  stripDiscordJumpLinkLine,
+  stripDiscordUserMentionPrefix,
 } from './utils/replyFormatter.js'
 import { refreshDiscordAttachmentParts } from './refreshAttachments.js'
 import {
@@ -744,20 +747,78 @@ async function resolveParentHarmonyId(
   harmonyChannelId: string,
 ): Promise<string | null> {
   const mapped = discordToHarmonyMessages.get(discordParentId)
-  if (mapped) return mapped
+  if (mapped) {
+    console.log(`🔗 Reply parent from cache: Discord ${discordParentId} -> Harmony ${mapped}`)
+    return mapped
+  }
 
   try {
     const parent = await harmonyClient.lookupMessageByDiscordId(harmonyChannelId, discordParentId)
     if (parent?.id) {
       discordToHarmonyMessages.set(discordParentId, parent.id)
       harmonyToDiscordMessages.set(parent.id, discordParentId)
+      console.log(`🔗 Reply parent from lookup: Discord ${discordParentId} -> Harmony ${parent.id}`)
       return parent.id
     }
   } catch {
-    // Lookup failed — send without reply reference.
+    // Lookup failed — try recent scan below.
+  }
+
+  try {
+    const recent = await harmonyClient.loadRecentMessages(harmonyChannelId, 100)
+    const found = recent.find(m => m.metadata?.discord_message_id === discordParentId)
+    if (found?.id) {
+      discordToHarmonyMessages.set(discordParentId, found.id)
+      harmonyToDiscordMessages.set(found.id, discordParentId)
+      console.log(`🔗 Reply parent from recent scan: Discord ${discordParentId} -> Harmony ${found.id}`)
+      return found.id
+    }
+  } catch (err) {
+    console.warn(`⚠️ Recent message scan failed for Discord reply parent ${discordParentId}:`, err)
   }
 
   return null
+}
+
+/**
+ * Resolve Harmony reply_to from a Discord reply (native reference or jump-link prefix).
+ * Strips bridge reply formatting from content so Harmony shows a clean threaded reply.
+ */
+async function resolveDiscordReplyToHarmony(
+  msg: DiscordMessage,
+  harmonyChannelId: string,
+): Promise<{ replyTo: string | null; cleanedContent: string }> {
+  let content = msg.content ?? ''
+  let discordParentId = msg.reference?.messageId ?? null
+
+  if (!discordParentId) {
+    const parsed = parseDiscordJumpLink(content)
+    if (parsed) {
+      discordParentId = parsed.messageId
+      content = content.slice(parsed.consumedLength).trimStart()
+    }
+  }
+
+  if (!discordParentId) {
+    return { replyTo: null, cleanedContent: content }
+  }
+
+  const replyTo = await resolveParentHarmonyId(discordParentId, harmonyChannelId)
+  if (!replyTo) {
+    console.log(`⚠️ Discord reply parent ${discordParentId} not in mapping; sending as plain message`)
+    return { replyTo: null, cleanedContent: content }
+  }
+
+  console.log(`↩️ Discord reply → Harmony reply_to ${replyTo} (parent Discord ${discordParentId})`)
+
+  content = stripDiscordJumpLinkLine(content)
+
+  const repliedUserId = msg.mentions.repliedUser?.id
+  if (repliedUserId) {
+    content = stripDiscordUserMentionPrefix(content, repliedUserId)
+  }
+
+  return { replyTo, cleanedContent: content }
 }
 
 const permissionSync = new PermissionSync(harmonyClient, discordClient, mapper, permissionSyncStore)
@@ -769,6 +830,15 @@ const permissionSync = new PermissionSync(harmonyClient, discordClient, mapper, 
 discordClient.on('messageCreate', async (msg: DiscordMessage) => {
   // Ignore bot messages
   if (msg.author.bot) return
+
+  if (msg.partial) {
+    try {
+      msg = await msg.fetch()
+    } catch (err) {
+      console.warn('⚠️ Failed to fetch partial Discord message:', err)
+      return
+    }
+  }
   
   // Check if channel is mapped
   const harmonyChannelId = mapper.getHarmonyChannel(msg.channelId)
@@ -777,28 +847,20 @@ discordClient.on('messageCreate', async (msg: DiscordMessage) => {
   if (!mapper.shouldBridgeFromDiscord(msg.channelId)) return
   
   try {
+    const { replyTo, cleanedContent } = await resolveDiscordReplyToHarmony(msg, harmonyChannelId)
+
     // Translate message content using MessageParts format. Attachment storage
     // policy (link/mirror) is applied server-side by the bot-gateway.
-    const contentParts = translator.discordToHarmonyParts(msg)
+    const contentParts = translator.discordToHarmonyParts({
+      ...msg,
+      content: cleanedContent,
+    })
 
     // Extract Discord user metadata for puppeting
     const metadata = translator.extractDiscordUserMetadata(msg)
 
     // Store Discord message ID in metadata for reaction mapping
     metadata.discord_message_id = msg.id
-
-    // Reply threading: if this Discord message is a reply, look up the
-    // Harmony parent via our mapping and forward as a real Harmony reply.
-    // Falls back to no reply if the parent isn't in our mapping window
-    // (e.g. replied to a very old message that's already evicted).
-    let replyTo: string | null = null
-    const discordParentId = msg.reference?.messageId
-    if (discordParentId) {
-      replyTo = await resolveParentHarmonyId(discordParentId, harmonyChannelId)
-      if (!replyTo) {
-        console.log(`⚠️ Discord reply parent ${discordParentId} not in mapping; sending as plain message`)
-      }
-    }
 
     // Send to Harmony with MessageParts array (and reply linkage if any)
     const result = await harmonyClient.sendMessage(

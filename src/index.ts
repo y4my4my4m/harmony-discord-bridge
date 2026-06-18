@@ -41,6 +41,7 @@ import {
 import { joinLinesWithinDiscordLimit } from './utils/discordMessage.js'
 import { buildHarmonyInviteDiscordEmbeds } from './utils/harmonyInviteEmbeds.js'
 import { shouldBridgeHarmonyMessageToDiscord } from './utils/harmonyMessageFilter.js'
+import { buildDiscordUserMetadata } from './utils/discordUserMetadata.js'
 import {
   buildDiscordStructurePlan,
   syncDiscordStructureOrderToHarmony,
@@ -861,6 +862,13 @@ discordClient.on('messageCreate', async (msg: DiscordMessage) => {
   try {
     const { replyTo, cleanedContent } = await resolveDiscordReplyToHarmony(msg, harmonyChannelId)
 
+    // Resolve guild member so we capture server nickname (not just global display name).
+    let guildMember = msg.member
+    if (!guildMember && msg.guild) {
+      guildMember = msg.guild.members.cache.get(msg.author.id)
+        ?? await msg.guild.members.fetch(msg.author.id).catch(() => null)
+    }
+
     // Translate message content using MessageParts format. Attachment storage
     // policy (link/mirror) is applied server-side by the bot-gateway.
     const contentParts = translator.discordToHarmonyParts({
@@ -868,11 +876,15 @@ discordClient.on('messageCreate', async (msg: DiscordMessage) => {
       content: cleanedContent,
     })
 
-    // Extract Discord user metadata for puppeting
-    const metadata = translator.extractDiscordUserMetadata(msg)
-
-    // Store Discord message ID in metadata for reaction mapping
-    metadata.discord_message_id = msg.id
+    // Extract Discord user metadata for puppeting (server nickname, not global name)
+    const metadata = {
+      ...buildDiscordUserMetadata(
+        msg.author,
+        guildMember,
+        discordMemberDetails.get(msg.author.id),
+      ),
+      discord_message_id: msg.id,
+    }
 
     // Send to Harmony with MessageParts array (and reply linkage if any)
     const result = await harmonyClient.sendMessage(
@@ -977,17 +989,16 @@ discordClient.on('messageReactionAdd', async (reaction, user) => {
       return
     }
     
-    // Prepare Discord user metadata for attribution
-    const reactionMetadata = {
-      discord_user: {
-        id: user.id,
-        username: user.username,
-        discriminator: user.discriminator,
-        display_name: user.globalName || user.username,
-        avatar_url: user.displayAvatarURL({ size: 128 })
-      },
-      bridge_source: 'discord'
+    // Prepare Discord user metadata for attribution (server nickname when available)
+    let reactionMember = reaction.message.guild?.members.cache.get(user.id) ?? null
+    if (!reactionMember && reaction.message.guild) {
+      reactionMember = await reaction.message.guild.members.fetch(user.id).catch(() => null)
     }
+    const reactionMetadata = buildDiscordUserMetadata(
+      user as import('discord.js').User,
+      reactionMember,
+      discordMemberDetails.get(user.id),
+    )
     
     // Add reaction to Harmony message with Discord user metadata
     await harmonyClient.addReaction(harmonyChannelId, harmonyMessageId, emojiIdentifier, reactionMetadata)

@@ -276,9 +276,11 @@ export class MessageTranslator {
           // User mention: <@id> or <@!id>
           const discordUserId = match[4]
           const user = discordMsg.mentions?.users?.get(discordUserId)
+          const guildMember = discordMsg.guild?.members?.cache?.get(discordUserId)
           
           if (user) {
             // Create proper mention MessagePart for Discord user
+            const displayName = guildMember?.displayName || user.globalName || user.username
             console.log(`🔔 D→H Mention: <@${discordUserId}> → @${user.username}@discord.com (ID: ${discordUserId})`)
             parts.push({
               type: 'mention',
@@ -286,7 +288,7 @@ export class MessageTranslator {
               username: user.username,
               domain: 'discord.com',
               isLocal: false,
-              displayName: user.globalName || user.username,
+              displayName,
               isBridged: true,
               bridgeSource: 'discord'
             })
@@ -467,18 +469,28 @@ export class MessageTranslator {
   }
   
   /**
-   * Extract Discord user metadata for puppeting
+   * Extract Discord user metadata for puppeting.
+   * @deprecated Prefer buildDiscordUserMetadata() with guild member for server nicknames.
    */
   extractDiscordUserMetadata(discordMsg: any): any {
+    const author = discordMsg.author
+    const member = discordMsg.member
+    const displayName =
+      (member && member.displayName) ||
+      author.globalName ||
+      author.username
     return {
       discord_user: {
-        id: discordMsg.author.id,
-        username: discordMsg.author.username,
-        discriminator: discordMsg.author.discriminator,
-        display_name: discordMsg.author.globalName || discordMsg.author.username,
-        avatar_url: discordMsg.author.displayAvatarURL({ size: 256 })
+        id: author.id,
+        username: author.username,
+        discriminator: author.discriminator,
+        display_name: displayName,
+        avatar_url:
+          (member && typeof member.displayAvatarURL === 'function'
+            ? member.displayAvatarURL({ size: 256 })
+            : null) || author.displayAvatarURL({ size: 256 }),
       },
-      bridge_source: 'discord'
+      bridge_source: 'discord',
     }
   }
   

@@ -264,6 +264,28 @@ export class HarmonyClient extends EventEmitter {
     }
   }
 
+  async fetchInvitePreview(code: string): Promise<{
+    code: string
+    invite_url: string
+    server_name: string
+    server_description?: string | null
+    server_icon_url?: string | null
+    member_count?: number | null
+  } | null> {
+    const response = await fetch(`${this.apiUrl}/api/v1/invites/${encodeURIComponent(code)}/preview`, {
+      headers: { Authorization: `Bot ${this.botToken}` },
+    })
+    if (!response.ok) return null
+    return (await response.json()) as {
+      code: string
+      invite_url: string
+      server_name: string
+      server_description?: string | null
+      server_icon_url?: string | null
+      member_count?: number | null
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Server structure: categories + channels.
   // Used by the bridge's `/bridge clone-server` and `/bridge link` commands.

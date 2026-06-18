@@ -16,7 +16,8 @@ import {
   PermissionFlagsBits,
   MessageFlags,
   ActivityType,
-  type Role as DiscordRole
+  type Role as DiscordRole,
+  type APIEmbed,
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
 import { MessageTranslator } from './MessageTranslator.js'
@@ -38,6 +39,8 @@ import {
   discordColorToHex,
 } from './utils/discordPermissions.js'
 import { joinLinesWithinDiscordLimit } from './utils/discordMessage.js'
+import { buildHarmonyInviteDiscordEmbeds } from './utils/harmonyInviteEmbeds.js'
+import { shouldBridgeHarmonyMessageToDiscord } from './utils/harmonyMessageFilter.js'
 import {
   buildDiscordStructurePlan,
   syncDiscordStructureOrderToHarmony,
@@ -576,7 +579,13 @@ async function buildHarmonyOutboundDiscordContent(
 /** Post a Harmony-originated message to Discord. Webhook first (puppeting), else bot send. */
 async function sendHarmonyToDiscord(
   channel: TextChannel,
-  opts: { content: string; username: string; avatarURL?: string; mentionUserIds?: string[] },
+  opts: {
+    content: string
+    username: string
+    avatarURL?: string
+    mentionUserIds?: string[]
+    embeds?: APIEmbed[]
+  },
 ): Promise<OutboundDiscordMessage | null> {
   const me = channel.client.user
   const webhook = await getOrCreateWebhook(channel.id)
@@ -584,6 +593,7 @@ async function sendHarmonyToDiscord(
     opts.mentionUserIds && opts.mentionUserIds.length > 0
       ? { parse: [] as const, users: opts.mentionUserIds }
       : { parse: [] as const }
+  const embeds = opts.embeds?.length ? opts.embeds.slice(0, 10) : undefined
 
   if (webhook) {
     const sent = await webhook.send({
@@ -591,6 +601,7 @@ async function sendHarmonyToDiscord(
       username: opts.username,
       avatarURL: opts.avatarURL,
       allowedMentions,
+      embeds,
     })
     if (!sent?.id) return null
     return { discordMessageId: sent.id, viaWebhook: true }
@@ -610,6 +621,7 @@ async function sendHarmonyToDiscord(
   const sent = await channel.send({
     content: `**${opts.username}**: ${opts.content}`,
     allowedMentions,
+    embeds,
   })
   return { discordMessageId: sent.id, viaWebhook: false }
 }
@@ -1207,6 +1219,11 @@ harmonyClient.on('messageCreate', async (msg: any) => {
     console.log('⏭️  Skipping bot message')
     return
   }
+
+  if (!shouldBridgeHarmonyMessageToDiscord(msg)) {
+    console.log('⏭️  Skipping Harmony system/server event message')
+    return
+  }
   
   // Check if channel is mapped
   const discordChannelId = mapper.getDiscordChannel(msg.channel_id)
@@ -1245,12 +1262,19 @@ harmonyClient.on('messageCreate', async (msg: any) => {
       return
     }
 
+    const inviteEmbeds = await buildHarmonyInviteDiscordEmbeds(
+      msg,
+      harmonyClient,
+      harmonyBaseUrl.hostname,
+    )
+
     console.log(`🔨 Sending to Discord as ${uniqueUsername}...`)
     const outbound = await sendHarmonyToDiscord(discordChannel, {
       content: outboundContent.content,
       username: uniqueUsername,
       avatarURL: avatarURL,
       mentionUserIds: outboundContent.mentionUserIds,
+      embeds: inviteEmbeds,
     })
 
     if (!outbound) {
@@ -1295,6 +1319,11 @@ harmonyClient.on('messageUpdate', async (msg: any) => {
   // Don't bridge messages that came from Discord (prevent loops!)
   if (msg.metadata?.bridge_source === 'discord') {
     console.log('⏭️  Skipping message from Discord (preventing loop)')
+    return
+  }
+
+  if (!shouldBridgeHarmonyMessageToDiscord(msg)) {
+    console.log('⏭️  Skipping Harmony system/server event message update')
     return
   }
   

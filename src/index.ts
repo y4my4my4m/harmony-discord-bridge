@@ -43,6 +43,10 @@ import { buildHarmonyInviteDiscordEmbeds } from './utils/harmonyInviteEmbeds.js'
 import { shouldBridgeHarmonyMessageToDiscord } from './utils/harmonyMessageFilter.js'
 import { buildDiscordUserMetadata } from './utils/discordUserMetadata.js'
 import {
+  buildDiscordReactionPayload,
+  mergeReactionMetadata,
+} from './utils/discordReaction.js'
+import {
   buildDiscordStructurePlan,
   syncDiscordStructureOrderToHarmony,
 } from './discordChannelOrder.js'
@@ -53,6 +57,7 @@ dotenv.config()
 
 // Initialize components
 const mapper = new ChannelMapper('./config/bridge-config.yml')
+await mapper.resolveHarmonyPairing()
 const config = mapper.getConfig()
 const permissionSyncStore = new PermissionSyncStore('./data/permission-sync.yml')
 
@@ -108,6 +113,7 @@ export interface BridgedDiscordRoleInfo {
 
 // Also store full member info for autosuggest API + member sidebar/profile
 interface CachedDiscordMember {
+  guildId: string
   id: string
   username: string
   displayName: string
@@ -201,15 +207,32 @@ export function getDiscordMemberIdCache(): Map<string, string> {
 /**
  * Add or update a member in the cache
  */
+function memberCacheKey(guildId: string, username: string): string {
+  return `${guildId}:${username.toLowerCase()}`
+}
+
+function getDiscordMemberCacheForGuild(guildId: string): Map<string, string> {
+  const scoped = new Map<string, string>()
+  const prefix = `${guildId}:`
+  for (const [key, value] of discordMemberCache.entries()) {
+    if (key.startsWith(prefix)) {
+      scoped.set(key.slice(prefix.length), value)
+    }
+  }
+  return scoped
+}
+
 function cacheMember(member: GuildMember) {
+  const guildId = member.guild.id
   const username = member.user.username.toLowerCase()
-  discordMemberCache.set(username, member.id)
+  discordMemberCache.set(memberCacheKey(guildId, username), member.id)
 
   const { harmonyRoleIds, roles } = mapMemberRoles(member)
   const { presenceStatus, customStatus } = extractMemberPresence(member)
   const bannerUrl = member.user.bannerURL({ size: 512 }) ?? null
 
   discordMemberDetails.set(member.id, {
+    guildId,
     id: member.id,
     username: member.user.username,
     displayName: member.displayName || member.user.username,
@@ -229,7 +252,10 @@ function cacheMember(member: GuildMember) {
  * Remove a member from the cache by ID
  */
 function uncacheMemberById(memberId: string, username: string) {
-  discordMemberCache.delete(username.toLowerCase())
+  const existing = discordMemberDetails.get(memberId)
+  if (existing) {
+    discordMemberCache.delete(memberCacheKey(existing.guildId, username))
+  }
   discordMemberDetails.delete(memberId)
 }
 
@@ -244,7 +270,7 @@ interface CachedHarmonyUser {
   isLocal: boolean
   avatarUrl: string | null
 }
-const harmonyUserCache = new Map<string, CachedHarmonyUser>()
+const harmonyUserCacheByServer = new Map<string, Map<string, CachedHarmonyUser>>()
 let harmonyUserCacheTimer: NodeJS.Timeout | null = null
 let discordStartupDone = false
 
@@ -256,97 +282,110 @@ const HARMONY_USER_CACHE_REFRESH_MS = 5 * 60 * 1000
  */
 async function refreshHarmonyUserCache(options: { verbose?: boolean } = {}) {
   const verbose = options.verbose ?? false
-  const prevSize = harmonyUserCache.size
-
-  if (!config.harmony.serverId) {
-    console.error('❌ harmony.serverId not configured in bridge-config.yml!')
+  const serverIds = mapper.getHarmonyServerIds()
+  if (serverIds.length === 0) {
+    console.error('❌ No harmonyServerId configured (bridges[] or harmony.serverId)')
     return
   }
 
-  const url = `${config.harmony.apiUrl}/api/v1/servers/${config.harmony.serverId}/members?limit=1000`
-  if (verbose) {
-    console.log('🔄 Refreshing Harmony user cache...')
-    console.log(`📡 Fetching from: ${url}`)
-  }
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bot ${config.harmony.token}`
-      }
-    })
-
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error('❌ Failed to fetch Harmony users:', errorText)
-      return
-    }
-
-    const members = await response.json() as any[]
-
-    harmonyUserCache.clear()
-
-    for (const member of members) {
-      if (member.user) {
-        const username = member.user.username || 'unknown'
-        const isLocal = member.user.is_local !== false
-        harmonyUserCache.set(member.user.id, {
-          id: member.user.id,
-          username,
-          displayName: formatHarmonyDisplayNameForDiscord(member.user.display_name, username),
-          domain: member.user.domain ?? null,
-          isLocal,
-          avatarUrl: member.user.avatar || null,
-        })
-      }
-    }
-
+  for (const serverId of serverIds) {
+    const prevSize = harmonyUserCacheByServer.get(serverId)?.size ?? 0
+    const url = `${config.harmony.apiUrl}/api/v1/servers/${serverId}/members?limit=1000`
     if (verbose) {
-      console.log(`✅ Harmony user cache: ${harmonyUserCache.size} users`)
-      const firstUsers = Array.from(harmonyUserCache.values()).slice(0, 3)
-      firstUsers.forEach(u => console.log(
-        `   👤 ${u.displayName} (${formatHarmonyUserHandle(u.username, u.domain, u.isLocal)})`,
-      ))
-    } else if (harmonyUserCache.size !== prevSize) {
-      console.log(`🔄 Harmony user cache: ${prevSize} → ${harmonyUserCache.size} users`)
+      console.log(`🔄 Refreshing Harmony user cache for server ${serverId}...`)
+      console.log(`📡 Fetching from: ${url}`)
     }
-  } catch (error) {
-    console.error('❌ Error fetching Harmony users:', error)
+
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bot ${config.harmony.token}`,
+        },
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        console.error(`❌ Failed to fetch Harmony users for ${serverId}:`, errorText)
+        continue
+      }
+
+      const members = await response.json() as any[]
+      const serverCache = new Map<string, CachedHarmonyUser>()
+
+      for (const member of members) {
+        if (member.user) {
+          const username = member.user.username || 'unknown'
+          const isLocal = member.user.is_local !== false
+          serverCache.set(member.user.id, {
+            id: member.user.id,
+            username,
+            displayName: formatHarmonyDisplayNameForDiscord(member.user.display_name, username),
+            domain: member.user.domain ?? null,
+            isLocal,
+            avatarUrl: member.user.avatar || null,
+          })
+        }
+      }
+
+      harmonyUserCacheByServer.set(serverId, serverCache)
+
+      if (verbose) {
+        console.log(`✅ Harmony user cache (${serverId.slice(0, 8)}…): ${serverCache.size} users`)
+      } else if (serverCache.size !== prevSize) {
+        console.log(`🔄 Harmony user cache (${serverId.slice(0, 8)}…): ${prevSize} → ${serverCache.size} users`)
+      }
+    } catch (error) {
+      console.error(`❌ Error fetching Harmony users for ${serverId}:`, error)
+    }
   }
+}
+
+function getHarmonyUserCacheForGuild(guildId: string): Map<string, CachedHarmonyUser> {
+  const bridge = mapper.getBridgeForDiscordGuild(guildId)
+  if (!bridge) return new Map()
+  return harmonyUserCacheByServer.get(bridge.harmonyServerId) ?? new Map()
 }
 
 /**
  * Get Harmony users matching a query (for autocomplete)
  */
-function searchHarmonyUsers(query: string): CachedHarmonyUser[] {
+function searchHarmonyUsers(query: string, guildId?: string): CachedHarmonyUser[] {
   const lowerQuery = query.toLowerCase()
   const results: CachedHarmonyUser[] = []
-  
-  for (const user of harmonyUserCache.values()) {
-    const handle = formatHarmonyUserHandle(user.username, user.domain, user.isLocal).toLowerCase()
-    if (
-      user.username.toLowerCase().includes(lowerQuery) ||
-      user.displayName.toLowerCase().includes(lowerQuery) ||
-      handle.includes(lowerQuery) ||
-      (user.domain && user.domain.toLowerCase().includes(lowerQuery))
-    ) {
-      results.push(user)
-      if (results.length >= 25) break // Discord autocomplete limit
+  const sources = guildId
+    ? [getHarmonyUserCacheForGuild(guildId)]
+    : Array.from(harmonyUserCacheByServer.values())
+
+  for (const cache of sources) {
+    for (const user of cache.values()) {
+      const handle = formatHarmonyUserHandle(user.username, user.domain, user.isLocal).toLowerCase()
+      if (
+        user.username.toLowerCase().includes(lowerQuery) ||
+        user.displayName.toLowerCase().includes(lowerQuery) ||
+        handle.includes(lowerQuery) ||
+        (user.domain && user.domain.toLowerCase().includes(lowerQuery))
+      ) {
+        results.push(user)
+        if (results.length >= 25) break
+      }
     }
+    if (results.length >= 25) break
   }
-  
+
   return results
 }
 
 function findHarmonyMember(username: string, domain: string | null = null): CachedHarmonyUser | null {
   const lowerUser = username.toLowerCase()
-  for (const user of harmonyUserCache.values()) {
-    if (user.username.toLowerCase() !== lowerUser) continue
-    if (domain) {
-      if (user.domain?.toLowerCase() === domain.toLowerCase()) return user
-      continue
+  for (const cache of harmonyUserCacheByServer.values()) {
+    for (const user of cache.values()) {
+      if (user.username.toLowerCase() !== lowerUser) continue
+      if (domain) {
+        if (user.domain?.toLowerCase() === domain.toLowerCase()) return user
+        continue
+      }
+      if (user.isLocal) return user
     }
-    if (user.isLocal) return user
   }
   return null
 }
@@ -379,39 +418,48 @@ function registerBridgeDataWithGateway() {
     return
   }
 
-  const members = Array.from(discordMemberDetails.values()).map(m => ({
-    id: m.id,
-    username: m.username,
-    displayName: m.displayName,
-    avatarUrl: m.avatarUrl,
-    bannerUrl: m.bannerUrl,
-    accentColor: m.accentColor,
-    harmonyRoleIds: m.harmonyRoleIds,
-    roles: m.roles,
-    joinedAt: m.joinedAt,
-    createdAt: m.createdAt,
-    presenceStatus: m.presenceStatus,
-    customStatus: m.customStatus,
-    source: 'discord' as const,
-  }))
+  const channels = mapper.getBridges().flatMap(bridge => {
+    const members = Array.from(discordMemberDetails.values())
+      .filter(m => m.guildId === bridge.discordGuildId)
+      .map(m => ({
+        id: m.id,
+        username: m.username,
+        displayName: m.displayName,
+        avatarUrl: m.avatarUrl,
+        bannerUrl: m.bannerUrl,
+        accentColor: m.accentColor,
+        harmonyRoleIds: m.harmonyRoleIds,
+        roles: m.roles,
+        joinedAt: m.joinedAt,
+        createdAt: m.createdAt,
+        presenceStatus: m.presenceStatus,
+        customStatus: m.customStatus,
+        source: 'discord' as const,
+      }))
 
-  const channels = config.channelMappings.map(mapping => ({
-    harmonyChannelId: mapping.harmony,
-    discordChannelId: mapping.discord,
-  }))
+    return bridge.channelMappings.map(mapping => ({
+      harmonyChannelId: mapping.harmony,
+      discordChannelId: mapping.discord,
+      members,
+    }))
+  })
+
+  const totalMembers = new Set(
+    Array.from(discordMemberDetails.values()).map(m => m.id),
+  ).size
 
   console.log('╔════════════════════════════════════════╗')
   console.log('║   🌉 Registering Bridge Data          ║')
   console.log('╠════════════════════════════════════════╣')
+  console.log(`║   Bridges: ${mapper.getBridges().length}`)
   console.log(`║   Channels: ${channels.length}`)
-  console.log(`║   Discord members (guild): ${members.length}`)
-  console.log(`║   Harmony members (autocomplete): ${harmonyUserCache.size}`)
+  console.log(`║   Discord members (all guilds): ${totalMembers}`)
   channels.forEach(ch => {
     console.log(`║   📍 ${ch.harmonyChannelId.substring(0, 8)}... <-> Discord ${ch.discordChannelId}`)
   })
   console.log('╚════════════════════════════════════════╝')
 
-  harmonyClient.registerBridgeData(channels, members)
+  harmonyClient.registerBridgeData(channels)
 }
 
 let bridgeDataRegisterTimer: NodeJS.Timeout | null = null
@@ -504,7 +552,7 @@ async function resolveReplyParentAuthorMention(
   } else if (parent?.author?.username) {
     usernames.push(parent.author.username)
     if (parent.author.display_name) usernames.push(parent.author.display_name)
-    const cached = discordMemberCache.get(parent.author.username.toLowerCase())
+    const cached = discordMemberCache.get(memberCacheKey(discordChannel.guildId, parent.author.username))
     if (cached) discordUserId = cached
   }
 
@@ -542,7 +590,10 @@ async function buildHarmonyOutboundDiscordContent(
   msg: any,
   discordChannel: TextChannel,
 ): Promise<OutboundDiscordContent> {
-  const contentText = translator.harmonyToDiscord(msg, discordMemberCache)
+  const contentText = translator.harmonyToDiscord(
+    msg,
+    getDiscordMemberCacheForGuild(discordChannel.guildId),
+  )
   if (!contentText || contentText.trim() === '') {
     return { content: contentText, mentionUserIds: [] }
   }
@@ -950,56 +1001,41 @@ discordClient.on('messageReactionAdd', async (reaction, user) => {
       return
     }
     
-    // Get bot ID for emoji creation
-    const botId = (harmonyClient as any).botId
-    if (!botId) {
-      console.error('❌ Bot ID not available')
-      return
-    }
-    
-    // Get emoji (Unicode or custom)
+    // Get emoji (Unicode or ephemeral URL-only custom Discord emoji)
     let emojiIdentifier: string | null = null
-    
+    let emojiMetadata: Record<string, unknown> = {}
+
     if (reaction.emoji.id) {
-      // Custom Discord emoji - find or create it in Harmony (same as ActivityPub does)
       const emojiName = reaction.emoji.name || 'unknown'
       const isAnimated = reaction.emoji.animated || false
       console.log(`🎭 Discord custom emoji: ${emojiName} (ID: ${reaction.emoji.id}, animated: ${isAnimated})`)
-      
-      // Find or create the emoji in Harmony
-      emojiIdentifier = await harmonyClient.findOrCreateDiscordEmoji(
-        emojiName,
-        reaction.emoji.id,
-        isAnimated,
-        botId
-      )
-      
-      if (!emojiIdentifier) {
-        console.error(`❌ Could not create/find Discord emoji: ${emojiName}`)
-        return
-      }
+      const payload = buildDiscordReactionPayload(emojiName, reaction.emoji.id, isAnimated)
+      emojiIdentifier = payload.identifier
+      emojiMetadata = payload.metadata
     } else {
-      // Unicode emoji
       emojiIdentifier = reaction.emoji.name || ''
       console.log(`🎭 Discord Unicode emoji: ${emojiIdentifier}`)
     }
-    
+
     if (!emojiIdentifier) {
       console.error('❌ Could not determine emoji identifier')
       return
     }
-    
+
     // Prepare Discord user metadata for attribution (server nickname when available)
     let reactionMember = reaction.message.guild?.members.cache.get(user.id) ?? null
     if (!reactionMember && reaction.message.guild) {
       reactionMember = await reaction.message.guild.members.fetch(user.id).catch(() => null)
     }
-    const reactionMetadata = buildDiscordUserMetadata(
-      user as import('discord.js').User,
-      reactionMember,
-      discordMemberDetails.get(user.id),
+    const reactionMetadata = mergeReactionMetadata(
+      buildDiscordUserMetadata(
+        user as import('discord.js').User,
+        reactionMember,
+        discordMemberDetails.get(user.id),
+      ),
+      emojiMetadata,
     )
-    
+
     // Add reaction to Harmony message with Discord user metadata
     await harmonyClient.addReaction(harmonyChannelId, harmonyMessageId, emojiIdentifier, reactionMetadata)
     console.log(`✅ Discord -> Harmony reaction: ${emojiIdentifier} on message ${harmonyMessageId}`)
@@ -1042,45 +1078,23 @@ discordClient.on('messageReactionRemove', async (reaction, user) => {
       return
     }
     
-    // Get bot ID for emoji lookup
-    const botId = (harmonyClient as any).botId
-    if (!botId) {
-      console.error('❌ Bot ID not available')
-      return
-    }
-    
-    // Get emoji (Unicode or custom)
     let emojiIdentifier: string | null = null
-    
+
     if (reaction.emoji.id) {
-      // Custom Discord emoji - need to look it up in Harmony (same as add)
       const emojiName = reaction.emoji.name || 'unknown'
       const isAnimated = reaction.emoji.animated || false
       console.log(`🎭 Discord custom emoji: ${emojiName} (ID: ${reaction.emoji.id})`)
-      
-      // Find the emoji in Harmony (should already exist from when it was added)
-      emojiIdentifier = await harmonyClient.findOrCreateDiscordEmoji(
-        emojiName,
-        reaction.emoji.id,
-        isAnimated,
-        botId
-      )
-      
-      if (!emojiIdentifier) {
-        console.error(`❌ Could not find Discord emoji: ${emojiName}`)
-        return
-      }
+      emojiIdentifier = buildDiscordReactionPayload(emojiName, reaction.emoji.id, isAnimated).identifier
     } else {
-      // Unicode emoji
       emojiIdentifier = reaction.emoji.name || ''
       console.log(`🎭 Discord Unicode emoji: ${emojiIdentifier}`)
     }
-    
+
     if (!emojiIdentifier) {
       console.error('❌ Could not determine emoji identifier')
       return
     }
-    
+
     // Remove reaction from Harmony message (scoped to this Discord user)
     await harmonyClient.removeReaction(harmonyChannelId, harmonyMessageId, emojiIdentifier, user.id)
     console.log(`✅ Discord -> Harmony reaction removed: ${emojiIdentifier} from message ${harmonyMessageId}`)
@@ -1158,7 +1172,7 @@ harmonyClient.on('ready', async (data: any) => {
   if (!harmonyStartupDone) {
     harmonyStartupDone = true
 
-    for (const mapping of config.channelMappings) {
+    for (const mapping of mapper.getAllMappings()) {
       console.log(`📡 Subscribing to Harmony channel: ${mapping.name || mapping.harmony}`);
 
       try {
@@ -1475,12 +1489,20 @@ async function resolveDiscordEmojiForReaction(
   channel: TextChannel,
   emojiName: string,
 ): Promise<string | null> {
+  const discordBridged = emojiName.match(/^discord:([^:]+):(\d+)$/)
+  if (discordBridged) {
+    const [, name, id] = discordBridged
+    const byId = channel.guild.emojis.cache.get(id)
+    if (byId) return byId.identifier
+    const byName = channel.guild.emojis.cache.find(e => e.name === name)
+    if (byName) return byName.identifier
+    return `${name}:${id}`
+  }
+
   // Unicode emoji: the name itself IS the identifier Discord wants.
-  // Rough check - if it's a single non-ASCII grapheme, treat as unicode.
   if (!/^[a-zA-Z0-9_+\-~]+$/.test(emojiName)) {
     return emojiName
   }
-  // Otherwise try to find a custom emoji on the guild with the same name.
   const guildEmoji = channel.guild.emojis.cache.find(e => e.name === emojiName)
   if (guildEmoji) return guildEmoji.identifier
   return null
@@ -1588,7 +1610,7 @@ harmonyClient.on('reactionRemove', async (data: any) => {
 console.log('╔════════════════════════════════════════╗')
 console.log('║   🌉 Discord-Harmony Bridge           ║')
 console.log('╠════════════════════════════════════════╣')
-console.log(`║   Mappings: ${config.channelMappings.length} channels            ║`)
+console.log(`║   Mappings: ${mapper.getTotalMappingCount()} channels (${mapper.getBridges().length} bridge(s)) ║`)
 console.log('╚════════════════════════════════════════╝')
 
 // Start Discord client
@@ -1605,9 +1627,10 @@ discordClient.on(Events.ClientReady, async () => {
   if (!discordStartupDone) {
     discordStartupDone = true
 
-    if (config.discord.guildId) {
+    const guildIds = mapper.getDiscordGuildIds()
+    for (const guildId of guildIds) {
       try {
-        const guild = await discordClient.guilds.fetch(config.discord.guildId)
+        const guild = await discordClient.guilds.fetch(guildId)
         console.log(`📥 Fetching members for guild: ${guild.name}`)
 
         const members = await guild.members.fetch({ withPresences: isSyncPresenceEnabled() })
@@ -1617,22 +1640,22 @@ discordClient.on(Events.ClientReady, async () => {
           }
         })
 
-        console.log(`✅ Cached ${discordMemberCache.size} Discord members for mention lookups`)
-
-        await registerSlashCommands(config.discord.guildId)
+        await registerSlashCommands(guildId)
 
         if (config.settings.syncPermissions) {
           permissionSync.attach()
           try {
             await permissionSync.initialSync(guild)
           } catch (err) {
-            console.error('❌ Permission sync initial reconcile failed:', err)
+            console.error(`❌ Permission sync initial reconcile failed for ${guild.name}:`, err)
           }
         }
       } catch (error) {
-        console.error('❌ Failed to fetch guild members:', error)
+        console.error(`❌ Failed to fetch guild ${guildId}:`, error)
       }
     }
+
+    console.log(`✅ Cached ${discordMemberDetails.size} Discord members for mention lookups`)
 
     await refreshHarmonyUserCache({ verbose: true })
 
@@ -1693,7 +1716,7 @@ discordClient.on('presenceUpdate', (_oldPresence, newPresence) => {
   if (!isSyncPresenceEnabled()) return
   const member = newPresence.member
   if (!member || member.user.bot) return
-  if (member.guild.id !== config.discord.guildId) return
+  if (!mapper.isConfiguredDiscordGuild(member.guild.id)) return
 
   const cached = discordMemberDetails.get(member.id)
   if (!cached) {
@@ -1869,9 +1892,11 @@ discordClient.on('interactionCreate', async (interaction) => {
     // Handle user, user2, user3, user4, user5 autocomplete
     if (focusedOption.name.startsWith('user')) {
       const query = focusedOption.value
-      console.log(`🔍 Autocomplete: "${query}", cache: ${harmonyUserCache.size}`)
-      
-      const matches = searchHarmonyUsers(query)
+      const guildId = autocomplete.guildId ?? undefined
+      const cacheSize = guildId ? getHarmonyUserCacheForGuild(guildId).size : 0
+      console.log(`🔍 Autocomplete: "${query}", cache: ${cacheSize}`)
+
+      const matches = searchHarmonyUsers(query, guildId)
       
       await autocomplete.respond(
         matches.map(user => ({
@@ -1920,9 +1945,12 @@ discordClient.on('interactionCreate', async (interaction) => {
       const contentParts: any[] = []
       const mentionedUsers: CachedHarmonyUser[] = []
       
+      const guildId = command.guildId
+      const harmonyUsersForGuild = guildId ? getHarmonyUserCacheForGuild(guildId) : new Map<string, CachedHarmonyUser>()
+
       // Add all user mentions
       for (const userId of userIds) {
-        const harmonyUser = harmonyUserCache.get(userId)
+        const harmonyUser = harmonyUsersForGuild.get(userId)
         if (harmonyUser) {
           contentParts.push(harmonyUserToMentionPart(harmonyUser))
           mentionedUsers.push(harmonyUser)
@@ -2073,16 +2101,14 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
     return
   }
 
-  if (!config.harmony.serverId) {
+  const bridge = mapper.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
     await command.reply({
-      content: '❌ `harmony.serverId` is not set in bridge-config.yml.',
+      content: '❌ This Discord server is not configured in bridge-config.yml (`bridges[]`).',
       flags: MessageFlags.Ephemeral,
     })
     return
   }
-
-  // Bot `manage_channels` on the Harmony side (granted at install) is the
-  // Harmony gate. Without it, clone/link calls below fail with 403.
 
   const sub = command.options.getSubcommand(true)
 
@@ -2118,12 +2144,12 @@ async function handleBridgeCommand(command: ChatInputCommandInteraction) {
 }
 
 async function runBridgeStatus(command: ChatInputCommandInteraction) {
-  const mappings = mapper.getAllMappings()
-  // eslint-disable-next-line unused-imports/no-unused-vars
   const guildId = command.guildId!
+  const bridge = mapper.getBridgeForDiscordGuild(guildId)
+  const mappings = mapper.getAllMappings(guildId)
   const lines: string[] = []
   lines.push(`**Bridge status** - ${mappings.length} mapping${mappings.length === 1 ? '' : 's'}`)
-  lines.push(`Harmony server: \`${config.harmony.serverId || '(not set)'}\``)
+  lines.push(`Harmony server: \`${bridge?.harmonyServerId || '(not configured)'}\``)
   lines.push('')
 
   if (mappings.length === 0) {
@@ -2146,6 +2172,16 @@ async function runBridgeStatus(command: ChatInputCommandInteraction) {
 }
 
 async function runBridgeLink(command: ChatInputCommandInteraction) {
+  const guildId = command.guildId!
+  const bridge = mapper.getBridgeForDiscordGuild(guildId)
+  if (!bridge) {
+    await command.reply({
+      content: '❌ This Discord server is not configured in bridge-config.yml.',
+      flags: MessageFlags.Ephemeral,
+    })
+    return
+  }
+
   const harmonyChannelId = command.options.getString('harmony_channel_id', true).trim()
   const bidirectional = command.options.getBoolean('bidirectional', false) ?? true
   const discordChannelId = command.channelId
@@ -2162,7 +2198,7 @@ async function runBridgeLink(command: ChatInputCommandInteraction) {
 
   // Sanity-check the Harmony channel exists and belongs to our server.
   try {
-    const channels = await harmonyClient.getServerChannels(config.harmony.serverId)
+    const channels = await harmonyClient.getServerChannels(bridge.harmonyServerId)
     const target = channels.find((c: any) => c.id === harmonyChannelId)
     if (!target) {
       await command.reply({
@@ -2180,7 +2216,7 @@ async function runBridgeLink(command: ChatInputCommandInteraction) {
   }
 
   try {
-    mapper.addMapping(discordChannelId, harmonyChannelId, bidirectional)
+    mapper.addMapping(discordChannelId, harmonyChannelId, bidirectional, undefined, guildId)
     await command.reply({
       content: `✅ Linked <#${discordChannelId}> ↔ Harmony \`${harmonyChannelId.slice(0, 8)}...\` (${bidirectional ? 'bidirectional' : 'Discord → Harmony only'}).`,
       flags: MessageFlags.Ephemeral,
@@ -2234,14 +2270,21 @@ function cloneableDiscordRoles(guild: { roles: { cache: Map<string, DiscordRole>
 async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   const dryRun = command.options.getBoolean('dry_run', false) ?? false
   const includeVoice = command.options.getBoolean('include_voice', false) ?? true
-  // clone_roles option overrides the config default when explicitly provided.
   const cloneRoles =
     command.options.getBoolean('clone_roles', false) ?? (config.settings.cloneRoles ?? false)
 
-  // Discord can take >3s; defer immediately so we don't blow the interaction.
   await command.deferReply({ flags: MessageFlags.Ephemeral })
 
   const guild = command.guild!
+  const bridge = mapper.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({
+      content: '❌ This Discord server is not configured in bridge-config.yml.',
+    })
+    return
+  }
+  const harmonyServerId = bridge.harmonyServerId
+
   await guild.channels.fetch() // refresh cache
 
   const { categories: discordCategories, channels: planned } = buildDiscordStructurePlan(
@@ -2250,14 +2293,14 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   )
 
   // Filter out anything already mapped - clone-server is strictly additive.
-  const alreadyMapped = new Set(mapper.getAllMappings().map(m => m.discord))
+  const alreadyMapped = new Set(mapper.getAllMappings(guild.id).map(m => m.discord))
   const toCreate = planned.filter(p => !alreadyMapped.has(p.discordId))
 
   // Role plan (additive, matched by name) - only when clone_roles is enabled.
   let rolesToClone: DiscordRole[] = []
   let existingRoleNames = new Set<string>()
   if (cloneRoles) {
-    const existingRoles = await harmonyClient.getServerRoles(config.harmony.serverId).catch(() => [])
+    const existingRoles = await harmonyClient.getServerRoles(harmonyServerId).catch(() => [])
     existingRoleNames = new Set(existingRoles.map((r: any) => r.name))
     rolesToClone = cloneableDiscordRoles(guild).filter(r => !existingRoleNames.has(r.name))
   }
@@ -2273,11 +2316,11 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
 
   // Fetch existing Harmony categories so we can reuse by name and avoid
   // duplicates if clone-server is run twice (additive contract).
-  const harmonyCategories = await harmonyClient.getServerCategories(config.harmony.serverId).catch(() => [])
+  const harmonyCategories = await harmonyClient.getServerCategories(harmonyServerId).catch(() => [])
   const categoryIdByName = new Map<string, string>(
     harmonyCategories.map((c: any) => [c.name as string, c.id as string])
   )
-  const harmonyChannels = await harmonyClient.getServerChannels(config.harmony.serverId).catch(() => [])
+  const harmonyChannels = await harmonyClient.getServerChannels(harmonyServerId).catch(() => [])
   const harmonyChannelByName = new Map<string, any>()
   for (const c of harmonyChannels) harmonyChannelByName.set(c.name, c)
 
@@ -2327,13 +2370,13 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
     try {
       const existing = categoryIdByName.get(cat.name)
       if (existing) {
-        await harmonyClient.updateCategory(config.harmony.serverId, existing, {
+        await harmonyClient.updateCategory(harmonyServerId, existing, {
           order: cat.position,
         })
         categoriesOrderUpdated++
       } else {
         const newCat = await harmonyClient.createCategory(
-          config.harmony.serverId,
+          harmonyServerId,
           cat.name,
           cat.position,
         )
@@ -2361,7 +2404,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
         harmonyChannelId = reuse.id
         reused++
       } else {
-        const newCh = await harmonyClient.createChannel(config.harmony.serverId, {
+        const newCh = await harmonyClient.createChannel(harmonyServerId, {
           name: p.name,
           type: p.harmonyType,
           categoryId: harmonyCategoryId,
@@ -2388,7 +2431,8 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
       harmony: m.harmony,
       bidirectional: true,
       name: m.name,
-    }))
+    })),
+    guild.id,
   )
 
   // 3b. Clone roles (additive, matched by name). Discord orders roles with the
@@ -2397,7 +2441,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   if (cloneRoles) {
     for (const role of rolesToClone) {
       try {
-        const created = await harmonyClient.createRole(config.harmony.serverId, {
+        const created = await harmonyClient.createRole(harmonyServerId, {
           name: role.name,
           color: discordColorToHex(role.color),
           position: role.position,
@@ -2425,7 +2469,7 @@ async function runBridgeCloneServer(command: ChatInputCommandInteraction) {
   try {
     orderSync = await syncDiscordStructureOrderToHarmony({
       guild,
-      serverId: config.harmony.serverId,
+      serverId: harmonyServerId,
       harmonyClient,
       getHarmonyChannelId: (discordId) => mapper.getHarmonyChannel(discordId),
       includeVoice,
@@ -2467,9 +2511,18 @@ async function runBridgeSyncOrder(command: ChatInputCommandInteraction) {
   await command.deferReply({ flags: MessageFlags.Ephemeral })
 
   const guild = command.guild!
+  const bridge = mapper.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({
+      content: '❌ This Discord server is not configured in bridge-config.yml.',
+    })
+    return
+  }
+  const harmonyServerId = bridge.harmonyServerId
+
   await guild.channels.fetch()
 
-  const mappings = mapper.getAllMappings()
+  const mappings = mapper.getAllMappings(guild.id)
   if (mappings.length === 0) {
     await command.editReply({
       content: '❌ No channel mappings configured. Run `/bridge clone-server` or `/bridge link` first.',
@@ -2480,7 +2533,7 @@ async function runBridgeSyncOrder(command: ChatInputCommandInteraction) {
   try {
     const result = await syncDiscordStructureOrderToHarmony({
       guild,
-      serverId: config.harmony.serverId,
+      serverId: harmonyServerId,
       harmonyClient,
       getHarmonyChannelId: (discordId) => mapper.getHarmonyChannel(discordId),
       includeVoice,
@@ -2522,14 +2575,8 @@ harmonyClient.connect().catch(error => {
 // imminent fs-watch event, so our own writes don't trigger this handler
 // twice and only manual edits / out-of-process edits cause a reload.
 // ---------------------------------------------------------------------------
-mapper.on('configReloaded', async ({ previous, current }: { previous: any[]; current: any[] }) => {
-  const prevIds = new Set(previous.map((m: any) => m.harmony))
-  const currIds = new Set(current.map((m: any) => m.harmony))
-  const newlyAdded = current.filter((m: any) => !prevIds.has(m.harmony))
-  const removed = previous.filter((m: any) => !currIds.has(m.harmony))
-
-  for (const mapping of newlyAdded) {
-    console.log(`📡 Live-reload: subscribing to new Harmony channel ${mapping.name || mapping.harmony}`)
+mapper.on('configReloaded', async () => {
+  for (const mapping of mapper.getAllMappings()) {
     try {
       const recent = await harmonyClient.loadRecentMessages(mapping.harmony, 50)
       for (const m of recent) {
@@ -2539,13 +2586,9 @@ mapper.on('configReloaded', async ({ previous, current }: { previous: any[]; cur
         }
       }
     } catch (err) {
-      console.error(`❌ Failed to subscribe to ${mapping.harmony}:`, err)
+      console.error(`❌ Failed to refresh mappings for ${mapping.harmony}:`, err)
     }
   }
-  if (removed.length > 0) {
-    console.log(`📤 Live-reload: ${removed.length} mapping(s) removed`)
-  }
-  // Re-broadcast to the gateway so the frontend autosuggest is in sync.
   registerBridgeDataWithGateway()
 })
 mapper.startWatching()

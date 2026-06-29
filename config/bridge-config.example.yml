@@ -8,6 +8,8 @@ discord:
 harmony:
   token: "YOUR_HARMONY_BOT_TOKEN"
   serverId: "YOUR_HARMONY_SERVER_UUID"
+  # Optional — from Harmony Server Settings → Discord Bridge
+  # pairingCode: "HRM-XXXX-XXXX"
 
   # har.mony.lol, bridge on same server:
   gatewayUrl: "ws://localhost:3002/gateway"
@@ -45,3 +47,21 @@ settings:
   # Mirror Discord presence + custom status in Harmony member list (default: true).
   # Requires "Server Members Intent" + "Presence Intent" in the Discord dev portal.
   syncPresence: true
+
+# ---------------------------------------------------------------------------
+# Multi-bridge (optional): one Discord bot token, multiple guild ↔ server pairs
+# you operate. Uncomment and remove the single discord.guildId / harmony.serverId
+# block above when using this.
+# ---------------------------------------------------------------------------
+# bridges:
+#   - name: "Community A"
+#     discordGuildId: "DISCORD_GUILD_ID_A"
+#     harmonyServerId: "HARMONY_SERVER_UUID_A"
+#     channelMappings:
+#       - discord: "1234567890"
+#         harmony: "uuid-here"
+#         bidirectional: true
+#   - name: "Community B"
+#     discordGuildId: "DISCORD_GUILD_ID_B"
+#     harmonyServerId: "HARMONY_SERVER_UUID_B"
+#     channelMappings: []

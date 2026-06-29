@@ -30,12 +30,20 @@ export class PermissionSync {
     private store: PermissionSyncStore,
   ) {}
 
-  private get serverId(): string {
-    return this.mapper.getConfig().harmony.serverId
+  private harmonyServerIdForGuild(guildId: string): string | null {
+    return this.mapper.getBridgeForDiscordGuild(guildId)?.harmonyServerId ?? null
   }
 
-  private get guildId(): string {
-    return this.mapper.getConfig().discord.guildId
+  private requireServerId(guildId: string): string {
+    const serverId = this.harmonyServerIdForGuild(guildId)
+    if (!serverId) {
+      throw new Error(`Discord guild ${guildId} is not configured in bridge-config.yml`)
+    }
+    return serverId
+  }
+
+  private isTrackedGuild(guildId: string): boolean {
+    return this.mapper.isConfiguredDiscordGuild(guildId)
   }
 
   isEnabled(): boolean {
@@ -87,7 +95,7 @@ export class PermissionSync {
   }
 
   private onRoleCreate = async (role: Role) => {
-    if (!this.isEnabled() || role.guild.id !== this.guildId) return
+    if (!this.isEnabled() || !this.isTrackedGuild(role.guild.id)) return
     if (role.managed || role.name === '@everyone') return
     try {
       await this.upsertHarmonyRole(role)
@@ -98,7 +106,7 @@ export class PermissionSync {
   }
 
   private onRoleUpdate = async (_oldRole: Role, newRole: Role) => {
-    if (!this.isEnabled() || newRole.guild.id !== this.guildId) return
+    if (!this.isEnabled() || !this.isTrackedGuild(newRole.guild.id)) return
     if (newRole.managed) return
     if (newRole.id === newRole.guild.id) {
       // @everyone base permissions cannot be changed via bot API (default role).
@@ -114,11 +122,11 @@ export class PermissionSync {
   }
 
   private onRoleDelete = async (role: Role) => {
-    if (!this.isEnabled() || role.guild.id !== this.guildId) return
+    if (!this.isEnabled() || !this.isTrackedGuild(role.guild.id)) return
     const harmonyRoleId = this.store.getHarmonyRoleId(role.id)
     if (!harmonyRoleId) return
     try {
-      await this.harmony.deleteRole(this.serverId, harmonyRoleId)
+      await this.harmony.deleteRole(this.requireServerId(role.guild.id), harmonyRoleId)
       this.store.removeMapping(role.id)
       console.log(`🔐 Deleted Harmony role for removed Discord role "${role.name}"`)
     } catch (err) {
@@ -131,7 +139,7 @@ export class PermissionSync {
     newChannel: DMChannel | NonThreadGuildBasedChannel,
   ) => {
     if (!this.isEnabled()) return
-    if (!('guildId' in newChannel) || newChannel.guildId !== this.guildId) return
+    if (!('guildId' in newChannel) || !newChannel.guildId || !this.isTrackedGuild(newChannel.guildId)) return
     if (
       newChannel.type !== ChannelType.GuildText &&
       newChannel.type !== ChannelType.GuildVoice
@@ -156,10 +164,10 @@ export class PermissionSync {
     }
   }
 
-  private async ensureDefaultRoleMapped(_guild: Guild) {
+  private async ensureDefaultRoleMapped(guild: Guild) {
     if (this.store.getDefaultHarmonyRoleId()) return
 
-    const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
+    const harmonyRoles = await this.harmony.getServerRoles(this.requireServerId(guild.id))
     const defaultRole = harmonyRoles.find((r: any) => r.is_default)
     if (defaultRole) {
       this.store.setDefaultHarmonyRoleId(defaultRole.id)
@@ -168,7 +176,8 @@ export class PermissionSync {
 
   /** Match Discord roles to Harmony roles by stored mapping or by name. */
   async reconcileRoles(guild: Guild): Promise<void> {
-    const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
+    const serverId = this.requireServerId(guild.id)
+    const harmonyRoles = await this.harmony.getServerRoles(serverId)
     const harmonyById = new Map(harmonyRoles.map((r: any) => [r.id, r]))
     const harmonyByName = new Map(
       harmonyRoles
@@ -186,7 +195,7 @@ export class PermissionSync {
           const existing = harmonyById.get(existingId)
           if (existing && this.isProtectedHarmonyRole(existing)) continue
 
-          await this.harmony.updateRole(this.serverId, existingId, {
+          await this.harmony.updateRole(serverId, existingId, {
             name: role.name,
             color: discordColorToHex(role.color),
             position: role.position,
@@ -200,7 +209,7 @@ export class PermissionSync {
         const byName = harmonyByName.get(role.name)
         if (byName) {
           this.store.setMapping(role.id, byName.id, role.name)
-          await this.harmony.updateRole(this.serverId, byName.id, {
+          await this.harmony.updateRole(serverId, byName.id, {
             color: discordColorToHex(role.color),
             position: role.position,
             permissions: discordRoleToHarmonyPermissions(role),
@@ -210,7 +219,7 @@ export class PermissionSync {
           continue
         }
 
-        const created = await this.harmony.createRole(this.serverId, {
+        const created = await this.harmony.createRole(serverId, {
           name: role.name,
           color: discordColorToHex(role.color),
           position: role.position,
@@ -226,10 +235,11 @@ export class PermissionSync {
   }
 
   async upsertHarmonyRole(role: Role): Promise<string> {
+    const serverId = this.requireServerId(role.guild.id)
     let harmonyRoleId = this.store.getHarmonyRoleId(role.id)
 
     if (!harmonyRoleId) {
-      const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
+      const harmonyRoles = await this.harmony.getServerRoles(serverId)
       const byName = harmonyRoles.find(
         (r: any) => r.name === role.name && !this.isProtectedHarmonyRole(r),
       )
@@ -249,23 +259,23 @@ export class PermissionSync {
     }
 
     if (harmonyRoleId) {
-      const harmonyRoles = await this.harmony.getServerRoles(this.serverId)
+      const harmonyRoles = await this.harmony.getServerRoles(serverId)
       const existing = harmonyRoles.find((r: any) => r.id === harmonyRoleId)
       if (existing && this.isProtectedHarmonyRole(existing)) {
         return harmonyRoleId
       }
 
-      await this.harmony.updateRole(this.serverId, harmonyRoleId, payload)
+      await this.harmony.updateRole(serverId, harmonyRoleId, payload)
       return harmonyRoleId
     }
 
-    const created = await this.harmony.createRole(this.serverId, payload)
+    const created = await this.harmony.createRole(serverId, payload)
     this.store.setMapping(role.id, created.id, role.name)
     return created.id
   }
 
   async syncAllMappedChannelOverwrites(guild: Guild) {
-    for (const mapping of this.mapper.getAllMappings()) {
+    for (const mapping of this.mapper.getAllMappings(guild.id)) {
       try {
         const channel = await guild.channels.fetch(mapping.discord)
         if (

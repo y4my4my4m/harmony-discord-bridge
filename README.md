@@ -79,6 +79,44 @@ harmony:
 Harmony (`npm run dev`), bot-gateway (`cd bot-gateway && npm run dev`), then
 start the bridge.
 
+## Discord application setup (each community)
+
+Every community runs **its own** Discord application. Harmony's **Server Settings → Advanced → Discord Bridge** page generates the invite URL once you paste your **Client ID**.
+
+### Privileged gateway intents (Developer Portal → Bot)
+
+| Intent | Required |
+|--------|----------|
+| **Message Content** | Yes |
+| **Server Members** | Optional (presence sync + richer member data) |
+| **Presence** | Optional (`syncPresence`) |
+
+### Invite URL template
+
+Replace `YOUR_CLIENT_ID` with OAuth2 → Client ID:
+
+```
+https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=536988736&scope=bot%20applications.commands
+```
+
+Included permissions: View Channels, Send Messages, Embed Links, Attach Files, Read Message History, Add Reactions, **Manage Webhooks**.
+
+For `/bridge clone-server`, also grant **Manage Channels** (`permissions=536988752`) or tick it on the Harmony setup page.
+
+After inviting: **Bot → Reset Token** → `discord.token` in config. Enable **Developer Mode** in Discord → copy guild/channel IDs.
+
+### Pairing code (Harmony)
+
+Harmony Server Settings generates a code like `HRM-AB12-CD34`. Include it in `harmony.pairingCode` or resolve metadata:
+
+```bash
+curl https://your-instance.example/bot-gateway/bridge-setup/HRM-AB12-CD34
+```
+
+## One bot, multiple server pairs
+
+If **you** operate several Discord↔Harmony pairs, use one Discord application and one bridge process with `bridges:` in config (see `config/bridge-config.example.yml`). Each guild still needs the bot invited and a matching Harmony server where the same Harmony bot is installed.
+
 ## Tokens & channel IDs
 
 **Discord:** bot token from the

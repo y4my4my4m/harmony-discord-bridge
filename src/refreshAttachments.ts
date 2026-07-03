@@ -26,10 +26,17 @@ export async function refreshDiscordAttachmentParts(
 ): Promise<any[] | null> {
   if (!Array.isArray(content)) return null
 
+  // Bridged attachments render as `file` parts or inline `url` parts; both can
+  // carry expired signed Discord CDN links, so re-sign both.
+  const isRefreshable = (p: any) =>
+    (p?.type === 'file' || p?.type === 'url') &&
+    typeof p?.url === 'string' &&
+    isDiscordCdnUrl(p.url)
+
   const urls = Array.from(
     new Set(
       content
-        .filter((p) => p?.type === 'file' && typeof p.url === 'string' && isDiscordCdnUrl(p.url))
+        .filter(isRefreshable)
         .map((p) => p.url as string),
     ),
   )
@@ -57,7 +64,7 @@ export async function refreshDiscordAttachmentParts(
 
   let changed = false
   const out = content.map((p) => {
-    if (p?.type === 'file' && typeof p.url === 'string') {
+    if ((p?.type === 'file' || p?.type === 'url') && typeof p.url === 'string') {
       const fresh = refreshedByBase.get(baseOf(p.url))
       if (fresh && fresh !== p.url) {
         changed = true

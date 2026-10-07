@@ -83,6 +83,16 @@ describe('detectProblems', () => {
     expect(codes({ connection: [], guilds, config: baseConfig })).toEqual(['bot_not_in_guild:guild_id=g1'])
   })
 
+  it('instance bot: an empty scoped list means bot_not_in_guild, not no_guild', () => {
+    const scoped = (guilds: ReturnType<typeof collectGuildViews>, guild: string | null = 'g1') =>
+      codes({ connection: [], guilds, scopedToSelection: true, config: { ...baseConfig, discord_guild_id: guild } })
+    expect(scoped([])).toEqual(['bot_not_in_guild:guild_id=g1'])
+    expect(scoped([], null)).toEqual(['no_guild'])
+    const linked = collectGuildViews(fakeClient([fakeGuild('g1', []), fakeGuild('g2', [])]), id => id === 'g1')
+    expect(linked.map(g => g.id)).toEqual(['g1'])
+    expect(scoped(linked)).toEqual([])
+  })
+
   it('checks each pair against channel permissions', () => {
     const guilds = collectGuildViews(fakeClient([fakeGuild('g1', [
       { id: 'ok', name: 'ok', perms: [ViewChannel, SendMessages, ManageWebhooks] },

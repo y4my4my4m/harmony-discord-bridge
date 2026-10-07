@@ -2,6 +2,7 @@ import { WebSocket } from 'ws'
 import { EventEmitter } from 'events'
 import { Backoff, fetchWithRetry, type FetchLike, type RetryOptions } from './http.js'
 import { Logger, errorText } from './log.js'
+import type { PresenceDelta } from './runtime/presenceDeltas.js'
 
 interface HarmonyMessage {
   id: string
@@ -577,7 +578,7 @@ export class HarmonyClient extends EventEmitter {
 
   /**
    * REGISTER_BRIDGE_DATA (op 6): channel mappings and Discord members for the
-   * frontend's bridged-user autosuggest.
+   * frontend's bridged-user autosuggest. False when the socket is not open.
    */
   registerBridgeData(
     channels: Array<{
@@ -599,6 +600,8 @@ export class HarmonyClient extends EventEmitter {
         }>
         joinedAt?: string | null
         createdAt?: string | null
+        presenceStatus?: 'online' | 'away' | 'busy' | 'offline'
+        customStatus?: { text: string; emoji: string | null } | null
         source: 'discord'
       }>
     }>,
@@ -622,10 +625,10 @@ export class HarmonyClient extends EventEmitter {
       customStatus?: { text: string; emoji: string | null } | null
       source: 'discord'
     }>,
-  ) {
+  ): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.log.warn(`Cannot register bridge data: Harmony socket not open (state ${this.ws?.readyState})`)
-      return
+      return false
     }
 
     const guildMembers = sharedMembers ?? channels.find(ch => ch.members?.length)?.members ?? []
@@ -638,6 +641,23 @@ export class HarmonyClient extends EventEmitter {
         members: guildMembers,
       },
     }))
+    return true
+  }
+
+  /**
+   * BRIDGE_PRESENCE_UPDATE (op 7): `{updates: [{id, presenceStatus, customStatus}]}`,
+   * `id` a Discord user id already registered with op 6. False before READY.
+   */
+  sendPresenceUpdates(updates: PresenceDelta[]): boolean {
+    if (!this.isConnected()) return false
+    this.ws!.send(JSON.stringify({
+      op: 7, // BRIDGE_PRESENCE_UPDATE
+      d: {
+        updates: updates.map(u => ({ id: u.id, presenceStatus: u.presenceStatus, customStatus: u.customStatus })),
+      },
+    }))
+    this.log.debug(`BRIDGE_PRESENCE_UPDATE: ${updates.length} member(s)`)
+    return true
   }
 
   disconnect() {

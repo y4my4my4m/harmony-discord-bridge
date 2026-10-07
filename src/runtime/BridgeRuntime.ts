@@ -1,18 +1,19 @@
+import { EventEmitter } from 'events'
 import {
   Client as DiscordClient,
   Message as DiscordMessage,
   Webhook,
   TextChannel,
-  Partials,
   GuildMember,
   Events,
+  type Guild,
   PermissionFlagsBits,
-  ActivityType,
   type APIEmbed,
   type ClientOptions,
   type Interaction,
   type MessageReaction,
   type PartialMessageReaction,
+  type Presence,
   type User,
   type PartialUser,
   type PartialMessage,
@@ -40,26 +41,27 @@ import { formatHarmonyDisplayNameForDiscord } from '../utils/discordDisplayName.
 import { loadInstanceIcon } from '../utils/instanceIcon.js'
 import { ReactionLedger } from '../utils/reactionLedger.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
-import { Backoff, type FetchLike } from '../http.js'
+import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
-import {
-  intentPortalHint,
-  type DiscordGuildView,
-  type PrivilegedIntent,
-  type Problem,
-} from '../problems.js'
+import type { DiscordGuildView, PrivilegedIntent, Problem } from '../problems.js'
 import { collectGuildViews } from '../v2/selfCheck.js'
 import type { PairDirectory, PairWriter } from './PairDirectory.js'
 import {
-  classifyDiscordClose,
-  classifyLoginError,
-  discordPreflight,
-  sameIntents,
-  selectIntents,
-  type IntentGrants,
+  DiscordConnection,
+  type DiscordApplication,
+  type DiscordConnState,
   type IntentSelection,
 } from './discordConnection.js'
+import type { SharedDiscordClient, SharedDiscordSink } from './SharedDiscordClient.js'
+import {
+  PresenceDeltaQueue,
+  mapDiscordPresence,
+  samePresence,
+  type MappedPresence,
+} from './presenceDeltas.js'
 import { handleInteraction, registerSlashCommands } from './commands.js'
+
+export type { DiscordConnState } from './discordConnection.js'
 
 export interface BridgedDiscordRoleInfo {
   id: string
@@ -128,17 +130,17 @@ export interface BridgeRuntimeOptions {
   fetchImpl?: FetchLike
   /** Test seam for the discord.js client. */
   createDiscordClient?: (options: ClientOptions) => DiscordClient
+  /** Instance bot: events of the linked guild come from this client; `discordToken` is unused. */
+  sharedDiscord?: SharedDiscordClient
+  /** BRIDGE_PRESENCE_UPDATE flush interval. */
+  presenceFlushMs?: number
 }
 
-export type DiscordConnState =
-  | 'idle'
-  | 'connecting'
-  | 'ready'
-  | 'reconnecting'
-  | 'token_invalid'
-  | 'intents_disallowed'
-  | 'unreachable'
-  | 'stopped'
+/** Where guild events and REST rate-limit events arrive from. */
+interface DiscordEventSource {
+  events: EventEmitter
+  rest: EventEmitter
+}
 
 /**
  * Message id mappings between Discord and Harmony, LRU-bounded. A dropped
@@ -146,7 +148,6 @@ export type DiscordConnState =
  */
 const MESSAGE_MAPPING_CAP = 50_000
 const HARMONY_USER_CACHE_REFRESH_MS = 5 * 60 * 1000
-const INTENT_RECHECK_MS = 5 * 60 * 1000
 /** rate_limited stays reported this long after the last drop. */
 const RATE_LIMIT_PROBLEM_MS = 5 * 60 * 1000
 /** A Discord REST wait longer than this counts as rate limiting worth reporting. */
@@ -169,6 +170,8 @@ function isRateLimitError(err: unknown): boolean {
 /**
  * One bridge: a discord.js client and a Harmony bot-gateway connection,
  * pairing channels from a PairDirectory. Several run side by side in host mode.
+ * The client is the bridge's own (DiscordConnection) or the instance bot's
+ * (SharedDiscordClient), which delivers only the linked guild's events.
  */
 export class BridgeRuntime {
   readonly mode: 'v1' | 'v2'
@@ -181,20 +184,17 @@ export class BridgeRuntime {
   readonly permissionSyncStore: PermissionSyncStore
   readonly permissionSync: PermissionSync
   readonly harmonyBaseUrl: URL
-  private readonly discordToken: string
   private readonly fetchImpl?: FetchLike
-  private readonly createClient: (options: ClientOptions) => DiscordClient
+  /** Own client (self, hosted, v1); null with a shared client. */
+  private readonly connection: DiscordConnection | null
+  private readonly shared: SharedDiscordClient | null
+  private readonly sharedSink: SharedDiscordSink | null
 
   discord: DiscordClient | null = null
   private discordState: DiscordConnState = 'idle'
-  private discordGeneration = 0
-  private discordRetryTimer: NodeJS.Timeout | null = null
-  private readonly discordBackoff = new Backoff(30_000, 15 * 60_000)
-  private intentRecheckTimer: NodeJS.Timeout | null = null
-  private application: { id: string; name: string; grants: IntentGrants; botUser: { id: string; name: string; avatar: string | null } | null } | null = null
-  intentSelection: IntentSelection | null = null
-  private lastDiscordFailureLogged = ''
   private discordStartupDone = false
+  /** What the member list was last fetched with on this client: 'members', 'presence', or null. */
+  private memberListKey: string | null = null
   private readonly registeredCommandGuilds = new Set<string>()
   private stopped = false
 
@@ -220,7 +220,7 @@ export class BridgeRuntime {
   private harmonyAuthLogged = false
   /** Socket errors since the last READY. */
   private harmonyUnreachable = false
-  private bridgeDataRegisterTimer: NodeJS.Timeout | null = null
+  private readonly presenceDeltas: PresenceDeltaQueue
   private lastRegistrationSummary = ''
   /** Harmony messages not bridged while Discord was down, since the last ready. */
   private skippedWhileDiscordDown = 0
@@ -237,9 +237,7 @@ export class BridgeRuntime {
     this.writer = opts.writer
     this.log = opts.log
     this.hooks = opts.hooks ?? {}
-    this.discordToken = opts.discordToken
     this.fetchImpl = opts.fetchImpl
-    this.createClient = opts.createDiscordClient ?? ((options) => new DiscordClient(options))
 
     this.harmonyBaseUrl = new URL(opts.harmony.baseUrl)
     if (!this.harmonyBaseUrl.hostname || this.harmonyBaseUrl.hostname === 'localhost') {
@@ -258,6 +256,45 @@ export class BridgeRuntime {
 
     this.permissionSyncStore = new PermissionSyncStore(opts.permissionStorePath)
     this.permissionSync = new PermissionSync(this.harmony, this.dir, this.permissionSyncStore, this.log)
+    this.presenceDeltas = new PresenceDeltaQueue(
+      updates => this.harmony.sendPresenceUpdates(updates),
+      opts.presenceFlushMs,
+    )
+
+    this.shared = opts.sharedDiscord ?? null
+    if (this.shared) {
+      this.connection = null
+      this.sharedSink = {
+        guildId: () => this.dir.getDiscordGuildIds()[0] ?? null,
+        needs: () => this.settings(),
+        events: new EventEmitter(),
+        rest: new EventEmitter(),
+        bindClient: (client) => this.bindClient(client),
+        onReady: (client) => { this.onDiscordReady(client).catch(err => this.log.error('Discord startup failed:', errorText(err))) },
+        onState: (state) => this.setDiscordState(state),
+        unbindClient: () => this.unbindClient(),
+      }
+      this.attachDiscordHandlers(this.sharedSink, () => !this.stopped)
+    } else {
+      this.sharedSink = null
+      this.connection = new DiscordConnection({
+        token: opts.discordToken,
+        log: this.log,
+        fetchImpl: opts.fetchImpl,
+        createClient: opts.createDiscordClient,
+        needs: () => this.settings(),
+        tokenHint: () => this.discordTokenHint(),
+        listener: {
+          onClient: (client, isCurrent) => {
+            this.bindClient(client)
+            this.attachDiscordHandlers({ events: client, rest: client.rest }, isCurrent)
+          },
+          onReady: (client) => { this.onDiscordReady(client).catch(err => this.log.error('Discord startup failed:', errorText(err))) },
+          onState: (state) => this.setDiscordState(state),
+          onTeardown: () => this.unbindClient(),
+        },
+      })
+    }
 
     this.attachHarmonyHandlers()
   }
@@ -274,28 +311,39 @@ export class BridgeRuntime {
     this.stopped = false
     this.log.info(`Bridge starting: ${this.dir.getTotalMappingCount()} channel pair(s), ${this.dir.getBridges().length} guild scope(s)`)
     this.harmony.connect().catch(err => this.log.error('Harmony connect failed:', errorText(err)))
-    await this.connectDiscord()
+    if (this.shared) {
+      this.shared.attach(this.sharedSink!)
+      return
+    }
+    await this.connection!.start()
   }
 
   async stop(): Promise<void> {
     this.stopped = true
     this.discordState = 'stopped'
-    this.clearDiscordRetry()
-    if (this.intentRecheckTimer) {
-      clearInterval(this.intentRecheckTimer)
-      this.intentRecheckTimer = null
-    }
     if (this.harmonyUserCacheTimer) {
       clearInterval(this.harmonyUserCacheTimer)
       this.harmonyUserCacheTimer = null
     }
-    if (this.bridgeDataRegisterTimer) {
-      clearTimeout(this.bridgeDataRegisterTimer)
-      this.bridgeDataRegisterTimer = null
+    this.presenceDeltas.stop()
+    if (this.connection) {
+      await this.connection.stop()
+    } else {
+      this.shared!.detach(this.sharedSink!)
+      this.unbindClient()
     }
-    await this.teardownDiscord()
     this.harmony.disconnect()
     this.harmony.removeAllListeners()
+  }
+
+  /** Own client only; the instance bot connects on its own schedule. */
+  async connectDiscord(): Promise<void> {
+    await this.connection?.connect()
+  }
+
+  /** Runs on the instance bot client. */
+  isShared(): boolean {
+    return this.shared !== null
   }
 
   isDiscordConnected(): boolean {
@@ -337,10 +385,30 @@ export class BridgeRuntime {
     return this.intentSelection?.missing ?? []
   }
 
-  /** Guilds the bot is in, with per-channel permissions. Null while disconnected. */
+  /** Active intent set as this bridge sees it. */
+  get intentSelection(): IntentSelection | null {
+    if (this.connection) return this.connection.selection
+    return this.shared!.selectionFor(this.settings())
+  }
+
+  private get application(): DiscordApplication | null {
+    return this.connection ? this.connection.application : this.shared!.application()
+  }
+
+  private currentDiscordToken(): string {
+    return this.connection ? this.connection.currentToken() : this.shared!.token()
+  }
+
+  /**
+   * Guilds the bot is in, with per-channel permissions. Null while
+   * disconnected. The instance bot reports only the linked guild.
+   */
   guildViews(): DiscordGuildView[] | null {
     if (!this.discord || this.discordState !== 'ready') return null
-    return collectGuildViews(this.discord as unknown as Parameters<typeof collectGuildViews>[0])
+    const client = this.discord as unknown as Parameters<typeof collectGuildViews>[0]
+    if (!this.shared) return collectGuildViews(client)
+    const linked = new Set(this.dir.getDiscordGuildIds())
+    return collectGuildViews(client, id => linked.has(id))
   }
 
   discordIdentity(): {
@@ -359,46 +427,18 @@ export class BridgeRuntime {
       intents: {
         message_content: grants?.message_content ?? active?.message_content ?? false,
         members: grants?.members ?? active?.members ?? false,
-        presence: grants?.presence ?? active?.presence ?? false,
+        presence: (grants?.presence ?? active?.presence ?? false) && (this.shared?.presenceAllowed() ?? true),
       },
     }
   }
 
   // ===========================================================================
-  // Discord connection: preflight, intents, backoff
+  // Discord client binding (own or shared)
   // ===========================================================================
-
-  private clearDiscordRetry() {
-    if (this.discordRetryTimer) {
-      clearTimeout(this.discordRetryTimer)
-      this.discordRetryTimer = null
-    }
-  }
-
-  private scheduleDiscordRetry() {
-    if (this.stopped) return
-    this.clearDiscordRetry()
-    const delay = this.discordBackoff.next()
-    this.log.debug(`Discord reconnect attempt in ${Math.round(delay / 1000)} s`)
-    this.discordRetryTimer = setTimeout(() => {
-      this.discordRetryTimer = null
-      void this.connectDiscord()
-    }, delay)
-  }
 
   private discordTokenHint(): string {
     return this.hooks.discordTokenHint
       ?? 'Discord rejected the bot token (DISCORD_TOKEN). Reset it in the Discord Developer Portal → your app → Bot → Reset Token, then update DISCORD_TOKEN (retrying automatically).'
-  }
-
-  /** Logs `line` once per distinct failure; later retries log at debug. */
-  private logDiscordFailure(key: string, line: string) {
-    if (this.lastDiscordFailureLogged === key) {
-      this.log.debug(line)
-      return
-    }
-    this.lastDiscordFailureLogged = key
-    this.log.error(line)
   }
 
   private setDiscordState(state: DiscordConnState) {
@@ -407,121 +447,27 @@ export class BridgeRuntime {
     this.notify(`discord:${state}`)
   }
 
-  async connectDiscord(): Promise<void> {
-    if (this.stopped) return
-    this.clearDiscordRetry()
-    await this.teardownDiscord()
-    const generation = ++this.discordGeneration
-    this.setDiscordState('connecting')
-
-    const pre = await discordPreflight(this.discordToken, this.fetchImpl)
-    if (generation !== this.discordGeneration || this.stopped) return
-
-    if (pre.kind === 'token_invalid') {
-      this.setDiscordState('token_invalid')
-      this.logDiscordFailure('token', this.discordTokenHint())
-      this.scheduleDiscordRetry()
-      return
-    }
-    if (pre.kind === 'unreachable') {
-      this.setDiscordState('unreachable')
-      this.logDiscordFailure('unreachable', `Cannot reach Discord (${pre.error}); retrying with backoff.`)
-      this.scheduleDiscordRetry()
-      return
-    }
-
-    this.application = { id: pre.applicationId, name: pre.applicationName, grants: pre.grants, botUser: pre.botUser }
-    const selection = selectIntents(this.settings(), pre.grants)
-    this.intentSelection = selection
-    if (selection.missing.length > 0) {
-      this.logDiscordFailure(`intents:${selection.missing.join(',')}`, intentPortalHint(selection.missing))
-    }
-
-    const client = this.createClient({
-      intents: selection.intents,
-      partials: [Partials.Message, Partials.Channel, Partials.Reaction],
-      rest: { retries: 3 },
-    })
+  private bindClient(client: DiscordClient) {
     this.discord = client
     this.discordStartupDone = false
+    this.memberListKey = null
     this.registeredCommandGuilds.clear()
-    this.attachDiscordHandlers(client, generation)
-
-    try {
-      await client.login(this.discordToken)
-    } catch (err) {
-      if (generation !== this.discordGeneration || this.stopped) return
-      const failure = classifyLoginError(err)
-      await this.teardownDiscord()
-      if (failure === 'token_invalid') {
-        this.setDiscordState('token_invalid')
-        this.logDiscordFailure('token', this.discordTokenHint())
-      } else if (failure === 'intents_disallowed') {
-        this.setDiscordState('intents_disallowed')
-        this.logDiscordFailure(`disallowed:${selection.requested.join(',')}`, intentPortalHint(selection.requested))
-      } else {
-        this.setDiscordState('unreachable')
-        this.logDiscordFailure('unreachable', `Discord login failed (${errorText(err)}); retrying with backoff.`)
-      }
-      this.scheduleDiscordRetry()
-      return
-    }
-
-    this.ensureIntentRecheck()
   }
 
-  /** Re-reads the application's intent toggles while some are missing; reconnects once they flip. */
-  private ensureIntentRecheck() {
-    if (this.intentRecheckTimer) return
-    this.intentRecheckTimer = setInterval(() => {
-      if (this.stopped || this.missingIntents().length === 0 || this.discordState !== 'ready') return
-      void this.recheckIntents()
-    }, INTENT_RECHECK_MS)
-    this.intentRecheckTimer.unref?.()
-  }
-
-  private async recheckIntents() {
-    const pre = await discordPreflight(this.discordToken, this.fetchImpl)
-    if (pre.kind !== 'ok' || this.stopped) return
-    this.application = { id: pre.applicationId, name: pre.applicationName, grants: pre.grants, botUser: pre.botUser }
-    const next = selectIntents(this.settings(), pre.grants)
-    if (this.intentSelection && !sameIntents(next.intents, this.intentSelection.intents)) {
-      this.log.info('Discord intent toggles changed; reconnecting with the new intent set')
-      await this.connectDiscord()
-    }
-  }
-
-  /** Settings changed: reconnect when the intent set differs. */
-  private async applyIntentSettings() {
-    const next = selectIntents(this.settings(), this.application?.grants ?? null)
-    const current = this.intentSelection
-    if (!current || !sameIntents(next.intents, current.intents)) {
-      this.log.info('Bridge settings need a different Discord intent set; reconnecting')
-      await this.connectDiscord()
-      return
-    }
-    this.intentSelection = next
-    if (next.missing.length > 0) {
-      this.logDiscordFailure(`intents:${next.missing.join(',')}`, intentPortalHint(next.missing))
-    }
-  }
-
-  /** Destroys the current client; its in-flight login and events become stale. */
-  private async teardownDiscord() {
-    this.discordGeneration++
-    const client = this.discord
-    if (!client) return
+  /** The client is going away; state bound to it is dropped. */
+  private unbindClient() {
     this.discord = null
     this.discordReady = false
     this.discordStartupDone = false
+    this.memberListKey = null
     this.permissionSync.detach()
     this.webhookCache.clear()
-    client.removeAllListeners()
-    try {
-      await client.destroy()
-    } catch (err) {
-      this.log.debug('discord.js destroy failed:', errorText(err))
-    }
+  }
+
+  /** Settings changed: the own client reconnects when its intent set differs; the shared one re-evaluates. */
+  private async applyIntentSettings() {
+    if (this.connection) await this.connection.applyNeeds()
+    else this.shared!.requirementsChanged()
   }
 
   requireDiscord(): DiscordClient {
@@ -529,51 +475,25 @@ export class BridgeRuntime {
     return this.discord
   }
 
-  private attachDiscordHandlers(client: DiscordClient, generation: number) {
-    const current = () => generation === this.discordGeneration && !this.stopped
+  /** Paired Discord channel. The instance bot refuses channels outside the linked guild. */
+  private async fetchPairedChannel(client: DiscordClient, channelId: string): Promise<TextChannel | null> {
+    const channel = await client.channels.fetch(channelId) as TextChannel | null
+    if (channel && this.shared && !this.dir.isConfiguredDiscordGuild(channel.guildId)) {
+      this.log.warn(`Discord channel ${channelId} is outside the linked guild; ignored`)
+      return null
+    }
+    return channel
+  }
 
-    client.on(Events.ClientReady, () => {
-      if (!current()) return
-      void this.onDiscordReady(client)
-    })
+  /** discord.js events of this bridge: the client itself, or the guild-scoped emitter. */
+  private permissionEvents(client: DiscordClient): EventEmitter {
+    return this.sharedSink?.events ?? client
+  }
 
-    client.on(Events.ShardDisconnect, (event) => {
-      if (!current()) return
-      const failure = classifyDiscordClose(event.code)
-      if (!failure) {
-        this.setDiscordState('reconnecting')
-        return
-      }
-      if (failure === 'token_invalid') {
-        this.setDiscordState('token_invalid')
-        this.logDiscordFailure('token', this.discordTokenHint())
-      } else if (failure === 'intents_disallowed') {
-        this.setDiscordState('intents_disallowed')
-        const requested = this.intentSelection?.requested ?? ['message_content']
-        this.logDiscordFailure(`disallowed:${requested.join(',')}`, intentPortalHint(requested))
-      } else {
-        this.setDiscordState('unreachable')
-        this.logDiscordFailure('invalid-intents', `Discord closed the connection with code ${event.code} (invalid intents)`)
-      }
-      void this.teardownDiscord().then(() => this.scheduleDiscordRetry())
-    })
+  private attachDiscordHandlers(source: DiscordEventSource, current: () => boolean) {
+    const { events, rest } = source
 
-    client.on(Events.ShardReconnecting, () => {
-      if (current()) this.setDiscordState('reconnecting')
-    })
-    client.on(Events.ShardResume, () => {
-      if (current() && this.discordReady) this.setDiscordState('ready')
-    })
-    client.on(Events.ShardReady, () => {
-      if (current() && this.discordReady) this.setDiscordState('ready')
-    })
-    client.on(Events.ShardError, (err) => {
-      if (current()) this.log.warn(`Discord connection error: ${errorText(err)}`)
-    })
-    client.on(Events.Error, (err) => {
-      if (current()) this.log.error('discord.js error:', errorText(err))
-    })
-    client.rest.on('rateLimited', (info) => {
+    rest.on('rateLimited', (info: { route: string; timeToReset: number }) => {
       if (!current()) return
       this.log.debug(`Discord rate limit on ${info.route}: waiting ${info.timeToReset} ms`)
       if (info.timeToReset > DISCORD_LONG_RATE_LIMIT_MS) {
@@ -581,13 +501,19 @@ export class BridgeRuntime {
       }
     })
 
-    client.on(Events.MessageCreate, (msg) => { if (current()) void this.onDiscordMessage(msg) })
-    client.on(Events.MessageReactionAdd, (reaction, user) => { if (current()) void this.onDiscordReactionAdd(reaction, user) })
-    client.on(Events.MessageReactionRemove, (reaction, user) => { if (current()) void this.onDiscordReactionRemove(reaction, user) })
-    client.on(Events.MessageUpdate, (_old, msg) => { if (current()) void this.onDiscordMessageUpdate(msg) })
-    client.on(Events.MessageDelete, (msg) => { if (current()) void this.onDiscordMessageDelete(msg) })
+    events.on(Events.MessageCreate, (msg: DiscordMessage) => { if (current()) void this.onDiscordMessage(msg) })
+    events.on(Events.MessageReactionAdd, (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+      if (current()) void this.onDiscordReactionAdd(reaction, user)
+    })
+    events.on(Events.MessageReactionRemove, (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+      if (current()) void this.onDiscordReactionRemove(reaction, user)
+    })
+    events.on(Events.MessageUpdate, (_old: unknown, msg: DiscordMessage | PartialMessage) => {
+      if (current()) void this.onDiscordMessageUpdate(msg)
+    })
+    events.on(Events.MessageDelete, (msg: DiscordMessage | PartialMessage) => { if (current()) void this.onDiscordMessageDelete(msg) })
 
-    client.on(Events.GuildMemberAdd, (member) => {
+    events.on(Events.GuildMemberAdd, (member: GuildMember) => {
       if (!current() || member.user.bot || !this.settings().syncMemberList) return
       if (!this.dir.isConfiguredDiscordGuild(member.guild.id)) return
       this.cacheMember(member)
@@ -595,14 +521,14 @@ export class BridgeRuntime {
       this.registerBridgeDataWithGateway()
     })
 
-    client.on(Events.GuildMemberRemove, (member) => {
+    events.on(Events.GuildMemberRemove, (member: GuildMember) => {
       if (!current()) return
       this.uncacheMemberById(member.id, member.user.username)
       this.log.debug(`Member cache: removed ${member.id}`)
       this.registerBridgeDataWithGateway()
     })
 
-    client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+    events.on(Events.GuildMemberUpdate, (oldMember: GuildMember, newMember: GuildMember) => {
       if (!current() || newMember.user.bot || !this.settings().syncMemberList) return
       if (!this.dir.isConfiguredDiscordGuild(newMember.guild.id)) return
 
@@ -625,50 +551,47 @@ export class BridgeRuntime {
       this.registerBridgeDataWithGateway()
     })
 
-    client.on(Events.PresenceUpdate, (_oldPresence, newPresence) => {
-      if (!current() || !this.isSyncPresenceEnabled()) return
-      const member = newPresence.member
-      if (!member || member.user.bot) return
-      if (!this.dir.isConfiguredDiscordGuild(member.guild.id)) return
-
-      const cached = this.discordMemberDetails.get(member.id)
-      if (!cached) {
-        this.cacheMember(member)
-      } else {
-        const { presenceStatus, customStatus } = this.extractMemberPresence(member)
-        this.discordMemberDetails.set(member.id, { ...cached, presenceStatus, customStatus })
-      }
-      this.scheduleBridgeDataRegistration()
+    events.on(Events.PresenceUpdate, (_old: Presence | null, presence: Presence) => {
+      if (!current() || !this.isSyncPresenceEnabled() || !this.settings().syncMemberList) return
+      const guildId = presence.guild?.id
+      if (!guildId || !this.dir.isConfiguredDiscordGuild(guildId)) return
+      this.onMemberPresence(presence.userId, guildId, mapDiscordPresence(presence))
     })
 
-    client.on(Events.InteractionCreate, (interaction: Interaction) => {
+    events.on(Events.InteractionCreate, (interaction: Interaction) => {
       if (!current()) return
       handleInteraction(this, interaction).catch(err => this.log.error('Interaction failed:', errorText(err)))
     })
 
     // Guild membership and channel layout feed the v2 self-check.
-    client.on(Events.GuildCreate, (guild) => {
+    events.on(Events.GuildCreate, (guild: { id: string }) => {
       if (!current()) return
       this.notify('guilds')
+      const client = this.discord
+      if (!client) return
+      if (this.shared) {
+        // Instance bot added to the linked guild after startup.
+        if (this.discordReady && this.discordStartupDone && this.dir.isConfiguredDiscordGuild(guild.id)) {
+          void this.runGuildStartup(client, guild.id).then(() => this.registerBridgeDataWithGateway())
+        }
+        return
+      }
       if (this.commandGuildIds(client).includes(guild.id)) void this.registerCommandsFor(client, guild.id)
     })
-    client.on(Events.GuildDelete, () => { if (current()) this.notify('guilds') })
-    client.on(Events.ChannelCreate, () => { if (current()) this.notify('channels') })
-    client.on(Events.ChannelDelete, () => { if (current()) this.notify('channels') })
-    client.on(Events.ChannelUpdate, () => { if (current()) this.notify('channels') })
-    client.on(Events.GuildRoleUpdate, () => { if (current()) this.notify('channels') })
-    client.on(Events.GuildMemberUpdate, (_old, member) => {
-      if (current() && member.id === client.user?.id) this.notify('channels')
+    events.on(Events.GuildDelete, () => { if (current()) this.notify('guilds') })
+    events.on(Events.ChannelCreate, () => { if (current()) this.notify('channels') })
+    events.on(Events.ChannelDelete, () => { if (current()) this.notify('channels') })
+    events.on(Events.ChannelUpdate, () => { if (current()) this.notify('channels') })
+    events.on(Events.GuildRoleUpdate, () => { if (current()) this.notify('channels') })
+    events.on(Events.GuildMemberUpdate, (_old: GuildMember, member: GuildMember) => {
+      if (current() && member.id === this.discord?.user?.id) this.notify('channels')
     })
   }
 
   private async onDiscordReady(client: DiscordClient) {
-    this.log.info(`Discord bot connected: ${client.user?.tag} (${client.guilds.cache.size} guild(s))`)
-    this.discordBackoff.reset()
-    this.lastDiscordFailureLogged = ''
     this.skippedWhileDiscordDown = 0
     this.discordReady = true
-    this.setDiscordState('ready')
+    if (this.shared) this.log.info(`Instance bot ready; linked guild ${this.dir.getDiscordGuildIds()[0] ?? '(none)'}`)
 
     // ClientReady can repeat after gateway reconnects; startup runs once per client.
     if (!this.discordStartupDone) {
@@ -704,6 +627,12 @@ export class BridgeRuntime {
    * Intent off) leaves commands and permission sync intact.
    */
   private async runGuildStartup(client: DiscordClient, guildId: string) {
+    if (this.shared && !client.guilds.cache.has(guildId)) {
+      this.log.warn(`The instance bot is not in the linked Discord guild ${guildId}`)
+      this.notify('guilds')
+      return
+    }
+
     let guild
     try {
       guild = await client.guilds.fetch(guildId)
@@ -713,23 +642,13 @@ export class BridgeRuntime {
     }
 
     const settings = this.settings()
-    if (settings.syncMemberList && this.intentSelection?.active.members) {
-      try {
-        this.log.info(`Fetching members for guild ${guild.name}`)
-        const members = await guild.members.fetch({ withPresences: this.isSyncPresenceEnabled() })
-        members.forEach(member => {
-          if (!member.user.bot) this.cacheMember(member)
-        })
-      } catch (err) {
-        this.log.warn(`Member fetch failed for ${guild.name}: ${errorText(err)}`)
-      }
-    }
+    await this.loadMemberList(guild)
 
     await this.registerCommandsFor(client, guild.id)
 
     if (settings.syncPermissions) {
       try {
-        this.permissionSync.attach(client)
+        this.permissionSync.attach(this.permissionEvents(client))
         await this.permissionSync.initialSync(guild)
       } catch (err) {
         this.log.error(`Permission sync initial reconcile failed for ${guild.name}: ${errorText(err)}`)
@@ -737,10 +656,34 @@ export class BridgeRuntime {
     }
   }
 
-  /** v1: configured guilds. v2: the selected guild, or every guild while none is selected. */
+  /** 'members' or 'presence' when the member list is synced and the intents allow it, else null. */
+  private memberListWanted(): string | null {
+    if (!this.settings().syncMemberList || !this.intentSelection?.active.members) return null
+    return this.isSyncPresenceEnabled() ? 'presence' : 'members'
+  }
+
+  private async loadMemberList(guild: Guild) {
+    const wanted = this.memberListWanted()
+    if (!wanted) return
+    try {
+      this.log.info(`Fetching members for guild ${guild.name}`)
+      const members = await guild.members.fetch({ withPresences: wanted === 'presence' })
+      members.forEach(member => {
+        if (!member.user.bot) this.cacheMember(member)
+      })
+      this.memberListKey = wanted
+    } catch (err) {
+      this.log.warn(`Member fetch failed for ${guild.name}: ${errorText(err)}`)
+    }
+  }
+
+  /**
+   * v1: configured guilds. v2: the selected guild, or every guild while none
+   * is selected. Instance bot: the linked guild only.
+   */
   private commandGuildIds(client: DiscordClient): string[] {
     const configured = this.dir.getDiscordGuildIds()
-    if (this.mode === 'v1' || configured.length > 0) return configured
+    if (this.mode === 'v1' || configured.length > 0 || this.shared) return configured
     return Array.from(client.guilds.cache.keys()).slice(0, 25)
   }
 
@@ -767,11 +710,14 @@ export class BridgeRuntime {
   } = {}): Promise<void> {
     if (this.stopped) return
 
+    if (change.guildChanged) this.shared?.reindex()
+
     if (change.settingsChanged) {
       const settings = this.settings()
       if (!settings.syncMemberList && this.discordMemberDetails.size > 0) {
         this.discordMemberDetails.clear()
         this.discordMemberCache.clear()
+        this.memberListKey = null
       }
       if (!settings.syncPermissions) this.permissionSync.detach()
       await this.applyIntentSettings()
@@ -782,13 +728,23 @@ export class BridgeRuntime {
       for (const guildId of this.dir.getDiscordGuildIds()) {
         await this.runGuildStartup(client, guildId)
       }
-    } else if (change.settingsChanged && client && this.discordReady && this.settings().syncPermissions) {
-      for (const guildId of this.dir.getDiscordGuildIds()) {
-        const guild = client.guilds.cache.get(guildId)
-        if (!guild) continue
-        this.permissionSync.attach(client)
-        await this.permissionSync.initialSync(guild).catch(err =>
-          this.log.error(`Permission sync reconcile failed: ${errorText(err)}`))
+    } else if (change.settingsChanged && client && this.discordReady) {
+      // The shared client keeps its connection when its intent set already covers the new settings.
+      const wanted = this.shared ? this.memberListWanted() : null
+      if (wanted && wanted !== this.memberListKey) {
+        for (const guildId of this.dir.getDiscordGuildIds()) {
+          const guild = client.guilds.cache.get(guildId)
+          if (guild) await this.loadMemberList(guild)
+        }
+      }
+      if (this.settings().syncPermissions) {
+        for (const guildId of this.dir.getDiscordGuildIds()) {
+          const guild = client.guilds.cache.get(guildId)
+          if (!guild) continue
+          this.permissionSync.attach(this.permissionEvents(client))
+          await this.permissionSync.initialSync(guild).catch(err =>
+            this.log.error(`Permission sync reconcile failed: ${errorText(err)}`))
+        }
       }
     }
 
@@ -850,32 +806,24 @@ export class BridgeRuntime {
     return this.settings().syncPresence && !!this.intentSelection?.active.presence
   }
 
-  private extractMemberPresence(member: GuildMember): {
-    presenceStatus: 'online' | 'away' | 'busy' | 'offline'
-    customStatus: { text: string; emoji: string | null } | null
-  } {
+  private extractMemberPresence(member: GuildMember): MappedPresence {
     if (!this.isSyncPresenceEnabled()) {
       return { presenceStatus: 'offline', customStatus: null }
     }
+    return mapDiscordPresence(member.presence)
+  }
 
-    const discordStatus = member.presence?.status ?? 'offline'
-    let presenceStatus: 'online' | 'away' | 'busy' | 'offline'
-    if (discordStatus === 'online') presenceStatus = 'online'
-    else if (discordStatus === 'idle') presenceStatus = 'away'
-    else if (discordStatus === 'dnd') presenceStatus = 'busy'
-    else presenceStatus = 'offline'
-
-    const customActivity = member.presence?.activities?.find(a => a.type === ActivityType.Custom)
-    if (!customActivity) {
-      return { presenceStatus, customStatus: null }
-    }
-
-    const text = customActivity.state?.trim() ?? ''
-    const emoji = customActivity.emoji?.name ?? null
-    if (!text && !emoji) {
-      return { presenceStatus, customStatus: null }
-    }
-    return { presenceStatus, customStatus: { text, emoji } }
+  /**
+   * PresenceUpdate of a member in the synced list. Activity-only changes map
+   * to the same status and custom status and are dropped; real changes go
+   * out as BRIDGE_PRESENCE_UPDATE deltas, never as a full REGISTER_BRIDGE_DATA.
+   */
+  private onMemberPresence(userId: string, guildId: string, next: MappedPresence) {
+    const cached = this.discordMemberDetails.get(userId)
+    if (!cached || cached.guildId !== guildId) return
+    if (samePresence(cached, next)) return
+    this.discordMemberDetails.set(userId, { ...cached, ...next })
+    this.presenceDeltas.push({ id: userId, ...next })
   }
 
   getDiscordMemberCacheForGuild(guildId: string): Map<string, string> {
@@ -1079,16 +1027,10 @@ export class BridgeRuntime {
       this.log.debug(`  ${ch.harmonyChannelId} <-> Discord ${ch.discordChannelId}`)
     }
 
-    this.harmony.registerBridgeData(channels)
-  }
-
-  /** Debounced; presence updates arrive in bursts. */
-  private scheduleBridgeDataRegistration() {
-    if (this.bridgeDataRegisterTimer) clearTimeout(this.bridgeDataRegisterTimer)
-    this.bridgeDataRegisterTimer = setTimeout(() => {
-      this.bridgeDataRegisterTimer = null
-      this.registerBridgeDataWithGateway()
-    }, 1500)
+    if (this.harmony.registerBridgeData(channels)) {
+      // op 6 carries presence; deltas start from what it sent.
+      this.presenceDeltas.baseline(channels.flatMap(ch => ch.members))
+    }
   }
 
   // ===========================================================================
@@ -1108,7 +1050,7 @@ export class BridgeRuntime {
       const cached = this.webhookCache.get(channelId)
       if (cached) return cached
 
-      const channel = await this.requireDiscord().channels.fetch(channelId) as TextChannel
+      const channel = await this.fetchPairedChannel(this.requireDiscord(), channelId)
       if (!channel || !channel.isTextBased()) {
         return null
       }
@@ -1828,7 +1770,7 @@ export class BridgeRuntime {
     }
 
     try {
-      const discordChannel = await client.channels.fetch(discordChannelId) as TextChannel
+      const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel || !discordChannel.guild) {
         this.log.error(`Discord channel ${discordChannelId} not found or not in a guild`)
         return
@@ -1928,7 +1870,7 @@ export class BridgeRuntime {
     if (!client || !this.discordReady) return
 
     try {
-      const discordChannel = await client.channels.fetch(discordChannelId) as TextChannel
+      const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel) {
         this.log.error(`Discord channel ${discordChannelId} not found`)
         return
@@ -1989,7 +1931,7 @@ export class BridgeRuntime {
     if (!client || !this.discordReady) return
 
     try {
-      const discordChannel = await client.channels.fetch(discordChannelId) as TextChannel
+      const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel) {
         this.log.error(`Discord channel ${discordChannelId} not found`)
         return
@@ -2028,7 +1970,7 @@ export class BridgeRuntime {
     setTimeout(() => this.recentlyRefreshedMessages.delete(messageId), 15_000)
 
     try {
-      const newContent = await refreshDiscordAttachmentParts(content, this.discordToken, this.fetchImpl)
+      const newContent = await refreshDiscordAttachmentParts(content, this.currentDiscordToken(), this.fetchImpl)
       if (!newContent) return
       await this.harmony.silentUpdateMessageContent(messageId, newContent)
       this.log.info(`Refreshed expired attachment URLs for message ${messageId}`)
@@ -2084,7 +2026,7 @@ export class BridgeRuntime {
     if (!client || !this.discordReady) return
 
     try {
-      const discordChannel = await client.channels.fetch(discordChannelId) as TextChannel
+      const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel) return
 
       const emojiInput = BridgeRuntime.reactionEmojiName(data)
@@ -2144,7 +2086,7 @@ export class BridgeRuntime {
     if (!client || !this.discordReady) return
 
     try {
-      const discordChannel = await client.channels.fetch(discordChannelId) as TextChannel
+      const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel) return
 
       const discordMessage = await discordChannel.messages.fetch(discordMessageId).catch(() => null)

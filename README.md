@@ -6,24 +6,28 @@ deletions flow both ways between the channels you pair. People on Discord show
 up in Harmony with their Discord name and picture, and Harmony users show up
 in Discord the same way.
 
-The bridge is a small program that logs in as **your own Discord bot**.
+The bridge is a small program that logs in to Discord as a bot: either the
+bot of your Harmony instance, or **your own Discord bot**.
 
-## Two ways to run it
+## Three ways to use it
 
-| | Hosted by your Harmony instance | Run it yourself |
-|---|---|---|
-| What you install | Nothing | Docker, then one command |
-| Where it runs | On the Harmony instance's server | Your PC, a home server, a NAS, a Raspberry Pi, a VPS… |
-| Who holds your Discord bot token | The instance operator | Only you |
-| Available | Only if the instance operator turned hosting on | Always |
+| | Your instance's bot | Your own bot, hosted by your instance | Your own bot, run it yourself |
+|---|---|---|---|
+| What you do | Click **Add to Discord** | Create a Discord bot, paste its token | Create a Discord bot, install Docker, run one command |
+| Where it runs | On the Harmony instance's side | On the Harmony instance's side | Your PC, a home server, a NAS, a Raspberry Pi, a VPS… |
+| Whose bot | The instance operator's | Yours (the operator holds its token) | Yours (only you hold its token) |
+| Available | If the instance operator set up the instance bot | If the instance operator turned hosting on | Always |
 
-Both start in Harmony: open your server, then **Server Settings → Discord
-Bridge**. The page walks you through creating the Discord bot and shows which
-of the two options your instance offers.
+All three start in Harmony: open your server, then **Server Settings →
+Discord Bridge**. The page shows which options your instance offers and walks
+you through the one you pick.
 
-- **Hosted:** paste your Discord bot token into that page. Done; of this guide
-  you only need [Create the Discord bot](#1-create-the-discord-bot) and
-  [Privacy](#privacy).
+- **Your instance's bot** (recommended when offered): click **Add to
+  Discord**, choose your Discord server, confirm. Back in Harmony, pair the
+  channels. There is no bot to create and nothing to install.
+- **Hosted, your own bot:** paste your Discord bot token into that page. Of
+  this guide you only need [Create the Discord bot](#1-create-the-discord-bot)
+  and [Privacy](#privacy).
 - **Run it yourself:** follow the steps below.
 
 ## Run it yourself
@@ -157,6 +161,11 @@ Which channels are paired and what is synced (member list, presence,
 reactions, edits, deletions) is set in Harmony's Discord Bridge page; the
 bridge picks up changes within seconds.
 
+Presence (online, away, busy, offline and the custom status of Discord
+members) is light on the network: only real changes are sent, at most every
+5 seconds, and only for people in the bridged member list. Games, music and
+other activities are not sent at all.
+
 ## Discord commands
 
 - `/mention` (or `/m`): mention Harmony users from Discord, with autocomplete.
@@ -180,7 +189,7 @@ The same codes appear in `docker logs harmony-bridge` and at
 | `intent_missing` | A Privileged Gateway Intent is off (Message Content, Server Members or Presence). | Developer Portal → Bot → switch the named intent on, **Save**. The bridge picks it up within a few minutes. |
 | `no_guild` | The bot is in no Discord server. | Invite it with the link from step 1. |
 | `guild_not_selected` | The bot is in several Discord servers. | Pick one in Harmony's Discord Bridge page. |
-| `bot_not_in_guild` | The bot left (or was kicked from) the chosen Discord server. | Invite it again, or pick another server. |
+| `bot_not_in_guild` | The bot left (or was kicked from) the chosen Discord server. | Invite it again, or pick another server. With the instance's bot: click **Add to Discord** again. |
 | `channel_not_visible` | The bot cannot see a paired Discord channel. | Give the bot **View Channel** on it (channel settings → Permissions). |
 | `cannot_send` | The bot cannot post in a paired channel. | Give the bot **Send Messages** on it. |
 | `cannot_manage_webhooks` | Harmony messages appear under the bot's name instead of the author's. | Give the bot **Manage Webhooks** on that channel. |
@@ -208,6 +217,8 @@ Other messages:
   elsewhere.
 - With **hosted** bridges, the Harmony instance operator holds your bot token
   and could read any channel the bot can see. Run it yourself if that matters.
+- With **the instance's bot**, the bot belongs to the instance operator, who
+  could likewise read every Discord channel you give it access to.
 - Logs contain ids and counts, not message contents, unless `LOG_LEVEL=debug`.
 - Credentials are stored in `/data/credentials.json`, readable only by the
   bridge's user.
@@ -228,11 +239,14 @@ Other messages:
 | `src/v2/BridgeApi.ts` | `/bridge/v2` client: redeem, config, status, pairs, hosted. |
 | `src/v2/V2Bridge.ts` | One v2 bridge: config refresh (60 s + `BRIDGE_CONFIG_UPDATE`), status heartbeat (30 s). |
 | `src/v2/V2Directory.ts` | `/config` as a pair directory; settings defaults. |
-| `src/v2/HostRunner.ts` | Host mode reconciliation of `/hosted`. |
+| `src/v2/HostRunner.ts` | Host mode reconciliation of `/hosted` (own-bot bridges). |
+| `src/v2/InstanceHost.ts` | Host mode reconciliation of `/hosted/instance` (instance bot bridges). |
 | `src/v2/selfCheck.ts` | Guild/channel permission snapshot, status payload. |
 | `src/problems.ts` | Problem codes, detection, plain-language text. |
-| `src/runtime/BridgeRuntime.ts` | One Discord client + one Harmony connection; message, reaction, edit and delete bridging. |
-| `src/runtime/discordConnection.ts` | Intent selection, Discord preflight, close-code handling. |
+| `src/runtime/BridgeRuntime.ts` | One bridge: its Discord client (own or shared) + one Harmony connection; message, reaction, edit and delete bridging. |
+| `src/runtime/discordConnection.ts` | One Discord client per token: intent selection, preflight, login, close codes, backoff. |
+| `src/runtime/SharedDiscordClient.ts` | The instance bot: one client for many bridges, events routed by guild. |
+| `src/runtime/presenceDeltas.ts` | Presence mapping and `BRIDGE_PRESENCE_UPDATE` batching. |
 | `src/runtime/commands.ts` | Slash commands. |
 | `src/runtime/PairDirectory.ts` | Interfaces shared by the YAML and API configurations. |
 | `src/v1/runV1.ts`, `src/ChannelMapper.ts` | Legacy `bridge-config.yml`. |
@@ -262,16 +276,21 @@ proxy):
 - `POST /redeem {code}` → bridge credentials (no auth).
 - `GET /config`, `POST /status`, `POST /pairs`, `DELETE /pairs/:discord_channel_id`
   with `Authorization: Bot <harmony_token>`.
-- `GET /hosted` with `X-Bridge-Host-Secret` (host mode).
+- `GET /hosted` and `GET /hosted/instance` with `X-Bridge-Host-Secret` (host
+  mode).
 - Gateway event `BRIDGE_CONFIG_UPDATE` triggers an immediate `/config` fetch.
 
-Messages use the ordinary bot API (`/api/v1`) and WebSocket gateway.
+Messages use the ordinary bot API (`/api/v1`) and WebSocket gateway. The
+member list goes out as `REGISTER_BRIDGE_DATA` (op 6) when membership or
+member details change; presence changes go out as `BRIDGE_PRESENCE_UPDATE`
+(op 7, `{updates: [{id, presenceStatus, customStatus}]}`), at most every 5 s.
 
 ### Host mode (instance operators)
 
-Runs every bridge whose community chose "hosted". Turn hosting on in the
-Harmony admin settings, and set the same `BRIDGE_HOST_SECRET` on bot-gateway
-and here:
+One container runs every bridge your instance hosts: the communities that
+chose your instance's bot (see [below](#your-instances-bot)), and the ones
+that pasted their own bot token (turn hosting on in the Harmony admin
+settings). Set the same `BRIDGE_HOST_SECRET` on bot-gateway and here:
 
 | Variable | Meaning |
 |---|---|
@@ -281,9 +300,46 @@ and here:
 | `HARMONY_PUBLIC_URL` | Public Harmony address, when `HARMONY_URL` points at bot-gateway directly. |
 | `DATA_DIR`, `LOG_LEVEL`, `HEALTH_PORT` | As above. |
 
-The list is re-read every 60 s: new bridges start, removed ones stop, changed
-tokens restart. One bridge failing does not affect the others. `/health` is
-200 while the list loads and reports each bridge.
+The container can run on any machine that reaches `HARMONY_URL`. The lists
+are re-read every 60 s: new bridges start, removed ones stop, changed tokens
+restart. One bridge failing does not affect the others. `/health` is 200
+while the lists load and reports each bridge.
+
+#### Your instance's bot
+
+Nothing changes in the container: the same `BRIDGE_MODE=host` setup runs it
+as soon as it is turned on in Harmony. Everything else is set in **Harmony →
+Admin → Discord bridge**:
+
+1. At <https://discord.com/developers/applications> create an application
+   (the name is what communities see in Discord).
+2. **OAuth2:** add the redirect URI shown on Harmony's admin page.
+3. **Bot:** switch on **Public Bot** and **Requires OAuth2 Code Grant** (the
+   bot then joins a Discord server only through Harmony's **Add to Discord**
+   button). Under **Privileged Gateway Intents** switch on **Message Content
+   Intent** (required) and **Server Members Intent** (member lists).
+   **Presence Intent** only if you turn presence on in Harmony.
+4. Copy the **Application ID**, the **Client Secret** (OAuth2) and the **Bot
+   Token** (Bot → Reset Token) into Harmony's admin page, and switch the
+   instance bot on.
+
+The bot asks for View Channels, Send Messages, Read Message History, Embed
+Links, Attach Files, Add Reactions, Use External Emojis and Manage Webhooks
+(permission integer `537250880`).
+
+All communities share one connection to Discord. Server Members is used when
+any community syncs its member list; Presence only when the presence switch
+in Harmony is on and a community syncs presence. Changing what is needed
+reconnects the bot once for everyone; communities joining or leaving do not.
+
+When a community deletes its bridge or links another Discord server, the bot
+leaves the old Discord server after 10 minutes. It never leaves while Harmony
+cannot be reached.
+
+Discord limits a bot that is not verified to 100 servers. Past that, apply
+for verification in the Developer Portal, and for the privileged intents
+(Message Content is needed; Server Members for member lists; Presence is
+rarely granted).
 
 ### Behavior notes
 

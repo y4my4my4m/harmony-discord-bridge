@@ -10,10 +10,18 @@ export interface HostedInstance {
   health(): HealthReport
 }
 
+/** Instance bot bridges, reconciled on the same timer (InstanceHost). */
+export interface InstanceReconciler {
+  reconcile(): Promise<void>
+  stop(): Promise<void>
+  health(): HealthReport
+}
+
 export interface HostRunnerOptions {
   /** GET /bridge/v2/hosted; null when the gateway answers 404 (hosting off). */
   fetchHosted: () => Promise<HostedEntry[] | null>
   createInstance: (entry: HostedEntry) => HostedInstance
+  instance?: InstanceReconciler
   log: Logger
   intervalMs?: number
 }
@@ -32,6 +40,8 @@ function fingerprint(entry: HostedEntry): string {
  * Host mode: one bridge instance per entry of GET /bridge/v2/hosted,
  * reconciled every 60 s. Entries that appear start, entries that disappear
  * stop, entries whose tokens changed restart. Instances fail independently.
+ * Instance bot bridges (GET /bridge/v2/hosted/instance) reconcile on the
+ * same tick, independently of the own-token list.
  */
 export class HostRunner {
   private readonly running = new Map<string, Running>()
@@ -55,7 +65,10 @@ export class HostRunner {
     await this.reconciling
     const all = Array.from(this.running.entries())
     this.running.clear()
-    await Promise.allSettled(all.map(([, r]) => r.instance.stop()))
+    await Promise.allSettled([
+      ...all.map(([, r]) => r.instance.stop()),
+      this.opts.instance?.stop(),
+    ])
   }
 
   runningIds(): string[] {
@@ -69,6 +82,15 @@ export class HostRunner {
   }
 
   private async doReconcile(): Promise<void> {
+    await this.reconcileHosted()
+    try {
+      await this.opts.instance?.reconcile()
+    } catch (err) {
+      this.opts.log.error(`Instance bot reconcile failed: ${errorText(err)}`)
+    }
+  }
+
+  private async reconcileHosted(): Promise<void> {
     const log = this.opts.log
     let list: HostedEntry[] | null
     try {
@@ -88,7 +110,7 @@ export class HostRunner {
 
     if (list === null) {
       if (!this.hostingDisabled) {
-        log.warn('Hosting is disabled on this Harmony instance (or BRIDGE_HOST_SECRET is not set there); no bridges run.')
+        log.warn('Own-bot hosting is disabled on this Harmony instance (or BRIDGE_HOST_SECRET is not set there); no own-bot hosted bridges run.')
       }
       this.hostingDisabled = true
       list = []
@@ -141,19 +163,21 @@ export class HostRunner {
     }
   }
 
-  /** Healthy while the hosted list loads; individual bridge failures show in the body. */
+  /** Healthy while both lists load; individual bridge failures show in the body. */
   health(): HealthReport {
     const bridges = Array.from(this.running.entries()).map(([id, r]) => {
       const h = r.instance.health()
       return { id, ok: h.ok, ...h.body }
     })
+    const instance = this.opts.instance?.health() ?? null
     return {
-      ok: this.lastListOk,
+      ok: this.lastListOk && (instance?.ok ?? true),
       body: {
         mode: 'host',
         hosting_enabled: !this.hostingDisabled,
         list_fetched_at: this.lastListAt ? new Date(this.lastListAt).toISOString() : null,
         bridges,
+        ...(instance ? { instance: instance.body } : {}),
       },
     }
   }

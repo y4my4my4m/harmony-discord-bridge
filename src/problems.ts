@@ -171,6 +171,12 @@ export interface DetectInput {
   connection: Problem[]
   /** Guilds the bot is in; null while Discord is not connected. */
   guilds: DiscordGuildView[] | null
+  /**
+   * `guilds` holds at most the selected guild (instance bot shared by many
+   * Discord servers): its absence means bot_not_in_guild, and no selection
+   * means the bot has not been added yet.
+   */
+  scopedToSelection?: boolean
   /** Bridge configuration; null before the first successful /config. */
   config: {
     discord_guild_id: string | null
@@ -179,33 +185,40 @@ export interface DetectInput {
   } | null
 }
 
+function checkSelectedGuild(guilds: DiscordGuildView[], selected: string, pairs: PairView[], problems: Problem[]) {
+  const guild = guilds.find(g => g.id === selected)
+  if (!guild) {
+    problems.push({ code: 'bot_not_in_guild', params: { guild_id: selected } })
+    return
+  }
+  for (const pair of pairs) {
+    const params = { discord_channel_id: pair.discord_channel_id }
+    const channel = guild.channels.find(c => c.id === pair.discord_channel_id)
+    if (!channel || !channel.can_view) {
+      problems.push({ code: 'channel_not_visible', params })
+      continue
+    }
+    if (pair.direction === 'to_harmony') continue
+    if (!channel.can_send) problems.push({ code: 'cannot_send', params })
+    if (!channel.can_manage_webhooks) problems.push({ code: 'cannot_manage_webhooks', params })
+  }
+}
+
 export function detectProblems(input: DetectInput): Problem[] {
   const problems: Problem[] = [...input.connection]
   const { guilds, config } = input
 
   if (guilds && config) {
     const selected = config.discord_guild_id
-    if (guilds.length === 0) {
+    if (input.scopedToSelection) {
+      if (!selected) problems.push({ code: 'no_guild' })
+      else checkSelectedGuild(guilds, selected, config.pairs, problems)
+    } else if (guilds.length === 0) {
       problems.push({ code: 'no_guild' })
     } else if (!selected) {
       if (guilds.length > 1) problems.push({ code: 'guild_not_selected' })
     } else {
-      const guild = guilds.find(g => g.id === selected)
-      if (!guild) {
-        problems.push({ code: 'bot_not_in_guild', params: { guild_id: selected } })
-      } else {
-        for (const pair of config.pairs) {
-          const params = { discord_channel_id: pair.discord_channel_id }
-          const channel = guild.channels.find(c => c.id === pair.discord_channel_id)
-          if (!channel || !channel.can_view) {
-            problems.push({ code: 'channel_not_visible', params })
-            continue
-          }
-          if (pair.direction === 'to_harmony') continue
-          if (!channel.can_send) problems.push({ code: 'cannot_send', params })
-          if (!channel.can_manage_webhooks) problems.push({ code: 'cannot_manage_webhooks', params })
-        }
-      }
+      checkSelectedGuild(guilds, selected, config.pairs, problems)
     }
   }
 

@@ -1,6 +1,13 @@
-import { GatewayIntentBits } from 'discord.js'
-import { fetchWithRetry, type FetchLike } from '../http.js'
-import type { PrivilegedIntent } from '../problems.js'
+import {
+  Client as DiscordClient,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  type ClientOptions,
+} from 'discord.js'
+import { Backoff, fetchWithRetry, type FetchLike } from '../http.js'
+import { Logger, errorText } from '../log.js'
+import { intentPortalHint, type PrivilegedIntent } from '../problems.js'
 
 const DISCORD_API = 'https://discord.com/api/v10'
 
@@ -150,4 +157,316 @@ export function classifyLoginError(err: unknown): DiscordFailure | 'unreachable'
   if (code === 'TokenInvalid' || /invalid token/i.test(message)) return 'token_invalid'
   if (code === 'DisallowedIntents' || /disallowed intents/i.test(message)) return 'intents_disallowed'
   return 'unreachable'
+}
+
+export type DiscordConnState =
+  | 'idle'
+  | 'connecting'
+  | 'ready'
+  | 'reconnecting'
+  | 'token_invalid'
+  | 'intents_disallowed'
+  | 'unreachable'
+  | 'stopped'
+
+export interface DiscordApplication {
+  id: string
+  name: string
+  grants: IntentGrants
+  botUser: { id: string; name: string; avatar: string | null } | null
+}
+
+/** Privileged intents wanted, in bridge-settings terms (see selectIntents). */
+export interface IntentNeeds {
+  syncMemberList: boolean
+  syncPresence: boolean
+}
+
+export interface DiscordConnectionListener {
+  /** A new client exists, before login. `isCurrent` is false once it is replaced or stopped. */
+  onClient(client: DiscordClient, isCurrent: () => boolean): void
+  /** ClientReady of the current client. */
+  onReady(client: DiscordClient): void
+  onState(state: DiscordConnState): void
+  /** The current client is about to be destroyed. */
+  onTeardown(client: DiscordClient): void
+}
+
+export interface DiscordConnectionOptions {
+  token: string
+  log: Logger
+  needs: () => IntentNeeds
+  listener: DiscordConnectionListener
+  /** Log line for a token rejection. */
+  tokenHint: () => string
+  fetchImpl?: FetchLike
+  createClient?: (options: ClientOptions) => DiscordClient
+}
+
+const INTENT_RECHECK_MS = 5 * 60 * 1000
+
+/**
+ * One discord.js client for one bot token: preflight, intent selection,
+ * login, close-code handling and backoff. A refused token or intent set is
+ * a state with a retry timer, never a crash loop.
+ */
+export class DiscordConnection {
+  client: DiscordClient | null = null
+  state: DiscordConnState = 'idle'
+  application: DiscordApplication | null = null
+  selection: IntentSelection | null = null
+  private token: string
+  private generation = 0
+  private retryTimer: NodeJS.Timeout | null = null
+  private readonly backoff = new Backoff(30_000, 15 * 60_000)
+  private recheckTimer: NodeJS.Timeout | null = null
+  private lastFailureLogged = ''
+  /** ClientReady seen for the current client. */
+  private clientReady = false
+  private stopped = false
+  private readonly createClient: (options: ClientOptions) => DiscordClient
+
+  constructor(private readonly opts: DiscordConnectionOptions) {
+    this.token = opts.token
+    this.createClient = opts.createClient ?? ((options) => new DiscordClient(options))
+  }
+
+  currentToken(): string {
+    return this.token
+  }
+
+  isClientReady(): boolean {
+    return this.client !== null && this.clientReady
+  }
+
+  /** Requested privileged intents Discord refused or the application lacks. */
+  missingIntents(): PrivilegedIntent[] {
+    if (this.state === 'intents_disallowed') return this.selection?.requested ?? ['message_content']
+    return this.selection?.missing ?? []
+  }
+
+  async start(): Promise<void> {
+    this.stopped = false
+    await this.connect()
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true
+    this.clearRetry()
+    if (this.recheckTimer) {
+      clearInterval(this.recheckTimer)
+      this.recheckTimer = null
+    }
+    await this.teardown()
+    this.state = 'stopped'
+  }
+
+  /** New token; reconnects when `reconnect` is set. */
+  async setToken(token: string, reconnect: boolean): Promise<void> {
+    if (token === this.token) return
+    this.token = token
+    this.lastFailureLogged = ''
+    this.backoff.reset()
+    if (reconnect) await this.connect()
+  }
+
+  private clearRetry() {
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer)
+      this.retryTimer = null
+    }
+  }
+
+  private scheduleRetry() {
+    if (this.stopped) return
+    this.clearRetry()
+    const delay = this.backoff.next()
+    this.opts.log.debug(`Discord reconnect attempt in ${Math.round(delay / 1000)} s`)
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null
+      void this.connect()
+    }, delay)
+  }
+
+  /** Logs `line` once per distinct failure; later retries log at debug. */
+  private logFailure(key: string, line: string) {
+    if (this.lastFailureLogged === key) {
+      this.opts.log.debug(line)
+      return
+    }
+    this.lastFailureLogged = key
+    this.opts.log.error(line)
+  }
+
+  private setState(state: DiscordConnState) {
+    if (this.state === state) return
+    this.state = state
+    this.opts.listener.onState(state)
+  }
+
+  async connect(): Promise<void> {
+    if (this.stopped) return
+    this.clearRetry()
+    await this.teardown()
+    const generation = ++this.generation
+    this.setState('connecting')
+
+    const pre = await discordPreflight(this.token, this.opts.fetchImpl)
+    if (generation !== this.generation || this.stopped) return
+
+    if (pre.kind === 'token_invalid') {
+      this.setState('token_invalid')
+      this.logFailure('token', this.opts.tokenHint())
+      this.scheduleRetry()
+      return
+    }
+    if (pre.kind === 'unreachable') {
+      this.setState('unreachable')
+      this.logFailure('unreachable', `Cannot reach Discord (${pre.error}); retrying with backoff.`)
+      this.scheduleRetry()
+      return
+    }
+
+    this.application = { id: pre.applicationId, name: pre.applicationName, grants: pre.grants, botUser: pre.botUser }
+    const selection = selectIntents(this.opts.needs(), pre.grants)
+    this.selection = selection
+    if (selection.missing.length > 0) {
+      this.logFailure(`intents:${selection.missing.join(',')}`, intentPortalHint(selection.missing))
+    }
+
+    const client = this.createClient({
+      intents: selection.intents,
+      partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+      rest: { retries: 3 },
+    })
+    this.client = client
+    this.clientReady = false
+    this.attachConnectionHandlers(client, generation)
+    this.opts.listener.onClient(client, () => generation === this.generation && !this.stopped)
+
+    try {
+      await client.login(this.token)
+    } catch (err) {
+      if (generation !== this.generation || this.stopped) return
+      const failure = classifyLoginError(err)
+      await this.teardown()
+      if (failure === 'token_invalid') {
+        this.setState('token_invalid')
+        this.logFailure('token', this.opts.tokenHint())
+      } else if (failure === 'intents_disallowed') {
+        this.setState('intents_disallowed')
+        this.logFailure(`disallowed:${selection.requested.join(',')}`, intentPortalHint(selection.requested))
+      } else {
+        this.setState('unreachable')
+        this.logFailure('unreachable', `Discord login failed (${errorText(err)}); retrying with backoff.`)
+      }
+      this.scheduleRetry()
+      return
+    }
+
+    this.ensureIntentRecheck()
+  }
+
+  /** Re-reads the application's intent toggles while some are missing; reconnects once they flip. */
+  private ensureIntentRecheck() {
+    if (this.recheckTimer) return
+    this.recheckTimer = setInterval(() => {
+      if (this.stopped || this.missingIntents().length === 0 || this.state !== 'ready') return
+      void this.recheckIntents()
+    }, INTENT_RECHECK_MS)
+    this.recheckTimer.unref?.()
+  }
+
+  private async recheckIntents() {
+    const pre = await discordPreflight(this.token, this.opts.fetchImpl)
+    if (pre.kind !== 'ok' || this.stopped) return
+    this.application = { id: pre.applicationId, name: pre.applicationName, grants: pre.grants, botUser: pre.botUser }
+    const next = selectIntents(this.opts.needs(), pre.grants)
+    if (this.selection && !sameIntents(next.intents, this.selection.intents)) {
+      this.opts.log.info('Discord intent toggles changed; reconnecting with the new intent set')
+      await this.connect()
+    }
+  }
+
+  /** Needs changed: reconnects when the intent set differs. */
+  async applyNeeds(): Promise<void> {
+    const next = selectIntents(this.opts.needs(), this.application?.grants ?? null)
+    const current = this.selection
+    if (!current || !sameIntents(next.intents, current.intents)) {
+      this.opts.log.info('The required Discord intent set changed; reconnecting')
+      await this.connect()
+      return
+    }
+    this.selection = next
+    if (next.missing.length > 0) {
+      this.logFailure(`intents:${next.missing.join(',')}`, intentPortalHint(next.missing))
+    }
+  }
+
+  /** Destroys the current client; its in-flight login and events become stale. */
+  private async teardown() {
+    this.generation++
+    const client = this.client
+    if (!client) return
+    this.client = null
+    this.clientReady = false
+    this.opts.listener.onTeardown(client)
+    client.removeAllListeners()
+    try {
+      await client.destroy()
+    } catch (err) {
+      this.opts.log.debug('discord.js destroy failed:', errorText(err))
+    }
+  }
+
+  private attachConnectionHandlers(client: DiscordClient, generation: number) {
+    const current = () => generation === this.generation && !this.stopped
+
+    client.on(Events.ClientReady, () => {
+      if (!current()) return
+      this.opts.log.info(`Discord bot connected: ${client.user?.tag} (${client.guilds.cache.size} guild(s))`)
+      this.backoff.reset()
+      this.lastFailureLogged = ''
+      this.clientReady = true
+      this.setState('ready')
+      this.opts.listener.onReady(client)
+    })
+
+    client.on(Events.ShardDisconnect, (event) => {
+      if (!current()) return
+      const failure = classifyDiscordClose(event.code)
+      if (!failure) {
+        this.setState('reconnecting')
+        return
+      }
+      if (failure === 'token_invalid') {
+        this.setState('token_invalid')
+        this.logFailure('token', this.opts.tokenHint())
+      } else if (failure === 'intents_disallowed') {
+        this.setState('intents_disallowed')
+        const requested = this.selection?.requested ?? ['message_content']
+        this.logFailure(`disallowed:${requested.join(',')}`, intentPortalHint(requested))
+      } else {
+        this.setState('unreachable')
+        this.logFailure('invalid-intents', `Discord closed the connection with code ${event.code} (invalid intents)`)
+      }
+      void this.teardown().then(() => this.scheduleRetry())
+    })
+
+    client.on(Events.ShardReconnecting, () => {
+      if (current()) this.setState('reconnecting')
+    })
+    client.on(Events.ShardResume, () => {
+      if (current() && this.clientReady) this.setState('ready')
+    })
+    client.on(Events.ShardReady, () => {
+      if (current() && this.clientReady) this.setState('ready')
+    })
+    client.on(Events.ShardError, (err) => {
+      if (current()) this.opts.log.warn(`Discord connection error: ${errorText(err)}`)
+    })
+    client.on(Events.Error, (err) => {
+      if (current()) this.opts.log.error('discord.js error:', errorText(err))
+    })
+  }
 }

@@ -32,9 +32,11 @@ export interface ClientLike {
 /** Discord channel types (API ChannelType): threads and DMs are never paired. */
 const THREAD_OR_DM_TYPES = new Set([1, 3, 10, 11, 12])
 
-export function collectGuildViews(client: ClientLike): DiscordGuildView[] {
+/** `include` limits the snapshot to some guilds (instance bot: the linked one). */
+export function collectGuildViews(client: ClientLike, include?: (guildId: string) => boolean): DiscordGuildView[] {
   const guilds: DiscordGuildView[] = []
   for (const guild of client.guilds.cache.values()) {
+    if (include && !include(guild.id)) continue
     const me = guild.members.me
     const channels: DiscordChannelView[] = []
     for (const channel of guild.channels.cache.values()) {

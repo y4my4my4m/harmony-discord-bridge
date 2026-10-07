@@ -1,5 +1,5 @@
+import type { EventEmitter } from 'events'
 import {
-  Client,
   ChannelType,
   OverwriteType,
   type DMChannel,
@@ -22,7 +22,7 @@ import {
  * Does NOT assign members to roles (no Discord↔Harmony account link).
  */
 export class PermissionSync {
-  private attachedTo: Client | null = null
+  private attachedTo: EventEmitter | null = null
 
   constructor(
     private harmony: HarmonyClient,
@@ -51,7 +51,8 @@ export class PermissionSync {
     return this.mapper.runtimeSettings().syncPermissions
   }
 
-  attach(discord: Client) {
+  /** `discord`: the discord.js client, or a guild-scoped emitter of its events. */
+  attach(discord: EventEmitter) {
     if (this.attachedTo === discord || !this.isEnabled()) return
     this.detach()
     discord.on('roleCreate', this.onRoleCreate)

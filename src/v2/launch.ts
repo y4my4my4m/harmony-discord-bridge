@@ -4,7 +4,9 @@ import { BridgeApi } from './BridgeApi.js'
 import { CredentialsError, obtainCredentials, type StoredCredentials } from './credentials.js'
 import { EndpointError, endpointsFor, probeEndpoints, type HarmonyEndpoints } from './endpoints.js'
 import { HostRunner } from './HostRunner.js'
+import { InstanceHost } from './InstanceHost.js'
 import { V2Bridge } from './V2Bridge.js'
+import { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
 import { Backoff, sleep, type FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
 import type { HealthReport, Launched } from '../health.js'
@@ -152,7 +154,12 @@ export async function runSelf(opts: {
   }
 }
 
-/** Host mode: every hosted bridge of the instance, reconciled every 60 s. */
+const safeDirName = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_')
+
+/**
+ * Host mode: every own-token hosted bridge (one Discord client each) and
+ * every instance bot bridge (one shared Discord client), reconciled every 60 s.
+ */
 export async function runHost(opts: {
   harmonyUrl: string
   hostSecret: string
@@ -178,8 +185,35 @@ export async function runHost(opts: {
   })
   const publicUrl = opts.publicUrl ?? (endpoints.direct ? null : opts.harmonyUrl)
 
+  const instanceLog = log.child('[instance]')
+  const instance = new InstanceHost<SharedDiscordClient>({
+    log: instanceLog,
+    fetchInstance: () => BridgeApi.hostedInstance(endpoints.apiBase, opts.hostSecret, opts.fetchImpl),
+    createShared: ({ token, presence }) => new SharedDiscordClient({
+      token,
+      presence,
+      log: instanceLog,
+      fetchImpl: opts.fetchImpl,
+    }),
+    createBridge: (entry, shared) => new V2Bridge({
+      label: `[${entry.bridge_id.slice(0, 8)}]`,
+      harmonyToken: entry.harmony_token,
+      apiBase: endpoints.apiBase,
+      gatewayUrl: endpoints.gatewayUrl,
+      baseUrl: publicUrl,
+      discordToken: '',
+      sharedDiscord: shared,
+      dataDir: join(opts.dataDir, 'instance', safeDirName(entry.bridge_id)),
+      log,
+      version: opts.version,
+      authHint: HOSTED_AUTH_HINT,
+      fetchImpl: opts.fetchImpl,
+    }),
+  })
+
   const runner = new HostRunner({
     log,
+    instance,
     fetchHosted: () => BridgeApi.hosted(endpoints.apiBase, opts.hostSecret, opts.fetchImpl),
     createInstance: (entry) => new V2Bridge({
       label: `[${entry.bridge_id.slice(0, 8)}]`,
@@ -188,7 +222,7 @@ export async function runHost(opts: {
       gatewayUrl: endpoints.gatewayUrl,
       baseUrl: publicUrl,
       discordToken: entry.discord_token,
-      dataDir: join(opts.dataDir, 'hosted', entry.bridge_id.replace(/[^A-Za-z0-9_-]/g, '_')),
+      dataDir: join(opts.dataDir, 'hosted', safeDirName(entry.bridge_id)),
       log,
       version: opts.version,
       authHint: HOSTED_AUTH_HINT,

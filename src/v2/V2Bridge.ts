@@ -8,6 +8,7 @@ import {
   type HarmonyChannelOption,
 } from '../runtime/BridgeRuntime.js'
 import type { NewPair, PairWriter } from '../runtime/PairDirectory.js'
+import type { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
 import { detectProblems, type DiscordGuildView, type Problem } from '../problems.js'
 import { Backoff, type FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -35,6 +36,8 @@ export interface V2BridgeOptions {
   /** Public Harmony site URL; null → /config base_url → bot-gateway URL minus /bot-gateway. */
   baseUrl: string | null
   discordToken: string
+  /** Instance bot client; replaces `discordToken`. */
+  sharedDiscord?: SharedDiscordClient
   /** Directory for permission-sync.yml. */
   dataDir: string
   log: Logger
@@ -185,6 +188,7 @@ export class V2Bridge {
       directory,
       writer: new ApiPairWriter(this.api),
       discordToken: this.opts.discordToken,
+      sharedDiscord: this.opts.sharedDiscord,
       harmony: {
         token: this.opts.harmonyToken,
         gatewayUrl: this.opts.gatewayUrl,
@@ -297,6 +301,7 @@ export class V2Bridge {
     return detectProblems({
       connection: [...(runtime?.connectionProblems() ?? []), ...this.configProblems()],
       guilds,
+      scopedToSelection: this.opts.sharedDiscord !== undefined,
       config: config && {
         discord_guild_id: config.discord_guild_id,
         pairs: this.directory!.getAllMappings().map(p => ({
@@ -332,6 +337,16 @@ export class V2Bridge {
       if (err instanceof BridgeApiError && err.isAuth) this.statusAuthFailed = true
       this.log.debug(`Status heartbeat failed: ${errorText(err)}`)
     }
+  }
+
+  /** The first /config has loaded. */
+  configLoaded(): boolean {
+    return this.directory !== null
+  }
+
+  /** discord_guild_id of the last loaded /config. */
+  linkedGuildId(): string | null {
+    return this.directory?.config().discord_guild_id ?? null
   }
 
   health(): HealthReport {

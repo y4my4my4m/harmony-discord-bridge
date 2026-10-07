@@ -70,8 +70,9 @@ function gateway() {
   return { state, fetchImpl }
 }
 
-function bridge(fetchImpl: any, runtimes: FakeRuntime[]) {
+function bridge(fetchImpl: any, runtimes: FakeRuntime[], extra: Partial<ConstructorParameters<typeof V2Bridge>[0]> = {}) {
   return new V2Bridge({
+    ...extra,
     harmonyToken: 'tok',
     apiBase: 'https://har.example/bot-gateway',
     gatewayUrl: 'wss://har.example/bot-gateway/gateway',
@@ -108,6 +109,8 @@ describe('V2Bridge configuration', () => {
     expect(rt.opts.harmony.baseUrl).toBe('https://har.example')
     expect(rt.opts.directory.getHarmonyChannel('d1')).toBe('h1')
     expect(rt.opts.hooks?.harmonyChannels?.().map(c => c.id)).toEqual(['h1', 'h2'])
+    expect(b.configLoaded()).toBe(true)
+    expect(b.linkedGuildId()).toBe('g1')
 
     await vi.advanceTimersByTimeAsync(20)
     expect(state.statuses).toHaveLength(1)
@@ -207,6 +210,21 @@ describe('V2Bridge configuration', () => {
     await b.stop()
   })
 
+  it('instance bridge: hands the shared client to the runtime and reports bot_not_in_guild', async () => {
+    const { state, fetchImpl } = gateway()
+    state.config = config({ mode: 'instance', discord_guild_id: 'g9' })
+    const runtimes: FakeRuntime[] = []
+    const shared = {} as any
+    const b = bridge(fetchImpl, runtimes, { sharedDiscord: shared, discordToken: '' })
+    await b.start()
+    expect(runtimes[0].opts.sharedDiscord).toBe(shared)
+    // Shared client: guild views hold the linked guild only, here absent.
+    runtimes[0].guilds = []
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(state.statuses.at(-1).problems).toEqual([{ code: 'bot_not_in_guild', params: { guild_id: 'g9' } }])
+    await b.stop()
+  })
+
   it('waits with backoff while Harmony rejects the token, without building a runtime', async () => {
     const { state, fetchImpl } = gateway()
     state.configStatus = 401
@@ -214,6 +232,8 @@ describe('V2Bridge configuration', () => {
     const b = bridge(fetchImpl, runtimes)
     await b.start()
     expect(runtimes).toHaveLength(0)
+    expect(b.configLoaded()).toBe(false)
+    expect(b.linkedGuildId()).toBeNull()
     expect(b.health()).toMatchObject({ ok: false, body: { problems: ['harmony_auth_failed'] } })
 
     // First retry after ~60 s (auth backoff), not immediately.

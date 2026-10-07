@@ -7,7 +7,7 @@ export type PairDirectionV2 = 'both' | 'to_harmony' | 'to_discord'
 export interface BridgeV2Config {
   bridge_id: string
   server_id: string
-  mode: 'self' | 'hosted'
+  mode: 'self' | 'hosted' | 'instance'
   discord_guild_id: string | null
   settings: Record<string, unknown>
   pairs: Array<{
@@ -43,6 +43,22 @@ export interface HostedEntry {
   bridge_id: string
   harmony_token: string
   discord_token: string
+}
+
+/** GET /bridge/v2/hosted/instance bridge entry */
+export interface InstanceBridgeEntry {
+  bridge_id: string
+  harmony_token: string
+  discord_guild_id: string | null
+}
+
+/** GET /bridge/v2/hosted/instance */
+export interface InstanceHosted {
+  application_id: string | null
+  discord_token: string
+  /** GuildPresences allowed on the shared client. */
+  presence: boolean
+  bridges: InstanceBridgeEntry[]
 }
 
 export class BridgeApiError extends Error {
@@ -108,7 +124,7 @@ export class BridgeApi {
     return {
       bridge_id: String(body.bridge_id ?? ''),
       server_id: String(body.server_id ?? ''),
-      mode: body.mode === 'hosted' ? 'hosted' : 'self',
+      mode: body.mode === 'hosted' || body.mode === 'instance' ? body.mode : 'self',
       discord_guild_id: body.discord_guild_id ? String(body.discord_guild_id) : null,
       settings: body.settings && typeof body.settings === 'object' ? body.settings : {},
       pairs: Array.isArray(body.pairs) ? body.pairs : [],
@@ -156,5 +172,33 @@ export class BridgeApi {
     return list
       .filter((e): e is HostedEntry =>
         !!e && typeof e.bridge_id === 'string' && typeof e.harmony_token === 'string' && typeof e.discord_token === 'string')
+  }
+
+  /** Instance bot and its bridges. Null when the gateway answers 404 (instance bot disabled or unconfigured). */
+  static async hostedInstance(apiBase: string, secret: string, fetchImpl?: FetchLike): Promise<InstanceHosted | null> {
+    const res = await fetchWithRetry(`${apiBase.replace(/\/+$/, '')}/bridge/v2/hosted/instance`, {
+      headers: { 'X-Bridge-Host-Secret': secret },
+    }, { fetchImpl, timeoutMs: TIMEOUT_MS })
+    if (res.status === 404) {
+      await res.body?.cancel().catch(() => {})
+      return null
+    }
+    if (!res.ok) throw await failure(res, 'GET /bridge/v2/hosted/instance')
+    const body = await res.json() as Partial<InstanceHosted> | null
+    if (!body || typeof body.discord_token !== 'string' || !body.discord_token) return null
+    const bridges = Array.isArray(body.bridges) ? body.bridges : []
+    return {
+      application_id: typeof body.application_id === 'string' ? body.application_id : null,
+      discord_token: body.discord_token,
+      presence: body.presence === true,
+      bridges: bridges
+        .filter((e): e is InstanceBridgeEntry =>
+          !!e && typeof e.bridge_id === 'string' && typeof e.harmony_token === 'string')
+        .map(e => ({
+          bridge_id: e.bridge_id,
+          harmony_token: e.harmony_token,
+          discord_guild_id: typeof e.discord_guild_id === 'string' && e.discord_guild_id ? e.discord_guild_id : null,
+        })),
+    }
   }
 }

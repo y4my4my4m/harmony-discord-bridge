@@ -1,19 +1,30 @@
-# =============================================================================
-# Harmony <-> Discord bridge (standalone)
-# =============================================================================
-# Run the bridge on its own - it only needs network access to a Harmony
-# bot-gateway and a Discord bot token. No Harmony backend or database required.
+# Harmony ↔ Discord bridge, run it yourself.
 #
-#   1. cp config/bridge-config.example.yml config/bridge-config.yml
-#   2. edit config/bridge-config.yml  (tokens, server IDs, channel mappings)
-#   3. docker compose up -d
-# =============================================================================
+#   1. Fill in the three values below (see README.md, "Run it yourself").
+#   2. docker compose up -d
+#   3. docker compose logs -f
+#
+# HARMONY_SETUP_CODE is used once. After the first start the bridge keeps its
+# credentials in the harmony-bridge volume; the line can be removed.
 services:
-  discord-bridge:
-    build: .
-    image: harmony-discord-bridge:local
-    container_name: harmony-discord-bridge
+  harmony-bridge:
+    image: ghcr.io/y4my4my4m/harmony-discord-bridge:latest
+    container_name: harmony-bridge
     restart: unless-stopped
+    environment:
+      HARMONY_URL: "https://har.mony.lol"
+      HARMONY_SETUP_CODE: "HB-XXXX-XXXX-XXXX"
+      DISCORD_TOKEN: "paste-your-discord-bot-token-here"
+      # LOG_LEVEL: "info"   # error | warn | info | debug (debug prints message contents)
     volumes:
-      - ./config:/app/config
-      - ./data:/app/data
+      - harmony-bridge:/data
+
+  # Legacy bridge-config.yml (v1) setups: drop the environment block above and
+  # mount the old folders instead. Bind-mounted folders must be writable by
+  # uid 1000 (sudo chown -R 1000:1000 config data).
+  #   volumes:
+  #     - ./config:/app/config
+  #     - ./data:/app/data
+
+volumes:
+  harmony-bridge:

@@ -1,6 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, watch as fsWatch, FSWatcher } from 'fs'
 import { parse, stringify } from 'yaml'
 import { EventEmitter } from 'events'
+import { fetchWithRetry } from './http.js'
+import type { PairDirectory, RuntimeSettings } from './runtime/PairDirectory.js'
 
 export interface ChannelMapping {
   discord: string // Discord channel ID
@@ -40,11 +42,9 @@ export interface BridgeConfig {
   /** One bot token can bridge multiple Discord↔Harmony server pairs */
   bridges?: BridgeInstance[]
   settings: {
-    syncAttachments: boolean
-    syncReactions: boolean
-    syncEdits: boolean
-    syncDeletes: boolean
-    mentionTranslation: boolean
+    syncReactions?: boolean
+    syncEdits?: boolean
+    syncDeletes?: boolean
     cloneRoles?: boolean
     syncPermissions?: boolean
     syncPresence?: boolean
@@ -53,7 +53,7 @@ export interface BridgeConfig {
 
 type NormalizedBridgeConfig = BridgeConfig & { bridges: BridgeInstance[] }
 
-export class ChannelMapper extends EventEmitter {
+export class ChannelMapper extends EventEmitter implements PairDirectory {
   private config: NormalizedBridgeConfig
   private configPath: string
   private watcher: FSWatcher | null = null
@@ -184,6 +184,20 @@ export class ChannelMapper extends EventEmitter {
     return this.config
   }
 
+  /** v1 defaults: reactions/edits/deletes off unless set, presence on unless false, member list always. */
+  runtimeSettings(): RuntimeSettings {
+    const s = this.config.settings ?? {}
+    return {
+      syncReactions: s.syncReactions === true,
+      syncEdits: s.syncEdits === true,
+      syncDeletes: s.syncDeletes === true,
+      syncPresence: s.syncPresence !== false,
+      syncMemberList: true,
+      syncPermissions: s.syncPermissions === true,
+      cloneRoles: s.cloneRoles === true,
+    }
+  }
+
   /**
    * Resolve pairingCode via bot-gateway public lookup (fills serverId / URLs).
    */
@@ -199,7 +213,7 @@ export class ChannelMapper extends EventEmitter {
 
     try {
       const lookupUrl = `${base}/bot-gateway/bridge-setup/${encodeURIComponent(code.toUpperCase())}`
-      const res = await fetch(lookupUrl)
+      const res = await fetchWithRetry(lookupUrl)
       if (!res.ok) {
         console.warn(`⚠️ Pairing lookup failed (${res.status}): ${lookupUrl}`)
         return
@@ -403,7 +417,7 @@ export class ChannelMapper extends EventEmitter {
   }
 
   updateSetting(key: keyof BridgeConfig['settings'], value: boolean) {
-    this.config.settings[key] = value
+    this.config.settings = { ...(this.config.settings ?? {}), [key]: value }
     this.saveConfig()
   }
 }

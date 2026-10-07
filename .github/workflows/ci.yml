@@ -2,19 +2,34 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
       - run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
       - name: Verify Docker image builds
         run: docker build -t harmony-discord-bridge:ci .
+      - name: Unconfigured container exits with instructions
+        run: |
+          set +e
+          out=$(docker run --rm harmony-discord-bridge:ci 2>&1)
+          code=$?
+          echo "$out"
+          test "$code" -ne 0 && echo "$out" | grep -q HARMONY_URL

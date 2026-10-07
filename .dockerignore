@@ -1,5 +1,14 @@
+.git
+.github
+.vitest
 node_modules
 dist
-*.log
+coverage
+test
+data
 config/bridge-config.yml
-.git
+*.log
+.env
+.env.*
+Dockerfile
+docker-compose.yml

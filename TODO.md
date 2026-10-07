@@ -15,8 +15,8 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Debug why Realtime subscriptions fail (check Supabase config, service role permissions)
 
 ### Message mapping persistence
-- [ ] Currently message ID mappings (Harmony ↔ Discord) are stored in memory
-- [ ] If bridge restarts, all mappings are lost
+- Mappings live in memory (LRU, 50k); Discord ids are also stored in Harmony message metadata and restored from the last 100 messages per paired channel at startup
+- [ ] Edits/reactions on messages older than that window are not bridged after a restart
 
 ---
 
@@ -42,7 +42,6 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 
 ### Performance
 - [ ] Batch Discord webhook calls if multiple Harmony messages arrive quickly
-- [ ] Implement backoff/retry for Discord rate limits
 
 ### Features
 - [ ] Bridge Discord embeds to Harmony (link previews)
@@ -51,9 +50,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Bridge Discord slash commands other than `/m`
 
 ### Monitoring
-- [ ] Add health check endpoint for bridge status
 - [ ] Expose metrics (messages bridged, errors, latency)
-- [ ] Alert when bridge disconnects from either side
 
 ---
 
@@ -72,4 +69,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [x] Message deletes (Harmony → Discord via polling, detects soft-delete flag)
 - [x] Message edits (Discord → Harmony)
 - [x] Message deletes (Discord → Harmony)
+- [x] `/health` endpoint; status heartbeat with problem codes to Harmony (v2)
+- [x] Bounded retry honoring Retry-After for Harmony and Discord REST
+- [x] Long Harmony messages split across several Discord messages
 

@@ -1,5 +1,7 @@
+# Legacy (v1) configuration. New bridges need no YAML: set HARMONY_URL,
+# HARMONY_SETUP_CODE and DISCORD_TOKEN instead (README.md, "Run it yourself").
 # https://github.com/y4my4my4m/harmony-discord-bridge
-# URL examples are in README.md — uncomment the block that matches your setup.
+# URL examples are in README.md (Legacy YAML configuration).
 
 discord:
   token: "YOUR_DISCORD_BOT_TOKEN"
@@ -33,15 +35,11 @@ channelMappings:
     name: "general"
 
 settings:
-  syncAttachments: true   # include attachments in bridged messages
-  # Attachment policy (link / refresh / mirror) is set by the INSTANCE ADMIN in
-  # the Harmony Admin Panel — not here. refresh re-signs expired Discord URLs on
-  # demand (no disk); mirror copies files into user_media (permanent, but grows
-  # disk usage). Default is link.
+  # Attachments always bridge. Their storage policy (link / refresh / mirror)
+  # is set by the instance admin in the Harmony Admin Panel, not here.
   syncReactions: true
   syncEdits: false
   syncDeletes: false
-  mentionTranslation: true
   cloneRoles: false
   syncPermissions: false
   # Mirror Discord presence + custom status in Harmony member list (default: true).

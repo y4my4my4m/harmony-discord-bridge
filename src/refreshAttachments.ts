@@ -1,3 +1,5 @@
+import { fetchWithRetry, type FetchLike } from './http.js'
+
 const DISCORD_API = 'https://discord.com/api/v10'
 const REFRESH_BATCH = 50 // Discord's max per refresh-urls call
 
@@ -23,6 +25,7 @@ function baseOf(url: string): string {
 export async function refreshDiscordAttachmentParts(
   content: any[],
   botToken: string,
+  fetchImpl?: FetchLike,
 ): Promise<any[] | null> {
   if (!Array.isArray(content)) return null
 
@@ -45,11 +48,11 @@ export async function refreshDiscordAttachmentParts(
   const refreshedByBase = new Map<string, string>()
   for (let i = 0; i < urls.length; i += REFRESH_BATCH) {
     const batch = urls.slice(i, i + REFRESH_BATCH)
-    const res = await fetch(`${DISCORD_API}/attachments/refresh-urls`, {
+    const res = await fetchWithRetry(`${DISCORD_API}/attachments/refresh-urls`, {
       method: 'POST',
       headers: { Authorization: `Bot ${botToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ attachment_urls: batch }),
-    })
+    }, { fetchImpl })
     if (!res.ok) {
       throw new Error(`Discord refresh-urls failed (${res.status})`)
     }

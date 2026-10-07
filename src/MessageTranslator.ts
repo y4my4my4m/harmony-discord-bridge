@@ -1,3 +1,5 @@
+import { Logger } from './log.js'
+
 /** Split URLs glued without separators (`...pnghttps://...`). */
 function extractGluedHttpUrls(text: string): string[] {
   if (!text) return []
@@ -151,11 +153,46 @@ export interface HarmonyMentionLookup {
   isLocal: boolean
 }
 
+type DiscordSegmentKind = 'inline' | 'url' | 'file'
+
+/** Characters that extend a URL when glued to one. */
+const URL_CONTINUATION = /[A-Za-z0-9\-._~:/?#[\]@!$&'*+,;=%]/
+
+/**
+ * Join translated parts into one Discord message. Text, mentions, emoji and
+ * hashtags join without a separator; the Harmony parts already carry their
+ * own spacing. File parts sit on their own line. A url part gets a space only
+ * where gluing would extend it (`...pnghttps://`).
+ */
+export function joinDiscordSegments(segments: Array<{ kind: DiscordSegmentKind; text: string }>): string {
+  let out = ''
+  let prevKind: DiscordSegmentKind | null = null
+  for (const seg of segments) {
+    if (!seg.text) continue
+    let text = seg.text
+    if (out && prevKind !== null) {
+      if (seg.kind === 'file' || prevKind === 'file') {
+        out = out.replace(/[ \t]+$/, '')
+        text = text.replace(/^[ \t]+/, '')
+        if (!out.endsWith('\n') && !text.startsWith('\n')) out += '\n'
+      } else if (seg.kind === 'url' || prevKind === 'url') {
+        const last = out[out.length - 1]
+        if (URL_CONTINUATION.test(last) && URL_CONTINUATION.test(text[0])) out += ' '
+      }
+    }
+    out += text
+    prevKind = seg.kind
+  }
+  return out
+}
+
 export class MessageTranslator {
   private serverId: string | null = null
   private harmonyDomain: string | null = null
   private harmonyMemberLookup: ((username: string, domain: string | null) => HarmonyMentionLookup | null) | null = null
-  
+
+  constructor(private readonly log: Logger = new Logger()) {}
+
   /**
    * Set the server ID for emoji lookups
    */
@@ -223,7 +260,7 @@ export class MessageTranslator {
   discordToHarmonyParts(discordMsg: any): any[] {
     const parts: any[] = []
     
-    console.log('🔍 discordToHarmonyParts input:', {
+    this.log.debug('🔍 discordToHarmonyParts input:', {
       contentType: typeof discordMsg.content,
       contentIsArray: Array.isArray(discordMsg.content),
       content: discordMsg.content
@@ -259,7 +296,7 @@ export class MessageTranslator {
           const discordEmojiId = match[3]
           const discordEmojiUrl = `https://cdn.discordapp.com/emojis/${discordEmojiId}.${isAnimated ? 'gif' : 'png'}`
           
-          console.log(`🎨 D→H Custom emoji: :${emojiName}: → ${discordEmojiUrl}`)
+          this.log.debug(`🎨 D→H Custom emoji: :${emojiName}: → ${discordEmojiUrl}`)
           
           parts.push({
             type: 'emoji',
@@ -281,7 +318,7 @@ export class MessageTranslator {
           if (user) {
             // Create proper mention MessagePart for Discord user
             const displayName = guildMember?.displayName || user.globalName || user.username
-            console.log(`🔔 D→H Mention: <@${discordUserId}> → @${user.username}@discord.com (ID: ${discordUserId})`)
+            this.log.debug(`🔔 D→H Mention: <@${discordUserId}> → @${user.username}@discord.com (ID: ${discordUserId})`)
             parts.push({
               type: 'mention',
               userId: discordUserId, // Store Discord snowflake ID for reverse translation
@@ -294,7 +331,7 @@ export class MessageTranslator {
             })
           } else {
             // User not found in mentions cache, keep as text
-            console.log(`⚠️ D→H Mention: <@${discordUserId}> not found in mentions cache`)
+            this.log.debug(`⚠️ D→H Mention: <@${discordUserId}> not found in mentions cache`)
             parts.push({ type: 'text', text: match[0] })
           }
         } else if (match[5]) {
@@ -352,7 +389,7 @@ export class MessageTranslator {
             const username = mentionMatch[1]
             const federatedDomain = mentionMatch[2] || null
             const lookup = this.harmonyMemberLookup?.(username, federatedDomain) ?? null
-            console.log(
+            this.log.debug(
               `🔔 D→H Plain mention: @${username}${federatedDomain ? `@${federatedDomain}` : ''}`
               + (lookup ? ` → ${lookup.id}` : ' (unresolved)'),
             )
@@ -392,7 +429,7 @@ export class MessageTranslator {
     
     // Attachments as proper file parts (images, videos, files)
     if (discordMsg.attachments && discordMsg.attachments.size > 0) {
-      console.log(`📎 D→H ${discordMsg.attachments.size} attachment(s):`)
+      this.log.debug(`📎 D→H ${discordMsg.attachments.size} attachment(s):`)
       discordMsg.attachments.forEach((attachment: any) => {
         const contentType = attachment.contentType || ''
         const fileType = inferAttachmentFileType(
@@ -401,7 +438,7 @@ export class MessageTranslator {
           attachment.url || '',
         )
 
-        console.log(`   📎 ${attachment.name} (${fileType}) → ${attachment.url}`)
+        this.log.debug(`   📎 ${attachment.name} (${fileType}) → ${attachment.url}`)
 
         parts.push({
           type: 'file',
@@ -424,7 +461,7 @@ export class MessageTranslator {
       discordMsg.embeds.forEach((embed: any) => {
         if (!embed.url) return
         if (isUrlAlreadyRepresented(parts, embed.url)) {
-          console.log(`⏭️ D→H Skipping duplicate embed URL: ${embed.url}`)
+          this.log.debug(`⏭️ D→H Skipping duplicate embed URL: ${embed.url}`)
           return
         }
         parts.push({
@@ -495,136 +532,70 @@ export class MessageTranslator {
   }
   
   /**
-   * Convert Harmony message to Discord format
-   * @param harmonyMsg - The Harmony message object
-   * @param discordMemberCache - Optional cache of Discord members for username-to-ID lookup
+   * Harmony message to Discord content. The result can exceed 2000
+   * characters; the sender splits it (splitDiscordContent).
+   * @param discordMemberCache - lowercase username → Discord user id
    */
   harmonyToDiscord(harmonyMsg: any, discordMemberCache?: Map<string, string>): string {
     let content = ''
-    
-    // If content_raw exists, use it to properly parse MessageParts
+
     if (harmonyMsg.content_raw && Array.isArray(harmonyMsg.content_raw)) {
-      const parts = harmonyMsg.content_raw.map((part: any) => {
+      const segments = harmonyMsg.content_raw.map((part: any): { kind: DiscordSegmentKind; text: string } => {
         if (part.type === 'text') {
-          return part.text || ''
+          return { kind: 'inline', text: part.text || '' }
         } else if (part.type === 'mention') {
-          // Handle mention parts
-          
-          // Check if this is a bridged Discord mention (has isBridged flag or domain is discord.com)
+          // Bridged Discord user: userId holds the Discord snowflake.
           if (part.domain === 'discord.com' && part.userId) {
-            // Discord user mention - userId contains the Discord ID
-            // Check if it's a valid Discord snowflake (numeric)
             if (/^\d+$/.test(part.userId)) {
-              console.log(`🔔 H→D Mention (Discord user): @${part.username} → <@${part.userId}>`)
-              return `<@${part.userId}>`
-            } else {
-              console.log(`⚠️ H→D Mention: Invalid Discord ID: ${part.userId}`)
+              this.log.debug(`H→D mention (Discord user): @${part.username} → <@${part.userId}>`)
+              return { kind: 'inline', text: `<@${part.userId}>` }
             }
+            this.log.debug(`H→D mention: invalid Discord id ${part.userId}`)
           }
-          
-          // Try to find this user in Discord by username
+
           if (discordMemberCache) {
-            const lookupUsername = part.username?.toLowerCase()
-            const discordId = discordMemberCache.get(lookupUsername)
+            const discordId = discordMemberCache.get(part.username?.toLowerCase())
             if (discordId) {
-              console.log(`🔔 H→D Mention: @${part.username} → <@${discordId}> (found in Discord)`)
-              return `<@${discordId}>`
+              this.log.debug(`H→D mention: @${part.username} → <@${discordId}>`)
+              return { kind: 'inline', text: `<@${discordId}>` }
             }
           }
-          
-          // Fallback: show as @username@domain for Harmony users not in Discord
+
           const username = part.username || 'unknown'
-          // Use the domain from the mention, fall back to configured Harmony domain
           const domain = part.domain || this.getHarmonyDomain()
-          const federatedMention = `@${username}@${domain}`
-          console.log(`🔔 H→D Mention (Harmony user): ${federatedMention}`)
-          return federatedMention
+          return { kind: 'inline', text: `@${username}@${domain}` }
         } else if (part.type === 'emoji') {
-          // Convert Harmony emoji to Discord format
           const emoji = part.emoji
-          console.log('🎭 Converting emoji to Discord:', JSON.stringify(emoji, null, 2))
           if (emoji) {
-            // If it's a Discord emoji (has domain), try to reconstruct Discord emoji format
+            // Bridged Discord emoji: https://cdn.discordapp.com/emojis/<id>.<ext>
             if (emoji.domain === 'discord.com' && emoji.url) {
-              // Extract Discord emoji ID from URL: https://cdn.discordapp.com/emojis/123.png
               const match = emoji.url.match(/emojis\/(\d+)\.(png|gif|webp)/)
               if (match) {
-                const emojiId = match[1]
                 const isAnimated = match[2] === 'gif'
-                // Use Discord emoji format: <:name:id> or <a:name:id> for animated
-                return `<${isAnimated ? 'a' : ''}:${emoji.name}:${emojiId}>`
+                return { kind: 'inline', text: `<${isAnimated ? 'a' : ''}:${emoji.name}:${match[1]}>` }
               }
             }
-            
-            // For Harmony native emojis, we can't render them in Discord directly
-            // Just show the name
-            return `:${emoji.name}:`
+            // Harmony-native emoji has no Discord rendering.
+            return { kind: 'inline', text: `:${emoji.name}:` }
           }
-          return ''
+          return { kind: 'inline', text: '' }
         } else if (part.type === 'file') {
-          // File attachments - Discord will auto-embed images/videos
-          return part.url || ''
+          return { kind: 'file', text: part.url || '' }
         } else if (part.type === 'url') {
-          // URL parts
-          return part.url || ''
+          return { kind: 'url', text: part.url || '' }
         } else if (part.type === 'hashtag') {
-          // Hashtags - show as plain text
-          return `#${part.name || ''}`
+          return { kind: 'inline', text: `#${part.name || ''}` }
         }
-        return ''
+        return { kind: 'inline', text: '' }
       })
-      
-      // Newline between segments so Discord (and Harmony URL parsers) treat
-      // multiple attachment URLs as separate links instead of one invalid URL.
-      content = parts.filter(Boolean).join('\n')
+
+      content = joinDiscordSegments(segments)
     } else if (harmonyMsg.content) {
-      // Fallback to simple content string
       content = harmonyMsg.content
     }
-    
-    // Remove [Discord] prefix if present (avoid loops)
-    content = content.replace(/^\*\*\[Discord\]\*\*\s+/, '')
-    
-    // Extract username if in "username: message" format
-    const match = content.match(/^(.+?):\s+(.+)$/)
-    if (match) {
-      const [, , message] = match
-      // Don't add prefix since we're using puppeting
-      content = message
-    }
-    
-    // Limit length to Discord's 2000 character limit
-    if (content.length > 2000) {
-      content = content.substring(0, 1997) + '...'
-    }
-    
-    return content
-  }
-  
-  /**
-   * Convert Harmony message to Discord format (old method, kept for compatibility)
-   */
-  harmonyToDiscordOld(harmonyMsg: any): string {
-    let content = harmonyMsg.content
-    
-    // Remove [Discord] prefix if present (avoid loops)
-    content = content.replace(/^\*\*\[Discord\]\*\*\s+/, '')
-    
-    // Extract username if in "username: message" format
-    const match = content.match(/^(.+?):\s+(.+)$/)
-    if (match) {
-      const [, username, message] = match
-      content = `**[Harmony]** ${username}: ${message}`
-    } else {
-      content = `**[Harmony]** ${content}`
-    }
-    
-    // Limit length to Discord's 2000 character limit
-    if (content.length > 2000) {
-      content = content.substring(0, 1997) + '...'
-    }
-    
-    return content
+
+    // Loop guard for the pre-puppeting "[Discord]" prefix format.
+    return content.replace(/^\*\*\[Discord\]\*\*\s+/, '')
   }
   
   /**

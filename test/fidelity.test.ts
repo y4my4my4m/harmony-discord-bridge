@@ -616,4 +616,14 @@ describe('HarmonyClient errors', () => {
     expect(isAutomodBlocked(err)).toBe(true)
     expect(fetchImpl).toHaveBeenCalledTimes(1)
   })
+
+  it('reads ?id= answered as one emoji object (Harmony 1.6.16) or as rows (older)', async () => {
+    const { HarmonyClient } = await import('../src/HarmonyClient.js')
+    const emoji = { id: 'e1', name: 'ananas', url: 'https://h.example/storage/v1/object/public/emojis/a.webp' }
+    for (const [body, expected] of [[emoji, [emoji]], [[emoji], [emoji]], [null, []]] as const) {
+      const fetchImpl = vi.fn(async () => Response.json(body))
+      const client = new HarmonyClient('t', 'ws://127.0.0.1:9/gateway', 'http://127.0.0.1:9', { fetchImpl, log: new Logger('error', '', true) })
+      expect(await client.getEmojis('e1')).toEqual(expected)
+    }
+  })
 })

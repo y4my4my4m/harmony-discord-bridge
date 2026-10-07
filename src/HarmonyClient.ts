@@ -599,9 +599,11 @@ export class HarmonyClient extends EventEmitter {
    * only; without an `id` filter it answers every row, all of which the caller
    * may cache.
    */
+  /** Harmony 1.6.16+ answers `?id=` with one emoji object; older versions with every row. */
   async getEmojis(id: string): Promise<Array<{ id: string; name: string | null; url: string | null }>> {
-    const rows = await this.getJson<unknown>(`/emojis?id=${encodeURIComponent(id)}`, 'Failed to fetch emojis')
-    return Array.isArray(rows) ? rows as Array<{ id: string; name: string | null; url: string | null }> : []
+    const body = await this.getJson<unknown>(`/emojis?id=${encodeURIComponent(id)}`, 'Failed to fetch emojis')
+    const rows = Array.isArray(body) ? body : body && typeof body === 'object' ? [body] : []
+    return rows as Array<{ id: string; name: string | null; url: string | null }>
   }
 
   async getGuildMembers(guildId: string): Promise<any[]> {

@@ -8,8 +8,9 @@ import {
   type NonThreadGuildBasedChannel,
 } from 'discord.js'
 import { HarmonyClient } from './HarmonyClient.js'
-import { ChannelMapper } from './ChannelMapper.js'
+import type { PairDirectory } from './runtime/PairDirectory.js'
 import { PermissionSyncStore } from './PermissionSyncStore.js'
+import { Logger } from './log.js'
 import {
   discordRoleToHarmonyPermissions,
   discordColorToHex,
@@ -21,13 +22,13 @@ import {
  * Does NOT assign members to roles (no Discord↔Harmony account link).
  */
 export class PermissionSync {
-  private attached = false
+  private attachedTo: Client | null = null
 
   constructor(
     private harmony: HarmonyClient,
-    private discord: Client,
-    private mapper: ChannelMapper,
+    private mapper: PairDirectory,
     private store: PermissionSyncStore,
+    private log: Logger = new Logger(),
   ) {}
 
   private harmonyServerIdForGuild(guildId: string): string | null {
@@ -37,7 +38,7 @@ export class PermissionSync {
   private requireServerId(guildId: string): string {
     const serverId = this.harmonyServerIdForGuild(guildId)
     if (!serverId) {
-      throw new Error(`Discord guild ${guildId} is not configured in bridge-config.yml`)
+      throw new Error(`Discord guild ${guildId} is not a bridged guild`)
     }
     return serverId
   }
@@ -47,26 +48,28 @@ export class PermissionSync {
   }
 
   isEnabled(): boolean {
-    return this.mapper.getConfig().settings.syncPermissions === true
+    return this.mapper.runtimeSettings().syncPermissions
   }
 
-  attach() {
-    if (this.attached || !this.isEnabled()) return
-    this.discord.on('roleCreate', this.onRoleCreate)
-    this.discord.on('roleUpdate', this.onRoleUpdate)
-    this.discord.on('roleDelete', this.onRoleDelete)
-    this.discord.on('channelUpdate', this.onChannelUpdate)
-    this.attached = true
-    console.log('🔐 Permission sync: listening for Discord role/channel changes')
+  attach(discord: Client) {
+    if (this.attachedTo === discord || !this.isEnabled()) return
+    this.detach()
+    discord.on('roleCreate', this.onRoleCreate)
+    discord.on('roleUpdate', this.onRoleUpdate)
+    discord.on('roleDelete', this.onRoleDelete)
+    discord.on('channelUpdate', this.onChannelUpdate)
+    this.attachedTo = discord
+    this.log.info('Permission sync: listening for Discord role/channel changes')
   }
 
   detach() {
-    if (!this.attached) return
-    this.discord.off('roleCreate', this.onRoleCreate)
-    this.discord.off('roleUpdate', this.onRoleUpdate)
-    this.discord.off('roleDelete', this.onRoleDelete)
-    this.discord.off('channelUpdate', this.onChannelUpdate)
-    this.attached = false
+    const discord = this.attachedTo
+    if (!discord) return
+    discord.off('roleCreate', this.onRoleCreate)
+    discord.off('roleUpdate', this.onRoleUpdate)
+    discord.off('roleDelete', this.onRoleDelete)
+    discord.off('channelUpdate', this.onChannelUpdate)
+    this.attachedTo = null
   }
 
   private isProtectedHarmonyRole(role: { is_default?: boolean; is_admin?: boolean }): boolean {
@@ -76,12 +79,12 @@ export class PermissionSync {
   /** Full reconcile on startup (roles by name + all mapped channel overwrites). */
   async initialSync(guild: Guild) {
     if (!this.isEnabled()) return
-    console.log('🔐 Permission sync: initial reconcile...')
+    this.log.info('🔐 Permission sync: initial reconcile...')
     await guild.roles.fetch()
     await this.ensureDefaultRoleMapped(guild)
     await this.reconcileRoles(guild)
     await this.syncAllMappedChannelOverwrites(guild)
-    console.log('🔐 Permission sync: initial reconcile complete')
+    this.log.info('🔐 Permission sync: initial reconcile complete')
   }
 
   /** After clone-server creates roles, record mappings and sync channel overwrites. */
@@ -99,9 +102,9 @@ export class PermissionSync {
     if (role.managed || role.name === '@everyone') return
     try {
       await this.upsertHarmonyRole(role)
-      console.log(`🔐 Synced new Discord role "${role.name}" → Harmony`)
+      this.log.info(`🔐 Synced new Discord role "${role.name}" → Harmony`)
     } catch (err) {
-      console.error(`🔐 Failed to sync new role "${role.name}":`, err)
+      this.log.error(`🔐 Failed to sync new role "${role.name}":`, err)
     }
   }
 
@@ -115,9 +118,9 @@ export class PermissionSync {
     }
     try {
       await this.upsertHarmonyRole(newRole)
-      console.log(`🔐 Synced role update "${newRole.name}" → Harmony`)
+      this.log.info(`🔐 Synced role update "${newRole.name}" → Harmony`)
     } catch (err) {
-      console.error(`🔐 Failed to sync role update "${newRole.name}":`, err)
+      this.log.error(`🔐 Failed to sync role update "${newRole.name}":`, err)
     }
   }
 
@@ -128,9 +131,9 @@ export class PermissionSync {
     try {
       await this.harmony.deleteRole(this.requireServerId(role.guild.id), harmonyRoleId)
       this.store.removeMapping(role.id)
-      console.log(`🔐 Deleted Harmony role for removed Discord role "${role.name}"`)
+      this.log.info(`🔐 Deleted Harmony role for removed Discord role "${role.name}"`)
     } catch (err) {
-      console.error(`🔐 Failed to delete Harmony role for "${role.name}":`, err)
+      this.log.error(`🔐 Failed to delete Harmony role for "${role.name}":`, err)
     }
   }
 
@@ -158,9 +161,9 @@ export class PermissionSync {
 
     try {
       await this.syncChannelOverwrites(newChannel as NonThreadGuildBasedChannel, harmonyChannelId)
-      console.log(`🔐 Synced channel overrides for #${newChannel.name}`)
+      this.log.info(`🔐 Synced channel overrides for #${newChannel.name}`)
     } catch (err) {
-      console.error(`🔐 Failed to sync overrides for #${newChannel.name}:`, err)
+      this.log.error(`🔐 Failed to sync overrides for #${newChannel.name}:`, err)
     }
   }
 
@@ -229,7 +232,7 @@ export class PermissionSync {
         })
         this.store.setMapping(role.id, created.id, role.name)
       } catch (err) {
-        console.error(`🔐 Failed to sync role "${role.name}":`, err)
+        this.log.error(`🔐 Failed to sync role "${role.name}":`, err)
       }
     }
   }
@@ -289,7 +292,7 @@ export class PermissionSync {
           mapping.harmony,
         )
       } catch (err) {
-        console.error(`🔐 Failed overrides for mapping ${mapping.name || mapping.discord}:`, err)
+        this.log.error(`🔐 Failed overrides for mapping ${mapping.name || mapping.discord}:`, err)
       }
     }
   }

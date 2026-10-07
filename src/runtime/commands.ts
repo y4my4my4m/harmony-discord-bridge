@@ -23,6 +23,9 @@ import {
   formatHarmonyUserHandle,
 } from '../utils/discordDisplayName.js'
 import { describeProblem } from '../problems.js'
+import { DiscordAuthorLimiter } from './antiSpam.js'
+import { memberJoinedAt } from '../utils/discordUserMetadata.js'
+import { isAutomodBlocked } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
 
 // =============================================================================
@@ -198,6 +201,16 @@ async function handleMention(rt: BridgeRuntime, command: ChatInputCommandInterac
     return
   }
 
+  const verdict = rt.antiSpam.check(command.user.id, command.channelId, DiscordAuthorLimiter.contentKey(message, userIds))
+  if (verdict !== 'ok') {
+    rt.noteSpamDrop(verdict, command.channelId)
+    await command.reply({
+      content: verdict === 'duplicate' ? '⏳ You just sent that.' : '⏳ Slow down: too many messages to Harmony.',
+      flags: MessageFlags.Ephemeral,
+    })
+    return
+  }
+
   const contentParts: any[] = []
   const mentionedUsers: CachedHarmonyUser[] = []
   const harmonyUsersForGuild = command.guildId
@@ -255,6 +268,7 @@ async function handleMention(rt: BridgeRuntime, command: ChatInputCommandInterac
       discriminator: command.user.discriminator,
       display_name: member?.displayName || command.user.username,
       avatar_url: command.user.displayAvatarURL({ size: 256 }),
+      ...(memberJoinedAt(command.member) ? { joined_at: memberJoinedAt(command.member) } : {}),
     },
     bridge_source: 'discord',
   }
@@ -280,6 +294,11 @@ async function handleMention(rt: BridgeRuntime, command: ChatInputCommandInterac
       rt.harmonyToDiscordMessages.set(harmonyMessageId, discordMessageId)
     }
   } catch (error) {
+    if (isAutomodBlocked(error)) {
+      rt.noteAutomodBlock(command.channelId)
+      await command.editReply({ content: '❌ Harmony\'s AutoMod blocked this message.' }).catch(() => {})
+      return
+    }
     rt.log.error(`/mention failed: ${errorText(error)}`)
     await command.editReply({ content: `❌ Failed to send: ${errorText(error)}` }).catch(() => {})
   }

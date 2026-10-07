@@ -18,12 +18,24 @@ interface HarmonyMessage {
 
 /** bot-gateway closes IDENTIFY with 4001 (missing token) or 4004 (rejected token). */
 export const HARMONY_AUTH_CLOSE_CODES = new Set([4001, 4004])
+/** bot-gateway closes a connection that sent more than 120 frames (op 1 excluded) in 60 s. */
+export const HARMONY_RATE_LIMITED_CLOSE = 4008
+const GATEWAY_FRAME_WINDOW_MS = 60_000
 
 export class HarmonyHttpError extends Error {
-  constructor(message: string, readonly status: number) {
+  /** `code` of the gateway's error body, e.g. AUTOMOD_BLOCKED. */
+  readonly code: string | null
+
+  constructor(message: string, readonly status: number, code: string | null = null) {
     super(message)
     this.name = 'HarmonyHttpError'
+    this.code = code
   }
+}
+
+/** A relay Harmony's AutoMod refused (403 `{code: "AUTOMOD_BLOCKED"}`); final, not retried. */
+export function isAutomodBlocked(err: unknown): boolean {
+  return err instanceof HarmonyHttpError && err.status === 403 && err.code === 'AUTOMOD_BLOCKED'
 }
 
 export interface HarmonyClientOptions {
@@ -40,8 +52,8 @@ export interface HarmonyClientOptions {
 
 /**
  * Events: ready(data), connectionState(boolean), authFailed({code, reason}),
- * unreachable(error), rateLimited(info), bridgeConfigUpdate(data), and the
- * message/reaction events listed in handleEvent.
+ * unreachable(error), rateLimited(info), gatewayRateLimited({code, reason}),
+ * bridgeConfigUpdate(data), and the message/reaction events listed in handleEvent.
  */
 export class HarmonyClient extends EventEmitter {
   private ws: WebSocket | null = null
@@ -49,6 +61,8 @@ export class HarmonyClient extends EventEmitter {
   private gatewayUrl: string
   private apiUrl: string
   private heartbeatInterval: NodeJS.Timeout | null = null
+  /** Resets the reconnect backoff once a connection outlives a frame window after a 4008 close. */
+  private stableTimer: NodeJS.Timeout | null = null
   private sessionId: string | null = null
   /** Cleared by disconnect(); the close handler reconnects only while set. */
   private reconnectEnabled: boolean = true
@@ -138,6 +152,10 @@ export class HarmonyClient extends EventEmitter {
         this.log.warn(
           `Harmony rejected the bridge token (close ${code}${reason ? ` "${reason}"` : ''}); retrying in ${Math.round(delay / 1000)} s`,
         )
+      } else if (code === HARMONY_RATE_LIMITED_CLOSE) {
+        delay = this.reconnectBackoff.next()
+        this.emit('gatewayRateLimited', { code, reason })
+        this.log.warn(`Harmony gateway closed the connection for sending too many frames (4008); reconnecting in ${Math.round(delay / 1000)} s`)
       } else {
         delay = this.reconnectBackoff.next()
         this.log.warn(
@@ -175,7 +193,16 @@ export class HarmonyClient extends EventEmitter {
       this.sessionId = payload.d.session_id
       this.ready = true
       this.authRejected = false
-      this.reconnectBackoff.reset()
+      if (this.lastClose?.code === HARMONY_RATE_LIMITED_CLOSE) {
+        // A 4008 loop keeps growing the delay until one connection survives a full frame window.
+        if (this.stableTimer) clearTimeout(this.stableTimer)
+        this.stableTimer = setTimeout(() => {
+          this.stableTimer = null
+          this.reconnectBackoff.reset()
+        }, GATEWAY_FRAME_WINDOW_MS)
+      } else {
+        this.reconnectBackoff.reset()
+      }
       this.authBackoff.reset()
       this.log.info(`Harmony bot ready: ${payload.d.bot?.username}`)
       this.emit('ready', payload.d)
@@ -264,6 +291,10 @@ export class HarmonyClient extends EventEmitter {
       clearInterval(this.heartbeatInterval)
       this.heartbeatInterval = null
     }
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer)
+      this.stableTimer = null
+    }
     this.sessionId = null
     this.ready = false
   }
@@ -299,7 +330,8 @@ export class HarmonyClient extends EventEmitter {
   private async expectOk(res: Response, fallback: string): Promise<Response> {
     if (res.ok) return res
     const errorData = await res.json().catch(() => ({})) as any
-    throw new HarmonyHttpError(errorData?.error || `${fallback} (${res.status})`, res.status)
+    const code = typeof errorData?.code === 'string' ? errorData.code : null
+    throw new HarmonyHttpError(errorData?.error || `${fallback} (${res.status})`, res.status, code)
   }
 
   private async getJson<T>(path: string, fallback: string): Promise<T> {
@@ -560,6 +592,16 @@ export class HarmonyClient extends EventEmitter {
       return { success: true }
     }
     return response.json()
+  }
+
+  /**
+   * Emoji rows for `id` ({id, name, url, ...}). bot-gateway filters by `url`
+   * only; without an `id` filter it answers every row, all of which the caller
+   * may cache.
+   */
+  async getEmojis(id: string): Promise<Array<{ id: string; name: string | null; url: string | null }>> {
+    const rows = await this.getJson<unknown>(`/emojis?id=${encodeURIComponent(id)}`, 'Failed to fetch emojis')
+    return Array.isArray(rows) ? rows as Array<{ id: string; name: string | null; url: string | null }> : []
   }
 
   async getGuildMembers(guildId: string): Promise<any[]> {

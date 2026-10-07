@@ -39,6 +39,7 @@ export const ROUTED_EVENTS: Readonly<Record<string, GuildOf>> = {
   [Events.MessageCreate]: (c, m) => m.guildId ?? channelGuild(c, m.channelId),
   [Events.MessageUpdate]: (c, _old, m) => m.guildId ?? channelGuild(c, m.channelId),
   [Events.MessageDelete]: (c, m) => m.guildId ?? channelGuild(c, m.channelId),
+  [Events.MessageBulkDelete]: (c, _messages, ch) => ch?.guildId ?? channelGuild(c, ch?.id),
   [Events.MessageReactionAdd]: (c, r) => r.message?.guildId ?? channelGuild(c, r.message?.channelId),
   [Events.MessageReactionRemove]: (c, r) => r.message?.guildId ?? channelGuild(c, r.message?.channelId),
   [Events.GuildMemberAdd]: (_c, m) => m.guild?.id,

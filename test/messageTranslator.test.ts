@@ -24,16 +24,69 @@ describe('MessageTranslator.harmonyToDiscord', () => {
     expect(out).not.toContain('\n')
   })
 
-  it('resolves Harmony mentions through the Discord member cache', () => {
-    const cache = new Map([['carol', '222']])
-    const out = translator().harmonyToDiscord({
+  it('pings only explicit Discord mention parts, never a Harmony user by username', () => {
+    const r = translator().renderHarmonyForDiscord({
       content_raw: [
         { type: 'text', text: 'ping ' },
         { type: 'mention', userId: 'u-2', username: 'Carol', domain: 'har.mony.lol' },
-        { type: 'text', text: ' now' },
+        { type: 'text', text: ' and ' },
+        { type: 'mention', userId: '222', username: 'carol', domain: 'discord.com' },
+        { type: 'mention', userId: '222', username: 'carol', domain: 'discord.com' },
+        { type: 'mention', userId: 'not-a-snowflake', username: 'x', domain: 'discord.com' },
       ],
-    }, cache)
-    expect(out).toBe('ping <@222> now')
+    })
+    expect(r.content).toBe('ping @Carol@har.mony.lol and <@222><@222>@x@discord.com')
+    expect(r.mentionUserIds).toEqual(['222'])
+  })
+
+  it('caps allowed mention users at 100', () => {
+    const content_raw = Array.from({ length: 120 }, (_, i) => ({ type: 'mention', userId: String(1000 + i), username: `u${i}`, domain: 'discord.com' }))
+    expect(translator().renderHarmonyForDiscord({ content_raw }).mentionUserIds).toHaveLength(100)
+  })
+
+  it('maps role and channel mentions to Discord, else plain names', () => {
+    const ctx = {
+      discordRoleFor: (id: string) => (id === 'hr-mod' ? '555' : undefined),
+      discordChannelFor: (id: string) => (id === 'hc-general' ? '777' : null),
+    }
+    const out = translator().harmonyToDiscord({
+      content_raw: [
+        { type: 'role_mention', roleId: 'hr-mod', roleName: 'Mods', roleColor: null },
+        { type: 'text', text: ' ' },
+        { type: 'role_mention', roleId: 'hr-other', roleName: 'Artists', roleColor: null },
+        { type: 'text', text: ' see ' },
+        { type: 'channel_mention', channelId: 'hc-general', serverId: 's', name: 'general' },
+        { type: 'text', text: ' or ' },
+        { type: 'channel_mention', channelId: 'hc-x', serverId: 's', name: 'random' },
+      ],
+    }, ctx)
+    expect(out).toBe('<@&555> @Artists see <#777> or #random')
+  })
+
+  it('suppresses embeds only when every link asked for no preview', () => {
+    const t = translator()
+    const quiet = t.renderHarmonyForDiscord({ content_raw: [{ type: 'text', text: 'see ' }, { type: 'url', url: 'https://x.example', preview: false }] })
+    expect(quiet).toMatchObject({ content: 'see <https://x.example>', suppressEmbeds: true })
+    const mixed = t.renderHarmonyForDiscord({ content_raw: [
+      { type: 'url', url: 'https://x.example', preview: false },
+      { type: 'text', text: ' and ' },
+      { type: 'url', url: 'https://y.example', preview: true },
+    ] })
+    expect(mixed).toMatchObject({ content: '<https://x.example> and https://y.example', suppressEmbeds: false })
+    expect(t.renderHarmonyForDiscord({ content_raw: [{ type: 'text', text: 'plain' }] }).suppressEmbeds).toBe(false)
+  })
+
+  it('renders Harmony custom emoji as application emoji when mapped, else :name:', () => {
+    const apps: Record<string, { id: string; name: string; animated: boolean }> = {
+      'e-1': { id: '901', name: 'party_abc123', animated: true },
+    }
+    const out = translator().harmonyToDiscord({
+      content_raw: [
+        { type: 'emoji', emoji: { id: 'e-1', name: 'party', url: 'https://h.example/e1.gif' } },
+        { type: 'emoji', emoji: { id: 'e-2', name: 'blob', url: 'https://h.example/e2.png' } },
+      ],
+    }, { appEmojiFor: (e: any) => apps[e.id] ?? null })
+    expect(out).toBe('<a:party_abc123:901>:blob:')
   })
 
   it('keeps a "Something: text" first line', () => {
@@ -50,17 +103,30 @@ describe('MessageTranslator.harmonyToDiscord', () => {
     expect(out.length).toBeGreaterThan(2000)
   })
 
-  it('puts attachments on their own lines and separates glued URLs', () => {
+  it('renders files as masked links without a preview, never the bare signed URL', () => {
+    const signed = 'https://h.example/storage/v1/object/sign/message_media/c/ch/u/a.png?token=abc.def'
     const out = translator().harmonyToDiscord({
       content_raw: [
         { type: 'text', text: 'look' },
-        { type: 'file', url: 'https://cdn.example/a.png' },
-        { type: 'file', url: 'https://cdn.example/b.png' },
+        { type: 'file', url: signed, path: 'c/ch/u/a.png', fileName: 'holiday [1].png', fileSize: 44_040_192, fileType: 'image' },
+        { type: 'file', url: 'https://cdn.example/b.pdf' },
         { type: 'url', url: 'https://x.example/page' },
         { type: 'url', url: 'https://y.example/' },
       ],
     })
-    expect(out).toBe('look\nhttps://cdn.example/a.png\nhttps://cdn.example/b.png\nhttps://x.example/page https://y.example/')
+    expect(out).toBe(`look\n[holiday \\[1\\].png · 42 MB](<${signed}>)\n[b.pdf](<https://cdn.example/b.pdf>)\nhttps://x.example/page https://y.example/`)
+    expect(out).not.toMatch(/(^|\s)https:\/\/h\.example/)
+  })
+
+  it('leaves uploaded files out of the text and keeps the caption', () => {
+    const out = translator().renderHarmonyForDiscord({
+      content_raw: [
+        { type: 'text', text: 'my cat' },
+        { type: 'file', url: 'https://h.example/storage/v1/object/sign/message_media/c/1/u/cat.jpg?token=t2', path: 'c/1/u/cat.jpg', fileType: 'image' },
+        { type: 'file', url: 'https://h.example/storage/v1/object/sign/message_media/c/1/u/big.mp4?token=t3', path: 'c/1/u/big.mp4', fileName: 'big.mp4', fileType: 'video' },
+      ],
+    }, { uploadedFiles: new Set(['c/1/u/cat.jpg']) })
+    expect(out.content).toBe('my cat\n[big.mp4](<https://h.example/storage/v1/object/sign/message_media/c/1/u/big.mp4?token=t3>)')
   })
 
   it('joins url parts with prose without inventing spaces', () => {
@@ -141,5 +207,120 @@ describe('splitDiscordContent', () => {
   it('hard-splits a single unbroken run', () => {
     const chunks = splitDiscordContent('z'.repeat(4500))
     expect(chunks.map(c => c.length)).toEqual([1996, 1996, 508])
+  })
+})
+
+function discordMessage(over: Record<string, unknown> = {}) {
+  return {
+    id: 'dm-1',
+    channelId: 'dc-1',
+    content: '',
+    mentions: { users: new Map(), roles: new Map(), channels: new Map() },
+    guild: { members: { cache: new Map() }, roles: { cache: new Map() }, channels: { cache: new Map() } },
+    attachments: new Map(),
+    stickers: new Map(),
+    embeds: [],
+    flags: { has: () => false },
+    reference: null,
+    messageSnapshots: new Map(),
+    ...over,
+  }
+}
+
+describe('MessageTranslator.discordToHarmonyParts', () => {
+  const ctx = {
+    harmonyRoleFor: (id: string) => (id === '555' ? 'hr-mod' : undefined),
+    harmonyChannelFor: (id: string) => (id === '777' ? { id: 'hc-general', serverId: 's-1', name: 'general' } : null),
+  }
+
+  it('turns mapped role and paired channel mentions into Harmony parts, others into plain names', () => {
+    const msg = discordMessage({
+      content: '<@&555> <@&556> in <#777> and <#778>',
+      mentions: {
+        users: new Map(),
+        roles: new Map([['555', { name: 'Mods', hexColor: '#ff0000' }], ['556', { name: 'Artists', hexColor: '#000000' }]]),
+        channels: new Map([['777', { name: 'general-dc' }], ['778', { name: 'offtopic' }]]),
+      },
+    })
+    expect(translator().discordToHarmonyParts(msg, ctx)).toEqual([
+      { type: 'role_mention', roleId: 'hr-mod', roleName: 'Mods', roleColor: '#ff0000' },
+      { type: 'text', text: ' ' },
+      { type: 'text', text: '@Artists' },
+      { type: 'text', text: ' in ' },
+      { type: 'channel_mention', channelId: 'hc-general', serverId: 's-1', name: 'general' },
+      { type: 'text', text: ' and ' },
+      { type: 'text', text: '#offtopic' },
+    ])
+  })
+
+  it('keeps a mapped role as text when Discord did not ping it', () => {
+    const msg = discordMessage({
+      content: '<@&555>',
+      guild: { members: { cache: new Map() }, roles: { cache: new Map([['555', { name: 'Mods', hexColor: '#ff0000' }]]) }, channels: { cache: new Map() } },
+    })
+    expect(translator().discordToHarmonyParts(msg, ctx)).toEqual([{ type: 'text', text: '@Mods' }])
+  })
+
+  it('treats @word as a mention only at a word boundary, never inside an email or URL', () => {
+    const t = translator()
+    t.setHarmonyMemberLookup((username) => (username === 'bob' ? { id: 'h-bob', username: 'bob', displayName: 'Bob', domain: null, isLocal: true } : null))
+    const parts = t.discordToHarmonyParts(discordMessage({ content: 'mail bob@example.com or (@bob), @alice@mastodon.social, @everyone' }))
+    const mentions = parts.filter((p: any) => p.type === 'mention')
+    expect(mentions.map((m: any) => [m.username, m.domain])).toEqual([['bob', 'har.mony.lol'], ['alice', 'mastodon.social']])
+    expect(parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('')).toContain('mail bob@example.com or (')
+    expect(parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('')).toContain('@everyone')
+
+    const url = t.discordToHarmonyParts(discordMessage({ content: 'see https://mastodon.social/@bob/123' }))
+    expect(url.some((p: any) => p.type === 'mention')).toBe(false)
+  })
+
+  it('marks voice messages and audio attachments as audio', () => {
+    const voice = translator().discordToHarmonyParts(discordMessage({
+      flags: { has: (bit: number) => bit === 1 << 13 },
+      attachments: new Map([['a1', { id: 'a1', name: 'voice-message.ogg', contentType: 'audio/ogg', url: 'https://cdn.discordapp.com/v.ogg', size: 5000 }]]),
+    }))
+    expect(voice).toEqual([expect.objectContaining({ type: 'file', fileType: 'audio', fileSize: 5000, fileName: 'voice-message.ogg' })])
+
+    const mp3 = translator().discordToHarmonyParts(discordMessage({
+      attachments: new Map([['a2', { id: 'a2', name: 'song.mp3', contentType: null, url: 'https://cdn.discordapp.com/song.mp3' }]]),
+    }))
+    expect(mp3[0]).toMatchObject({ type: 'file', fileType: 'audio' })
+  })
+
+  it('bridges image stickers as files and Lottie stickers as text', () => {
+    const parts = translator().discordToHarmonyParts(discordMessage({
+      content: 'hi',
+      stickers: new Map([
+        ['s1', { id: 's1', name: 'wave', format: 1 }],
+        ['s2', { id: 's2', name: 'dance', format: 4 }],
+        ['s3', { id: 's3', name: 'lottie', format: 3 }],
+      ]),
+    }))
+    expect(parts).toEqual([
+      { type: 'text', text: 'hi' },
+      { type: 'file', url: 'https://media.discordapp.net/stickers/s1.png', fileName: 'wave.png', fileType: 'image' },
+      { type: 'file', url: 'https://media.discordapp.net/stickers/s2.gif', fileName: 'dance.gif', fileType: 'image' },
+      { type: 'text', text: '\n[sticker: lottie]' },
+    ])
+  })
+
+  it('bridges a forward as an italic header, the snapshot text and its attachments', () => {
+    const snapshot = discordMessage({
+      id: 'orig-1',
+      content: 'look at this',
+      attachments: new Map([['a1', { id: 'a1', name: 'pic.png', contentType: 'image/png', url: 'https://cdn.discordapp.com/pic.png' }]]),
+    })
+    const parts = translator().discordToHarmonyParts(discordMessage({
+      reference: { type: 1, messageId: 'orig-1', channelId: 'other' },
+      messageSnapshots: new Map([['orig-1', snapshot]]),
+    }))
+    expect(parts[0]).toEqual({ type: 'text', text: '*↪ Forwarded*\n' })
+    expect(parts[1]).toEqual({ type: 'text', text: 'look at this' })
+    expect(parts[2]).toMatchObject({ type: 'file', fileType: 'image', bridgeRef: { discordMessageId: 'dm-1', discordChannelId: 'dc-1' } })
+  })
+
+  it('keeps a reply reference out of the forward path', () => {
+    const parts = translator().discordToHarmonyParts(discordMessage({ content: 'yes', reference: { type: 0, messageId: 'x' } }))
+    expect(parts).toEqual([{ type: 'text', text: 'yes' }])
   })
 })

@@ -121,13 +121,14 @@ describe('SharedDiscordClient routing', () => {
     client.emit(Events.PresenceUpdate, null, { guild: { id: 'gA' } })
     client.emit(Events.InteractionCreate, { guildId: 'gB' })
     client.emit(Events.ChannelUpdate, {}, { guildId: 'gA' })
+    client.emit(Events.MessageBulkDelete, new Collection(), { id: 'cB', guildId: 'gB' })
     // Unlinked guild and DM: nobody.
     client.emit(Events.MessageCreate, { guildId: 'gOther', channelId: 'cX' })
     client.emit(Events.MessageCreate, { guildId: null, channelId: 'dm' })
     client.emit(Events.InteractionCreate, { guildId: null })
 
     expect(a.received.map(([e]) => e)).toEqual([Events.MessageCreate, Events.PresenceUpdate, Events.ChannelUpdate])
-    expect(b.received.map(([e]) => e)).toEqual([Events.MessageReactionAdd, Events.GuildMemberAdd, Events.InteractionCreate])
+    expect(b.received.map(([e]) => e)).toEqual([Events.MessageReactionAdd, Events.GuildMemberAdd, Events.InteractionCreate, Events.MessageBulkDelete])
     expect((a.received[0][1][0] as any).guildId).toBe('gA')
     await shared.stop()
   })

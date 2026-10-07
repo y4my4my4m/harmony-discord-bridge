@@ -16,6 +16,7 @@ services:
       HARMONY_SETUP_CODE: "HB-XXXX-XXXX-XXXX"
       DISCORD_TOKEN: "paste-your-discord-bot-token-here"
       # LOG_LEVEL: "info"   # error | warn | info | debug (debug prints message contents)
+      # MAX_UPLOAD_MB: "8"   # files up to this size per message are uploaded to Discord; larger ones become links
     volumes:
       - harmony-bridge:/data
 

@@ -40,6 +40,8 @@ export interface V2BridgeOptions {
   sharedDiscord?: SharedDiscordClient
   /** Directory for permission-sync.yml. */
   dataDir: string
+  /** Directory of application emoji maps, shared by bridges of one application; default `<dataDir>/app-emojis`. */
+  appEmojiDir?: string
   log: Logger
   version: string
   /** Log line for a Harmony token rejection. */
@@ -196,6 +198,7 @@ export class V2Bridge {
         baseUrl,
       },
       permissionStorePath: join(this.opts.dataDir, 'permission-sync.yml'),
+      appEmojiDir: this.opts.appEmojiDir ?? join(this.opts.dataDir, 'app-emojis'),
       log: this.log,
       fetchImpl: this.opts.fetchImpl,
       hooks: {

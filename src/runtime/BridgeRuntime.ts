@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events'
+import { join } from 'path'
 import {
   Client as DiscordClient,
   Message as DiscordMessage,
@@ -7,19 +8,29 @@ import {
   GuildMember,
   Events,
   type Guild,
+  MessageFlags,
   PermissionFlagsBits,
+  Routes,
   type APIEmbed,
   type ClientOptions,
   type Interaction,
   type MessageReaction,
   type PartialMessageReaction,
   type Presence,
+  type ReadonlyCollection,
   type User,
   type PartialUser,
   type PartialMessage,
 } from 'discord.js'
-import { HarmonyClient, HarmonyHttpError } from '../HarmonyClient.js'
-import { MessageTranslator } from '../MessageTranslator.js'
+import { HarmonyClient, HarmonyHttpError, isAutomodBlocked } from '../HarmonyClient.js'
+import {
+  MessageTranslator,
+  collectHarmonyCustomEmoji,
+  collectHarmonyFiles,
+  type DiscordRendering,
+  type DiscordToHarmonyContext,
+  type HarmonyToDiscordContext,
+} from '../MessageTranslator.js'
 import { PermissionSync } from '../PermissionSync.js'
 import { PermissionSyncStore } from '../PermissionSyncStore.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
@@ -37,7 +48,13 @@ import { buildHarmonyInviteDiscordEmbeds } from '../utils/harmonyInviteEmbeds.js
 import { shouldBridgeHarmonyMessageToDiscord } from '../utils/harmonyMessageFilter.js'
 import { buildDiscordUserMetadata } from '../utils/discordUserMetadata.js'
 import { buildDiscordReactionPayload, mergeReactionMetadata } from '../utils/discordReaction.js'
-import { formatHarmonyDisplayNameForDiscord } from '../utils/discordDisplayName.js'
+import {
+  botPostPrefix,
+  formatHarmonyDisplayNameForDiscord,
+  harmonyAuthorName,
+  sanitizeWebhookUsername,
+} from '../utils/discordDisplayName.js'
+import { isPublicHttpsUrl } from '../utils/fetchCapped.js'
 import { loadInstanceIcon } from '../utils/instanceIcon.js'
 import { ReactionLedger } from '../utils/reactionLedger.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
@@ -60,6 +77,15 @@ import {
   type MappedPresence,
 } from './presenceDeltas.js'
 import { handleInteraction, registerSlashCommands } from './commands.js'
+import { DiscordAuthorLimiter } from './antiSpam.js'
+import { AppEmojiStore, loadEmojiImage, type AppEmoji, type AppEmojiIO } from './appEmojis.js'
+import {
+  OutboundMedia,
+  guildUploadLimit,
+  mediaOptionsFromEnv,
+  type MediaOptions,
+  type PreparedUpload,
+} from './outboundMedia.js'
 
 export type { DiscordConnState } from './discordConnection.js'
 
@@ -132,8 +158,12 @@ export interface BridgeRuntimeOptions {
   createDiscordClient?: (options: ClientOptions) => DiscordClient
   /** Instance bot: events of the linked guild come from this client; `discordToken` is unused. */
   sharedDiscord?: SharedDiscordClient
-  /** BRIDGE_PRESENCE_UPDATE flush interval. */
+  /** BRIDGE_PRESENCE_UPDATE flush interval; never below 5 s. */
   presenceFlushMs?: number
+  /** Upload budget and media origin; default from MAX_UPLOAD_MB and HARMONY_MEDIA_ORIGIN. */
+  media?: MediaOptions
+  /** Directory of application emoji maps (`<application id>.json`); null keeps them in memory. */
+  appEmojiDir?: string | null
 }
 
 /** Where guild events and REST rate-limit events arrive from. */
@@ -152,13 +182,75 @@ const HARMONY_USER_CACHE_REFRESH_MS = 5 * 60 * 1000
 const RATE_LIMIT_PROBLEM_MS = 5 * 60 * 1000
 /** A Discord REST wait longer than this counts as rate limiting worth reporting. */
 const DISCORD_LONG_RATE_LIMIT_MS = 10_000
+/** REGISTER_BRIDGE_DATA (op 6) at most this often; the gateway allows 120 frames per 60 s. */
+const REGISTER_MIN_INTERVAL_MS = 5_000
+/** BRIDGE_PRESENCE_UPDATE (op 7) at most this often. */
+const PRESENCE_MIN_INTERVAL_MS = 5_000
+/** Application emoji uploads wait this long before a message goes out with `:name:` text. */
+const APP_EMOJI_WAIT_MS = 4_000
+/** Distinct custom emoji per message considered for upload. */
+const APP_EMOJI_PER_MESSAGE = 10
+/** Harmony emoji rows cached this long; a missing row is asked again after MISS_TTL. */
+const HARMONY_EMOJI_TTL_MS = 60 * 60 * 1000
+const HARMONY_EMOJI_MISS_TTL_MS = 10 * 60 * 1000
+/** Spam drops are logged at the first and then every this many. */
+const SPAM_LOG_EVERY = 50
 
-function memberCacheKey(guildId: string, username: string): string {
-  return `${guildId}:${username.toLowerCase()}`
+/** Discord REST error codes. */
+const DISCORD_UNKNOWN_WEBHOOK = 10015
+const DISCORD_UNKNOWN_MESSAGE = 10008
+const DISCORD_UNKNOWN_EMOJI = 10014
+const DISCORD_MISSING_PERMISSIONS = 50013
+const DISCORD_ENTITY_TOO_LARGE = 40005
+/** Discord MessageReferenceType.Forward. */
+const REFERENCE_FORWARD = 1
+
+function discordCode(err: unknown): number | undefined {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === 'number' ? code : undefined
 }
 
 function isMissingPermission(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && 'code' in err && (err as { code: number }).code === 50013
+  return discordCode(err) === DISCORD_MISSING_PERMISSIONS
+}
+
+function isTooLarge(err: unknown): boolean {
+  return discordCode(err) === DISCORD_ENTITY_TOO_LARGE || (err as { status?: number } | null)?.status === 413
+}
+
+/** A send that failed after posting some chunks; those ids are known so they can be removed. */
+class PartialSendError extends Error {
+  constructor(readonly failure: unknown, readonly sentIds: string[]) {
+    super(errorText(failure))
+  }
+}
+
+function unwrapSend(err: unknown): { failure: unknown; sentIds: string[] } {
+  return err instanceof PartialSendError ? { failure: err.failure, sentIds: err.sentIds } : { failure: err, sentIds: [] }
+}
+
+/** One rendering of a Harmony message for Discord: text, attachments, flags. */
+interface OutboundVariant {
+  content: string
+  files: PreparedUpload[]
+  suppressEmbeds: boolean
+}
+
+interface Outbound {
+  /** Puppet name before webhook sanitising. */
+  username: string
+  avatarURL?: string
+  mentionUserIds: string[]
+  embeds?: APIEmbed[]
+  primary: OutboundVariant
+  /** Same message with every file as a link; null when `primary` has no attachments. */
+  linksOnly: OutboundVariant | null
+}
+
+interface Delivery {
+  discordMessageIds: string[]
+  viaWebhook: boolean
+  uploadedKeys: string[]
 }
 
 function isRateLimitError(err: unknown): boolean {
@@ -204,12 +296,28 @@ export class BridgeRuntime {
   private readonly harmonyDiscordViaWebhook = new BoundedMap<string, boolean>(MESSAGE_MAPPING_CAP)
   /** Harmony message id → every Discord message id of a split message. */
   private readonly harmonyDiscordChunks = new BoundedMap<string, string[]>(MESSAGE_MAPPING_CAP)
+  /** Harmony message id → harmonyFileKey of files sent as Discord attachments. */
+  private readonly harmonyDiscordUploads = new BoundedMap<string, string[]>(MESSAGE_MAPPING_CAP)
+  /** Discord ids of copies of Harmony messages: a Discord delete of one is not mirrored to Harmony. */
+  private readonly harmonyOriginCopies = new BoundedMap<string, true>(MESSAGE_MAPPING_CAP)
+  /** Discord ids whose Harmony copy the bridge deleted; Harmony's MESSAGE_DELETE for them is an echo. */
+  private readonly deletedFromDiscord = new BoundedMap<string, true>(10_000)
   private readonly webhookCache = new Map<string, Webhook>()
   private readonly webhookPermissionWarned = new Set<string>()
+  private readonly manageMessagesWarned = new Set<string>()
   private instanceIcon: Promise<Buffer | null> | null = null
 
-  /** lowercase `guildId:username` → Discord user id, for mention lookups. */
-  private readonly discordMemberCache = new Map<string, string>()
+  readonly antiSpam = new DiscordAuthorLimiter()
+  readonly media: OutboundMedia
+  /** Guild id → upload limit learned from a 40005 rejection. */
+  private readonly learnedUploadLimit = new Map<string, number>()
+  private readonly appEmojiDir: string | null
+  private readonly appEmojiStores = new Map<string, AppEmojiStore>()
+  /** Harmony emoji id → row (null: not found), with fetch time. */
+  private readonly harmonyEmojiRows = new BoundedMap<string, { row: { name: string; url: string } | null; at: number }>(5_000)
+  private registerTimer: NodeJS.Timeout | null = null
+  private lastRegisterAt = -Infinity
+
   private readonly discordMemberDetails = new Map<string, CachedDiscordMember>()
   private readonly harmonyUserCacheByServer = new Map<string, Map<string, CachedHarmonyUser>>()
   private harmonyUserCacheTimer: NodeJS.Timeout | null = null
@@ -229,6 +337,8 @@ export class BridgeRuntime {
   private readonly reactionLedger = new ReactionLedger()
 
   private droppedMessages = 0
+  /** Discord messages Harmony's AutoMod refused since start. */
+  automodBlocked = 0
   private rateLimitedUntil = 0
 
   constructor(opts: BridgeRuntimeOptions) {
@@ -258,8 +368,10 @@ export class BridgeRuntime {
     this.permissionSync = new PermissionSync(this.harmony, this.dir, this.permissionSyncStore, this.log)
     this.presenceDeltas = new PresenceDeltaQueue(
       updates => this.harmony.sendPresenceUpdates(updates),
-      opts.presenceFlushMs,
+      Math.max(PRESENCE_MIN_INTERVAL_MS, opts.presenceFlushMs ?? PRESENCE_MIN_INTERVAL_MS),
     )
+    this.media = new OutboundMedia(this.harmonyBaseUrl.href, opts.media ?? mediaOptionsFromEnv(process.env, this.log), opts.fetchImpl)
+    this.appEmojiDir = opts.appEmojiDir ?? null
 
     this.shared = opts.sharedDiscord ?? null
     if (this.shared) {
@@ -325,6 +437,11 @@ export class BridgeRuntime {
       clearInterval(this.harmonyUserCacheTimer)
       this.harmonyUserCacheTimer = null
     }
+    if (this.registerTimer) {
+      clearTimeout(this.registerTimer)
+      this.registerTimer = null
+    }
+    for (const store of this.appEmojiStores.values()) store.flush()
     this.presenceDeltas.stop()
     if (this.connection) {
       await this.connection.stop()
@@ -512,6 +629,9 @@ export class BridgeRuntime {
       if (current()) void this.onDiscordMessageUpdate(msg)
     })
     events.on(Events.MessageDelete, (msg: DiscordMessage | PartialMessage) => { if (current()) void this.onDiscordMessageDelete(msg) })
+    events.on(Events.MessageBulkDelete, (messages: ReadonlyCollection<string, DiscordMessage | PartialMessage>) => {
+      if (current()) void this.onDiscordMessageBulkDelete(Array.from(messages.values()))
+    })
 
     events.on(Events.GuildMemberAdd, (member: GuildMember) => {
       if (!current() || member.user.bot || !this.settings().syncMemberList) return
@@ -523,7 +643,7 @@ export class BridgeRuntime {
 
     events.on(Events.GuildMemberRemove, (member: GuildMember) => {
       if (!current()) return
-      this.uncacheMemberById(member.id, member.user.username)
+      this.discordMemberDetails.delete(member.id)
       this.log.debug(`Member cache: removed ${member.id}`)
       this.registerBridgeDataWithGateway()
     })
@@ -538,15 +658,13 @@ export class BridgeRuntime {
       const profileChanged =
         oldMember.user.username !== newMember.user.username
         || oldMember.displayName !== newMember.displayName
+        || oldMember.avatar !== newMember.avatar
         || oldMember.user.avatar !== newMember.user.avatar
         || oldMember.user.banner !== newMember.user.banner
         || oldMember.user.hexAccentColor !== newMember.user.hexAccentColor
 
       if (!rolesChanged && !profileChanged) return
 
-      if (oldMember.user.username !== newMember.user.username) {
-        this.uncacheMemberById(oldMember.id, oldMember.user.username)
-      }
       this.cacheMember(newMember)
       this.registerBridgeDataWithGateway()
     })
@@ -716,7 +834,6 @@ export class BridgeRuntime {
       const settings = this.settings()
       if (!settings.syncMemberList && this.discordMemberDetails.size > 0) {
         this.discordMemberDetails.clear()
-        this.discordMemberCache.clear()
         this.memberListKey = null
       }
       if (!settings.syncPermissions) this.permissionSync.detach()
@@ -762,14 +879,27 @@ export class BridgeRuntime {
         let restored = 0
         for (const m of recent) {
           if (m.metadata?.discord_message_id && m.id) {
-            this.discordToHarmonyMessages.set(m.metadata.discord_message_id, m.id)
-            this.harmonyToDiscordMessages.set(m.id, m.metadata.discord_message_id)
+            this.rememberMapping(m)
             restored++
           }
         }
         if (restored > 0) this.log.info(`Restored ${restored} message mappings for Harmony channel ${channelId}`)
       } catch (err) {
         this.log.error(`Failed to restore mappings for ${channelId}: ${errorText(err)}`)
+      }
+    }
+  }
+
+  /** Records the Discord ids a Harmony message's metadata names. */
+  private rememberMapping(m: { id: string; metadata?: any }) {
+    const discordId = String(m.metadata.discord_message_id)
+    this.discordToHarmonyMessages.set(discordId, m.id)
+    this.harmonyToDiscordMessages.set(m.id, discordId)
+    if (m.metadata.bridge_source === 'harmony') {
+      const ids: string[] = Array.isArray(m.metadata.discord_message_ids) ? m.metadata.discord_message_ids.map(String) : [discordId]
+      for (const id of ids) this.harmonyOriginCopies.set(id, true)
+      if (Array.isArray(m.metadata.discord_uploaded_files)) {
+        this.harmonyDiscordUploads.set(m.id, m.metadata.discord_uploaded_files.map(String))
       }
     }
   }
@@ -826,21 +956,8 @@ export class BridgeRuntime {
     this.presenceDeltas.push({ id: userId, ...next })
   }
 
-  getDiscordMemberCacheForGuild(guildId: string): Map<string, string> {
-    const scoped = new Map<string, string>()
-    const prefix = `${guildId}:`
-    for (const [key, value] of this.discordMemberCache.entries()) {
-      if (key.startsWith(prefix)) {
-        scoped.set(key.slice(prefix.length), value)
-      }
-    }
-    return scoped
-  }
-
   private cacheMember(member: GuildMember) {
     const guildId = member.guild.id
-    this.discordMemberCache.set(memberCacheKey(guildId, member.user.username), member.id)
-
     const { harmonyRoleIds, roles } = this.mapMemberRoles(member)
     const { presenceStatus, customStatus } = this.extractMemberPresence(member)
     const bannerUrl = member.user.bannerURL({ size: 512 }) ?? null
@@ -850,7 +967,8 @@ export class BridgeRuntime {
       id: member.id,
       username: member.user.username,
       displayName: member.displayName || member.user.username,
-      avatarUrl: member.user.displayAvatarURL({ size: 128 }),
+      // Server avatar, else the account avatar: the picture bridged messages carry.
+      avatarUrl: member.displayAvatarURL({ size: 128 }),
       bannerUrl,
       accentColor: member.user.hexAccentColor ?? null,
       harmonyRoleIds,
@@ -860,14 +978,6 @@ export class BridgeRuntime {
       presenceStatus,
       customStatus,
     })
-  }
-
-  private uncacheMemberById(memberId: string, username: string) {
-    const existing = this.discordMemberDetails.get(memberId)
-    if (existing) {
-      this.discordMemberCache.delete(memberCacheKey(existing.guildId, username))
-    }
-    this.discordMemberDetails.delete(memberId)
   }
 
   getCachedDiscordMember(memberId: string): CachedDiscordMember | undefined {
@@ -981,13 +1091,35 @@ export class BridgeRuntime {
   // REGISTER_BRIDGE_DATA
   // ===========================================================================
 
-  /** Sends pairs and Discord members to the gateway once both sides are ready. */
-  registerBridgeDataWithGateway() {
+  /**
+   * Sends pairs and Discord members to the gateway once both sides are ready,
+   * at most every 5 s; changes inside that interval go out together at its
+   * end. `immediate` is for a new gateway connection, which holds nothing yet.
+   */
+  registerBridgeDataWithGateway(opts: { immediate?: boolean } = {}) {
     if (!this.discordReady || !this.harmonyReady) {
       this.log.debug(`Bridge data registration waiting: Discord=${this.discordReady}, Harmony=${this.harmonyReady}`)
       return
     }
+    const wait = this.lastRegisterAt + REGISTER_MIN_INTERVAL_MS - Date.now()
+    if (!opts.immediate && wait > 0) {
+      if (!this.registerTimer) {
+        this.registerTimer = setTimeout(() => {
+          this.registerTimer = null
+          if (!this.stopped) this.registerBridgeDataWithGateway()
+        }, wait)
+      }
+      return
+    }
+    if (this.registerTimer) {
+      clearTimeout(this.registerTimer)
+      this.registerTimer = null
+    }
+    this.lastRegisterAt = Date.now()
+    this.sendRegistration()
+  }
 
+  private sendRegistration() {
     const syncMembers = this.settings().syncMemberList
     const channels = this.dir.getBridges().flatMap(bridge => {
       const members = !syncMembers ? [] : Array.from(this.discordMemberDetails.values())
@@ -1085,45 +1217,125 @@ export class BridgeRuntime {
     }
   }
 
+  /** Pings only the Discord users the message names; never roles, @everyone or @here. */
   private allowedMentions(mentionUserIds?: string[]) {
     return mentionUserIds && mentionUserIds.length > 0
-      ? { parse: [] as const, users: mentionUserIds }
+      ? { parse: [] as const, users: mentionUserIds.slice(0, 100) }
       : { parse: [] as const }
   }
 
-  /** Posts a Harmony message: webhook first (author name/avatar), else as the bot. */
-  private async sendHarmonyToDiscord(
-    channel: TextChannel,
-    opts: {
-      content: string
-      username: string
-      avatarURL?: string
-      mentionUserIds?: string[]
-      embeds?: APIEmbed[]
-    },
-  ): Promise<{ discordMessageIds: string[]; viaWebhook: boolean } | null> {
-    const me = channel.client.user
-    const webhook = await this.getOrCreateWebhook(channel.id)
-    const allowedMentions = this.allowedMentions(opts.mentionUserIds)
-    const embeds = opts.embeds?.length ? opts.embeds.slice(0, 10) : undefined
+  /**
+   * Webhook avatar_url for a Harmony avatar: absolute http(s) URLs as given,
+   * paths resolved against the Harmony base URL. Undefined when Discord
+   * cannot fetch it (loopback host, other schemes).
+   */
+  webhookAvatarUrl(avatar: unknown): string | undefined {
+    if (typeof avatar !== 'string' || !avatar.trim()) return undefined
+    let u: URL
+    try {
+      u = new URL(avatar.trim(), this.harmonyBaseUrl)
+    } catch {
+      return undefined
+    }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return undefined
+    const host = u.hostname.toLowerCase()
+    if (host === 'localhost' || host.endsWith('.localhost') || host === '127.0.0.1' || host === '[::1]') return undefined
+    return u.href
+  }
 
-    if (webhook) {
-      const chunks = splitDiscordContent(opts.content)
-      const ids: string[] = []
-      for (let i = 0; i < chunks.length; i++) {
-        const sent = await webhook.send({
-          content: chunks[i],
-          username: opts.username,
-          avatarURL: opts.avatarURL,
-          allowedMentions,
-          embeds: i === chunks.length - 1 ? embeds : undefined,
+  /** Attachment bytes per message: MAX_UPLOAD_MB, capped by the guild's limit. */
+  private uploadBudget(channel: TextChannel): number {
+    const guildLimit = this.learnedUploadLimit.get(channel.guildId) ?? guildUploadLimit(channel.guild?.premiumTier)
+    return Math.min(this.media.options.maxUploadBytes, guildLimit)
+  }
+
+  /** Discord refused `attempted` bytes (40005): later messages in the guild stay below it. */
+  private learnUploadLimit(guildId: string, attempted: number) {
+    const next = Math.max(0, attempted - 1)
+    if (next >= (this.learnedUploadLimit.get(guildId) ?? Infinity)) return
+    this.learnedUploadLimit.set(guildId, next)
+    this.log.warn(`Discord refused ${Math.round(attempted / 1024)} KiB of attachments in guild ${guildId}; larger files go as links`)
+  }
+
+  /** Sends `variant` in chunks of at most 2000 characters; attachments and embeds ride on the last chunk. */
+  private async postChunks(
+    variant: OutboundVariant,
+    opts: { prefix: string; embeds?: APIEmbed[]; send: (payload: any) => Promise<{ id?: string } | null | undefined> },
+  ): Promise<string[]> {
+    const chunks = splitDiscordContent(opts.prefix + variant.content)
+    const ids: string[] = []
+    for (let i = 0; i < chunks.length; i++) {
+      const last = i === chunks.length - 1
+      try {
+        const sent = await opts.send({
+          ...(chunks[i] ? { content: chunks[i] } : {}),
+          ...(last && variant.files.length > 0 ? { files: variant.files.map(f => ({ attachment: f.data, name: f.name })) } : {}),
+          ...(last && opts.embeds ? { embeds: opts.embeds } : {}),
+          ...(variant.suppressEmbeds && !opts.embeds ? { flags: MessageFlags.SuppressEmbeds } : {}),
         })
         if (sent?.id) ids.push(sent.id)
+      } catch (err) {
+        throw new PartialSendError(err, ids)
       }
-      if (ids.length === 0) return null
-      return { discordMessageIds: ids, viaWebhook: true }
+    }
+    return ids
+  }
+
+  /**
+   * Posts a Harmony message: webhook first (author name and avatar), else as
+   * the bot with a bold author prefix. A vanished webhook (10015) is created
+   * again once; any other webhook failure falls back to the bot. Attachments
+   * Discord refuses fall back to links.
+   */
+  private async sendHarmonyToDiscord(channel: TextChannel, out: Outbound): Promise<Delivery | null> {
+    const allowedMentions = this.allowedMentions(out.mentionUserIds)
+    const embeds = out.embeds?.length ? out.embeds.slice(0, 10) : undefined
+    let variant = out.primary
+    const switchToLinks = (failure: unknown): boolean => {
+      if (!out.linksOnly || variant === out.linksOnly) return false
+      if (isTooLarge(failure)) this.learnUploadLimit(channel.guildId, variant.files.reduce((n, f) => n + f.data.length, 0))
+      variant = out.linksOnly
+      return true
+    }
+    const delivered = (ids: string[], viaWebhook: boolean): Delivery =>
+      ({ discordMessageIds: ids, viaWebhook, uploadedKeys: variant.files.map(f => f.key) })
+
+    let webhook = await this.getOrCreateWebhook(channel.id)
+    let recreated = false
+    while (webhook) {
+      const hook: Webhook = webhook
+      try {
+        const ids = await this.postChunks(variant, {
+          prefix: '',
+          embeds,
+          send: payload => hook.send({
+            ...payload,
+            username: sanitizeWebhookUsername(out.username),
+            avatarURL: out.avatarURL,
+            allowedMentions,
+          }),
+        })
+        if (ids.length === 0) return null
+        return delivered(ids, true)
+      } catch (err) {
+        const { failure, sentIds } = unwrapSend(err)
+        for (const id of sentIds) await hook.deleteMessage(id).catch(() => {})
+        if (discordCode(failure) === DISCORD_UNKNOWN_WEBHOOK) {
+          this.webhookCache.delete(channel.id)
+          if (!recreated) {
+            recreated = true
+            this.log.info(`Webhook of channel ${channel.id} no longer exists; creating it again`)
+            webhook = await this.getOrCreateWebhook(channel.id)
+            continue
+          }
+        }
+        if (isTooLarge(failure) && switchToLinks(failure)) continue
+        this.log.warn(`Webhook post to channel ${channel.id} failed (${errorText(failure)}); posting as the bot`)
+        break
+      }
     }
 
+    const me = channel.client.user
     if (!me) {
       this.log.error('Discord client not ready')
       return null
@@ -1133,23 +1345,28 @@ export class BridgeRuntime {
       return null
     }
 
-    const chunks = splitDiscordContent(`**${opts.username}**: ${opts.content}`)
-    const ids: string[] = []
-    for (let i = 0; i < chunks.length; i++) {
-      const sent = await channel.send({
-        content: chunks[i],
-        allowedMentions,
-        embeds: i === chunks.length - 1 ? embeds : undefined,
-      })
-      ids.push(sent.id)
+    for (;;) {
+      try {
+        const ids = await this.postChunks(variant, {
+          prefix: botPostPrefix(out.username),
+          embeds,
+          send: payload => channel.send({ ...payload, allowedMentions }),
+        })
+        return delivered(ids, false)
+      } catch (err) {
+        const { failure, sentIds } = unwrapSend(err)
+        for (const id of sentIds) await channel.messages.delete(id).catch(() => {})
+        if (switchToLinks(failure)) continue
+        throw failure
+      }
     }
-    return { discordMessageIds: ids, viaWebhook: false }
   }
 
   /**
    * Edits a bridged message; returns the Discord ids now holding it. Bot posts
    * are the bot's own messages and need no extra permission. Webhook posts
    * need the webhook (Manage Webhooks); Discord offers no other way to edit them.
+   * Attachments stay: an edit without `attachments` keeps them.
    */
   private async editHarmonyOnDiscord(
     channel: TextChannel,
@@ -1175,7 +1392,7 @@ export class BridgeRuntime {
         } else {
           const sent = await webhook.send({
             content: chunks[i],
-            username: author.username,
+            username: sanitizeWebhookUsername(author.username),
             avatarURL: author.avatarURL,
             allowedMentions,
           })
@@ -1188,7 +1405,7 @@ export class BridgeRuntime {
       return ids
     }
 
-    const chunks = splitDiscordContent(`**${author.username}**: ${content}`)
+    const chunks = splitDiscordContent(`${botPostPrefix(author.username)}${content}`)
     const ids: string[] = []
     for (let i = 0; i < chunks.length; i++) {
       if (i < discordMessageIds.length) {
@@ -1261,8 +1478,115 @@ export class BridgeRuntime {
     return true
   }
 
+  /** A relay Harmony's AutoMod refused: counted, logged without content, not retried. */
+  noteAutomodBlock(channelId: string) {
+    this.automodBlocked++
+    const line = `Harmony AutoMod blocked a Discord message from channel ${channelId} (${this.automodBlocked} blocked since start)`
+    if (this.automodBlocked === 1 || this.automodBlocked % SPAM_LOG_EVERY === 0) this.log.warn(line)
+    else this.log.debug(line)
+  }
+
+  /** Anti-spam drop of a Discord message: counted, logged without content. */
+  noteSpamDrop(reason: 'rate' | 'duplicate', channelId: string) {
+    const { rate, duplicate } = this.antiSpam.dropped
+    const total = rate + duplicate
+    const line = `Anti-spam: dropped a Discord message in channel ${channelId} (${reason === 'rate' ? 'too many messages' : 'repeated content'}); ${rate} rate-limited and ${duplicate} repeated since start`
+    if (total === 1 || total % SPAM_LOG_EVERY === 0) this.log.warn(line)
+    else this.log.debug(line)
+  }
+
   // ===========================================================================
-  // Replies
+  // Application emojis (Harmony custom emoji on Discord)
+  // ===========================================================================
+
+  /** The application emoji map of the connected application and the REST calls for it. */
+  private appEmojiContext(): { store: AppEmojiStore; io: AppEmojiIO } | null {
+    const client = this.discord
+    const appId = client?.application?.id ?? this.application?.id
+    if (!client || !appId) return null
+    let store = this.appEmojiStores.get(appId)
+    if (!store) {
+      const path = this.appEmojiDir ? join(this.appEmojiDir, `${appId.replace(/[^0-9A-Za-z_-]/g, '_')}.json`) : null
+      store = AppEmojiStore.forPath(path, { log: this.log })
+      this.appEmojiStores.set(appId, store)
+    }
+    const rest = client.rest
+    const io: AppEmojiIO = {
+      api: {
+        list: async () => {
+          const res = await rest.get(Routes.applicationEmojis(appId)) as { items?: unknown } | unknown[]
+          return (Array.isArray(res) ? res : Array.isArray((res as { items?: unknown }).items) ? (res as { items: unknown[] }).items : []) as Array<{ id: string; name: string; animated?: boolean }>
+        },
+        create: async (name, image) =>
+          await rest.post(Routes.applicationEmojis(appId), { body: { name, image } }) as { id: string; name: string; animated?: boolean },
+        delete: async (id) => { await rest.delete(Routes.applicationEmoji(appId, id)) },
+      },
+      loadImage: (url) => loadEmojiImage(this.media.route(url), this.fetchImpl),
+    }
+    return { store, io }
+  }
+
+  /**
+   * Harmony emoji row by id (GET /emojis?id=), cached. Only a row whose id is
+   * the requested one counts: Harmony before 1.6.16 ignores `id` and answers
+   * every row.
+   */
+  private async harmonyEmojiRow(id: string): Promise<{ name: string; url: string } | null> {
+    const now = Date.now()
+    const cached = this.harmonyEmojiRows.get(id)
+    if (cached && now - cached.at < (cached.row ? HARMONY_EMOJI_TTL_MS : HARMONY_EMOJI_MISS_TTL_MS)) return cached.row
+    let rows: Array<{ id: string; name: string | null; url: string | null }>
+    try {
+      rows = await this.harmony.getEmojis(id)
+    } catch (err) {
+      this.log.debug(`Harmony emoji lookup failed: ${errorText(err)}`)
+      return cached?.row ?? null
+    }
+    const match = rows.find(r => r?.id === id && typeof r.url === 'string' && /^https?:\/\//.test(r.url))
+    const row = match ? { name: match.name || 'emoji', url: match.url! } : null
+    this.harmonyEmojiRows.set(id, { row, at: now })
+    return row
+  }
+
+  /**
+   * Discord emoji for a Harmony emoji row: a row holding a Discord CDN emoji
+   * is that emoji; any other image becomes an application emoji. Null when
+   * it cannot be uploaded.
+   */
+  private async appEmojiForRow(row: { name: string; url: string }): Promise<AppEmoji | null> {
+    const cdn = row.url.match(/^https:\/\/(?:cdn|media)\.discordapp\.(?:com|net)\/emojis\/(\d+)\.(png|gif|webp)/)
+    if (cdn) return { id: cdn[1], name: row.name.replace(/[^A-Za-z0-9_]/g, '_') || 'emoji', animated: cdn[2] === 'gif' }
+    if (!this.media.isFetchable(row.url) && !isPublicHttpsUrl(row.url)) return null
+    const ctx = this.appEmojiContext()
+    if (!ctx) return null
+    return ctx.store.resolve({ url: row.url, name: row.name }, ctx.io)
+  }
+
+  /**
+   * Application emoji of a Harmony message's custom emoji, by Harmony emoji
+   * id. Waits at most 4 s; uploads still running finish for later messages.
+   */
+  private async resolveAppEmojis(msg: any): Promise<Map<string, AppEmoji>> {
+    const found = new Map<string, AppEmoji>()
+    const wanted = collectHarmonyCustomEmoji(msg).slice(0, APP_EMOJI_PER_MESSAGE)
+    if (wanted.length === 0 || !this.appEmojiContext()) return found
+    const work = (async () => {
+      for (const emoji of wanted) {
+        const row = await this.harmonyEmojiRow(emoji.id)
+        if (!row) continue
+        const app = await this.appEmojiForRow(row).catch(() => null)
+        if (app) found.set(emoji.id, app)
+      }
+    })()
+    let timer: NodeJS.Timeout | undefined
+    const deadline = new Promise<void>(resolve => { timer = setTimeout(resolve, APP_EMOJI_WAIT_MS) })
+    await Promise.race([work, deadline])
+    clearTimeout(timer)
+    return new Map(found)
+  }
+
+  // ===========================================================================
+  // Replies and content
   // ===========================================================================
 
   /** Discord @mention for the parent author of a Harmony reply, unless already mentioned. */
@@ -1288,17 +1612,11 @@ export class BridgeRuntime {
       if (parent.metadata.discord_user.username) {
         usernames.push(parent.metadata.discord_user.username)
       }
-    } else if (parent?.author?.username) {
-      usernames.push(parent.author.username)
-      if (parent.author.display_name) usernames.push(parent.author.display_name)
-      const cached = this.discordMemberCache.get(memberCacheKey(discordChannel.guildId, parent.author.username))
-      if (cached) discordUserId = cached
-    }
-
-    if (!discordUserId) {
+    } else if (!parent) {
+      // Parent unknown to Harmony: the Discord message names its author.
       try {
         const dMsg = await discordChannel.messages.fetch(parentDiscordMessageId)
-        if (!dMsg.webhookId) {
+        if (!dMsg.webhookId && !dMsg.author.bot) {
           discordUserId = dMsg.author.id
           usernames.push(dMsg.author.username, dMsg.author.displayName ?? '')
         }
@@ -1316,27 +1634,46 @@ export class BridgeRuntime {
     return { mention: `<@${discordUserId}>`, userId: discordUserId }
   }
 
-  /** Discord content for a Harmony message, with jump-link + mention reply formatting. */
-  private async buildHarmonyOutboundDiscordContent(
+  /** Translation context for Harmony → Discord. */
+  private harmonyToDiscordContext(appEmoji: Map<string, AppEmoji>, uploaded?: ReadonlySet<string>): HarmonyToDiscordContext {
+    return {
+      discordRoleFor: id => this.permissionSyncStore.getDiscordRoleId(id),
+      discordChannelFor: id => this.dir.getDiscordChannel(id),
+      appEmojiFor: emoji => (typeof emoji?.id === 'string' ? appEmoji.get(emoji.id) : undefined) ?? null,
+      uploadedFiles: uploaded,
+    }
+  }
+
+  /** Translation context for Discord → Harmony. */
+  private discordToHarmonyContext(): DiscordToHarmonyContext {
+    return {
+      harmonyRoleFor: id => this.permissionSyncStore.getHarmonyRoleId(id),
+      harmonyChannelFor: id => {
+        for (const bridge of this.dir.getBridges()) {
+          const pair = bridge.channelMappings.find(m => m.discord === id)
+          if (pair) return { id: pair.harmony, serverId: bridge.harmonyServerId, name: pair.name ?? '' }
+        }
+        return null
+      },
+    }
+  }
+
+  /**
+   * Reply formatting of a Harmony reply: a jump link to the Discord parent and
+   * an @mention of its Discord author. Identity for anything else.
+   */
+  private async replyFormatting(
     msg: any,
     discordChannel: TextChannel,
-  ): Promise<{ content: string; mentionUserIds: string[] }> {
-    const contentText = this.translator.harmonyToDiscord(
-      msg,
-      this.getDiscordMemberCacheForGuild(discordChannel.guildId),
-    )
-    if (!contentText || contentText.trim() === '') {
-      return { content: contentText, mentionUserIds: [] }
-    }
-
-    if (!msg.reply_to || !discordChannel.guildId) {
-      return { content: contentText, mentionUserIds: [] }
-    }
+    content: string,
+  ): Promise<{ apply: (content: string) => string; userId: string | null }> {
+    const none = { apply: (c: string) => c, userId: null }
+    if (!msg.reply_to || !discordChannel.guildId) return none
 
     const parentDiscordId = await this.resolveParentDiscordId(msg.reply_to, msg.channel_id)
     if (!parentDiscordId) {
       this.log.debug(`Harmony reply parent ${msg.reply_to} has no Discord mapping; sending without reply link`)
-      return { content: contentText, mentionUserIds: [] }
+      return none
     }
 
     const jumpLink = buildDiscordJumpLink(discordChannel.guildId, discordChannel.id, parentDiscordId)
@@ -1344,14 +1681,10 @@ export class BridgeRuntime {
       msg.reply_to,
       parentDiscordId,
       discordChannel,
-      contentText,
+      content,
       msg.content_raw,
     )
-
-    return {
-      content: formatHarmonyReplyForDiscord(jumpLink, mention, contentText),
-      mentionUserIds: userId ? [userId] : [],
-    }
+    return { apply: (c: string) => formatHarmonyReplyForDiscord(jumpLink, mention, c), userId }
   }
 
   /** Harmony reply parent → Discord message id (memory, then metadata, then recent scan). */
@@ -1363,9 +1696,8 @@ export class BridgeRuntime {
       const parent = await this.harmony.getMessage(harmonyReplyToId)
       const discordId = parent?.metadata?.discord_message_id
       if (discordId && parent?.id) {
-        this.discordToHarmonyMessages.set(discordId, parent.id)
-        this.harmonyToDiscordMessages.set(parent.id, discordId)
-        return discordId
+        this.rememberMapping(parent)
+        return String(discordId)
       }
     } catch (err) {
       this.log.debug(`getMessage failed for reply parent ${harmonyReplyToId}: ${errorText(err)}`)
@@ -1375,10 +1707,8 @@ export class BridgeRuntime {
       const recent = await this.harmony.loadRecentMessages(harmonyChannelId, 100)
       const found = recent.find(m => m.id === harmonyReplyToId && m.metadata?.discord_message_id)
       if (found?.metadata?.discord_message_id) {
-        const discordId = found.metadata.discord_message_id
-        this.discordToHarmonyMessages.set(discordId, found.id)
-        this.harmonyToDiscordMessages.set(found.id, discordId)
-        return discordId
+        this.rememberMapping(found)
+        return String(found.metadata.discord_message_id)
       }
     } catch (err) {
       this.log.debug(`Recent message scan failed for reply parent ${harmonyReplyToId}: ${errorText(err)}`)
@@ -1420,16 +1750,18 @@ export class BridgeRuntime {
 
   /**
    * Harmony reply_to from a Discord reply (native reference or jump-link
-   * prefix); strips the bridge's reply formatting from the content.
+   * prefix); strips the bridge's reply formatting from the content. A
+   * forward's reference names the forwarded message, not a parent.
    */
   private async resolveDiscordReplyToHarmony(
     msg: DiscordMessage,
     harmonyChannelId: string,
   ): Promise<{ replyTo: string | null; cleanedContent: string }> {
     let content = msg.content ?? ''
-    let discordParentId = msg.reference?.messageId ?? null
+    const isForward = msg.reference?.type === REFERENCE_FORWARD
+    let discordParentId = isForward ? null : (msg.reference?.messageId ?? null)
 
-    if (!discordParentId) {
+    if (!discordParentId && !isForward) {
       const parsed = parseDiscordJumpLink(content)
       if (parsed) {
         discordParentId = parsed.messageId
@@ -1461,6 +1793,15 @@ export class BridgeRuntime {
   // Discord → Harmony
   // ===========================================================================
 
+  /** Anti-spam identity of a Discord message: text plus attachments, stickers and forwarded content. */
+  private static spamKey(msg: DiscordMessage): string {
+    const extras: string[] = []
+    for (const a of msg.attachments?.values() ?? []) extras.push(`a:${a.name}:${a.size}`)
+    for (const s of msg.stickers?.values() ?? []) extras.push(`s:${s.id}`)
+    for (const f of msg.messageSnapshots?.values() ?? []) extras.push(`f:${f.content ?? ''}:${f.attachments?.size ?? 0}`)
+    return DiscordAuthorLimiter.contentKey(msg.content ?? '', extras)
+  }
+
   private async onDiscordMessage(msg: DiscordMessage) {
     if (msg.author.bot) return
 
@@ -1478,8 +1819,15 @@ export class BridgeRuntime {
     if (!this.dir.shouldBridgeFromDiscord(msg.channelId)) return
 
     // Without the Message Content intent Discord delivers empty messages.
-    if (!this.intentSelection?.active.message_content && !msg.content && msg.attachments.size === 0) {
+    const hasBody = !!msg.content || msg.attachments.size > 0 || (msg.stickers?.size ?? 0) > 0 || (msg.messageSnapshots?.size ?? 0) > 0
+    if (!this.intentSelection?.active.message_content && !hasBody) {
       this.log.debug(`Skipping Discord message ${msg.id}: no content (Message Content Intent off)`)
+      return
+    }
+
+    const verdict = this.antiSpam.check(msg.author.id, msg.channelId, BridgeRuntime.spamKey(msg))
+    if (verdict !== 'ok') {
+      this.noteSpamDrop(verdict, msg.channelId)
       return
     }
 
@@ -1494,10 +1842,11 @@ export class BridgeRuntime {
       }
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
-      const contentParts = this.translator.discordToHarmonyParts({
-        ...msg,
-        content: cleanedContent,
-      })
+      const contentParts = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(), { content: cleanedContent })
+      if (contentParts.length === 0) {
+        this.log.debug(`Discord message ${msg.id} has nothing to bridge`)
+        return
+      }
 
       const metadata = {
         ...buildDiscordUserMetadata(
@@ -1521,22 +1870,26 @@ export class BridgeRuntime {
 
       this.log.info(`Discord → Harmony: ${msg.id} → ${harmonyMessageId ?? '?'} (channel ${msg.channelId})`)
     } catch (error) {
+      if (isAutomodBlocked(error)) {
+        this.noteAutomodBlock(msg.channelId)
+        return
+      }
       if (!this.noteDrop('Discord → Harmony', error)) {
         this.log.error(`Failed to bridge Discord → Harmony (${msg.id}): ${errorText(error)}`)
       }
     }
   }
 
+  /** Reaction emoji for Harmony; a custom emoji carries its CDN URL (`.gif` when animated). */
   private discordReactionIdentifier(reaction: MessageReaction | PartialMessageReaction): {
     identifier: string | null
     metadata: Record<string, unknown>
   } {
     if (reaction.emoji.id) {
-      const payload = buildDiscordReactionPayload(
-        reaction.emoji.name || 'unknown',
-        reaction.emoji.id,
-        reaction.emoji.animated || false,
-      )
+      const animated = reaction.emoji.animated
+        ?? reaction.message.guild?.emojis.cache.get(reaction.emoji.id)?.animated
+        ?? false
+      const payload = buildDiscordReactionPayload(reaction.emoji.name || 'unknown', reaction.emoji.id, animated)
       return { identifier: payload.identifier, metadata: payload.metadata }
     }
     return { identifier: reaction.emoji.name || null, metadata: {} }
@@ -1644,39 +1997,69 @@ export class BridgeRuntime {
         return
       }
 
-      const contentParts = this.translator.discordToHarmonyParts(newMsg)
+      const contentParts = this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext())
       await this.harmony.editMessage(harmonyMessageId, contentParts)
       this.log.info(`Discord → Harmony edit: ${newMsg.id} → ${harmonyMessageId}`)
     } catch (error) {
+      if (isAutomodBlocked(error)) {
+        this.noteAutomodBlock(newMsg.channelId)
+        return
+      }
       if (!this.noteDrop('Discord → Harmony edit', error)) {
-        this.log.error(`Failed to bridge edit Discord → Harmony: ${errorText(error)}`)
+        this.log.error(`Failed to bridge edit Discord → Harmony (${newMsg.id}): ${errorText(error)}`)
       }
     }
   }
 
   private async onDiscordMessageDelete(msg: DiscordMessage | PartialMessage) {
     if (!this.settings().syncDeletes) return
-    if (msg.author?.bot) return
+    if (await this.deleteHarmonyCopy(msg)) {
+      this.log.info(`Discord → Harmony delete: ${msg.id} (channel ${msg.channelId})`)
+    }
+  }
+
+  /** MESSAGE_DELETE_BULK (purge): each Discord-origin message loses its Harmony copy. */
+  private async onDiscordMessageBulkDelete(messages: Array<DiscordMessage | PartialMessage>) {
+    if (!this.settings().syncDeletes || messages.length === 0) return
+    let deleted = 0
+    for (const msg of messages) {
+      if (await this.deleteHarmonyCopy(msg)) deleted++
+    }
+    if (deleted > 0) {
+      this.log.info(`Discord → Harmony bulk delete: ${deleted} of ${messages.length} message(s) (channel ${messages[0].channelId})`)
+    }
+  }
+
+  /**
+   * Deletes the Harmony copy of a Discord-origin message. Copies of Harmony
+   * messages (webhook or bot posts) are skipped: removing one on Discord does
+   * not delete the Harmony original. True when a copy was deleted.
+   */
+  private async deleteHarmonyCopy(msg: DiscordMessage | PartialMessage): Promise<boolean> {
+    if (msg.author?.bot || msg.webhookId) return false
+    if (this.harmonyOriginCopies.has(msg.id)) return false
 
     const harmonyChannelId = this.dir.getHarmonyChannel(msg.channelId)
-    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(msg.channelId)) return
+    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(msg.channelId)) return false
+
+    const harmonyMessageId = this.discordToHarmonyMessages.get(msg.id)
+    if (!harmonyMessageId) {
+      this.log.debug(`No message mapping for Discord message ${msg.id}`)
+      return false
+    }
 
     try {
-      const harmonyMessageId = this.discordToHarmonyMessages.get(msg.id)
-      if (!harmonyMessageId) {
-        this.log.debug(`No message mapping for Discord message ${msg.id}`)
-        return
-      }
-
+      this.deletedFromDiscord.set(msg.id, true)
       await this.harmony.deleteMessage(harmonyMessageId)
-      this.log.info(`Discord → Harmony delete: ${msg.id} → ${harmonyMessageId}`)
-
       this.discordToHarmonyMessages.delete(msg.id)
       this.harmonyToDiscordMessages.delete(harmonyMessageId)
+      return true
     } catch (error) {
+      this.deletedFromDiscord.delete(msg.id)
       if (!this.noteDrop('Discord → Harmony delete', error)) {
-        this.log.error(`Failed to bridge delete Discord → Harmony: ${errorText(error)}`)
+        this.log.error(`Failed to bridge delete Discord → Harmony (${msg.id}): ${errorText(error)}`)
       }
+      return false
     }
   }
 
@@ -1703,6 +2086,10 @@ export class BridgeRuntime {
     h.on('rateLimited', () => {
       this.log.debug('Harmony rate limit hit; waiting as instructed')
     })
+    h.on('gatewayRateLimited', () => {
+      this.rateLimitedUntil = Date.now() + RATE_LIMIT_PROBLEM_MS
+      this.notify('rate_limited')
+    })
     h.on('messageCreate', (msg: any) => { void this.onHarmonyMessageCreate(msg) })
     h.on('messageUpdate', (msg: any) => { void this.onHarmonyMessageUpdate(msg) })
     h.on('messageDelete', (msg: any) => { void this.onHarmonyMessageDelete(msg) })
@@ -1726,7 +2113,7 @@ export class BridgeRuntime {
       this.log.debug('Harmony gateway reconnected (mappings already restored)')
     }
 
-    this.registerBridgeDataWithGateway()
+    this.registerBridgeDataWithGateway({ immediate: true })
     this.notify('harmony:ready')
   }
 
@@ -1742,11 +2129,7 @@ export class BridgeRuntime {
       content_raw: msg.content_raw,
     })
 
-    if (msg.metadata?.discord_message_id && msg.id) {
-      const discordMsgId = msg.metadata.discord_message_id
-      this.discordToHarmonyMessages.set(discordMsgId, msg.id)
-      this.harmonyToDiscordMessages.set(msg.id, discordMsgId)
-    }
+    if (msg.metadata?.discord_message_id && msg.id) this.rememberMapping(msg)
 
     // Loop guards: Discord-originated, own, and other bots' messages.
     if (msg.metadata?.bridge_source === 'discord') return
@@ -1776,23 +2159,33 @@ export class BridgeRuntime {
         return
       }
 
-      const username = formatHarmonyDisplayNameForDiscord(msg.author?.display_name, msg.author?.username)
-      const avatarURL = msg.author?.avatar?.startsWith('http://localhost') ? undefined : msg.author?.avatar
-
-      const outboundContent = await this.buildHarmonyOutboundDiscordContent(msg, discordChannel)
-      if (!outboundContent.content || outboundContent.content.trim() === '') {
+      const appEmoji = await this.resolveAppEmojis(msg)
+      const links = this.translator.renderHarmonyForDiscord(msg, this.harmonyToDiscordContext(appEmoji))
+      if (!links.content.trim()) {
         this.log.warn(`Harmony message ${msg.id} is empty after translation; not sent`)
         return
       }
 
+      const files = collectHarmonyFiles(msg)
+      const uploads = files.length > 0 ? await this.media.prepare(files, this.uploadBudget(discordChannel)) : []
+      const primary = uploads.length > 0
+        ? this.translator.renderHarmonyForDiscord(msg, this.harmonyToDiscordContext(appEmoji, new Set(uploads.map(u => u.key))))
+        : links
+
+      const reply = await this.replyFormatting(msg, discordChannel, primary.content)
       const inviteEmbeds = await buildHarmonyInviteDiscordEmbeds(msg, this.harmony, this.harmonyBaseUrl.hostname)
+      const variant = (r: DiscordRendering, attached: PreparedUpload[]): OutboundVariant =>
+        ({ content: reply.apply(r.content), files: attached, suppressEmbeds: r.suppressEmbeds })
 
       const outbound = await this.sendHarmonyToDiscord(discordChannel, {
-        content: outboundContent.content,
-        username,
-        avatarURL,
-        mentionUserIds: outboundContent.mentionUserIds,
+        username: harmonyAuthorName(msg.author),
+        avatarURL: this.webhookAvatarUrl(msg.author?.avatar),
+        mentionUserIds: reply.userId && !primary.mentionUserIds.includes(reply.userId)
+          ? [reply.userId, ...primary.mentionUserIds]
+          : primary.mentionUserIds,
         embeds: inviteEmbeds,
+        primary: variant(primary, uploads),
+        linksOnly: uploads.length > 0 ? variant(links, []) : null,
       })
 
       if (!outbound) {
@@ -1803,15 +2196,20 @@ export class BridgeRuntime {
       const [firstId] = outbound.discordMessageIds
       if (msg.id) {
         this.harmonyToDiscordMessages.set(msg.id, firstId)
-        for (const id of outbound.discordMessageIds) this.discordToHarmonyMessages.set(id, msg.id)
+        for (const id of outbound.discordMessageIds) {
+          this.discordToHarmonyMessages.set(id, msg.id)
+          this.harmonyOriginCopies.set(id, true)
+        }
         this.harmonyDiscordViaWebhook.set(msg.id, outbound.viaWebhook)
         if (outbound.discordMessageIds.length > 1) this.harmonyDiscordChunks.set(msg.id, outbound.discordMessageIds)
+        if (outbound.uploadedKeys.length > 0) this.harmonyDiscordUploads.set(msg.id, outbound.uploadedKeys)
 
         // Persisted so replies, edits and deletes survive restarts.
         try {
           await this.harmony.mergeMessageMetadata(msg.id, {
             discord_message_id: firstId,
             ...(outbound.discordMessageIds.length > 1 ? { discord_message_ids: outbound.discordMessageIds } : {}),
+            ...(outbound.uploadedKeys.length > 0 ? { discord_uploaded_files: outbound.uploadedKeys } : {}),
             discord_via_webhook: outbound.viaWebhook,
             bridge_source: 'harmony',
           })
@@ -1821,7 +2219,7 @@ export class BridgeRuntime {
       }
 
       this.log.info(
-        `Harmony → Discord (${outbound.viaWebhook ? 'webhook' : 'bot'}): ${msg.id} → ${outbound.discordMessageIds.join(',')} (channel ${discordChannelId})`,
+        `Harmony → Discord (${outbound.viaWebhook ? 'webhook' : 'bot'}${outbound.uploadedKeys.length ? `, ${outbound.uploadedKeys.length} file(s)` : ''}): ${msg.id} → ${outbound.discordMessageIds.join(',')} (channel ${discordChannelId})`,
       )
     } catch (error) {
       if (!this.noteDrop('Harmony → Discord', error)) {
@@ -1882,21 +2280,32 @@ export class BridgeRuntime {
         return
       }
 
-      const outboundContent = await this.buildHarmonyOutboundDiscordContent(msg, discordChannel)
-      const username = formatHarmonyDisplayNameForDiscord(msg.author?.display_name, msg.author?.username)
-      const avatarURL = msg.author?.avatar?.startsWith('http://localhost') ? undefined : msg.author?.avatar
+      const recorded = msg.metadata?.discord_uploaded_files
+      const uploaded = new Set(this.harmonyDiscordUploads.get(msg.id) ?? (Array.isArray(recorded) ? recorded.map(String) : []))
+      const appEmoji = await this.resolveAppEmojis(msg)
+      const rendered = this.translator.renderHarmonyForDiscord(msg, this.harmonyToDiscordContext(appEmoji, uploaded))
+      const reply = await this.replyFormatting(msg, discordChannel, rendered.content)
+      const mentionUserIds = reply.userId && !rendered.mentionUserIds.includes(reply.userId)
+        ? [reply.userId, ...rendered.mentionUserIds]
+        : rendered.mentionUserIds
 
       const before = this.chunkIdsFor(msg, discordMessageId)
       const after = await this.editHarmonyOnDiscord(
         discordChannel,
         before,
         viaWebhook,
-        outboundContent.content,
-        { username, avatarURL },
-        outboundContent.mentionUserIds,
+        reply.apply(rendered.content),
+        {
+          username: harmonyAuthorName(msg.author),
+          avatarURL: this.webhookAvatarUrl(msg.author?.avatar),
+        },
+        mentionUserIds,
       )
       this.harmonyDiscordViaWebhook.set(msg.id, viaWebhook)
-      for (const id of after) this.discordToHarmonyMessages.set(id, msg.id)
+      for (const id of after) {
+        this.discordToHarmonyMessages.set(id, msg.id)
+        this.harmonyOriginCopies.set(id, true)
+      }
       if (after.length > 1) this.harmonyDiscordChunks.set(msg.id, after)
       else this.harmonyDiscordChunks.delete(msg.id)
       if (after.join(',') !== before.join(',')) {
@@ -1915,7 +2324,10 @@ export class BridgeRuntime {
     this.log.debug('Harmony message deleted:', { id: msg.id, channel_id: msg.channel_id })
 
     if (!this.harmonyToDiscordEnabled('deletes')) return
-    if (msg.metadata?.bridge_source === 'discord') return
+    if (msg.metadata?.bridge_source === 'discord') {
+      await this.deleteDiscordOriginal(msg)
+      return
+    }
 
     const discordMessageId = this.harmonyToDiscordMessages.get(msg.id)
       ?? (msg.metadata?.bridge_source === 'harmony' ? msg.metadata?.discord_message_id : undefined)
@@ -1950,9 +2362,59 @@ export class BridgeRuntime {
       this.harmonyToDiscordMessages.delete(msg.id)
       this.harmonyDiscordViaWebhook.delete(msg.id)
       this.harmonyDiscordChunks.delete(msg.id)
+      this.harmonyDiscordUploads.delete(msg.id)
     } catch (error) {
       if (!this.noteDrop('Harmony → Discord delete', error)) {
         this.log.error(`Failed to bridge delete Harmony → Discord (${msg.id}): ${errorText(error)}`)
+      }
+    }
+  }
+
+  /**
+   * A Discord-origin message deleted on Harmony (moderator, AutoMod): the
+   * Discord original is deleted too. Needs Manage Messages in the channel;
+   * without it the original stays and the channel is logged once. Harmony's
+   * echo of a delete the bridge itself made is ignored.
+   */
+  private async deleteDiscordOriginal(msg: any) {
+    const recorded = msg.metadata?.discord_message_id
+    const discordId = recorded ? String(recorded) : this.harmonyToDiscordMessages.get(msg.id)
+    if (!discordId) return
+    this.harmonyToDiscordMessages.delete(msg.id)
+    this.discordToHarmonyMessages.delete(discordId)
+    if (this.deletedFromDiscord.has(discordId)) {
+      this.deletedFromDiscord.delete(discordId)
+      return
+    }
+
+    const discordChannelId = this.dir.getDiscordChannel(msg.channel_id)
+    if (!discordChannelId || !this.dir.shouldBridgeFromHarmony(msg.channel_id)) return
+
+    const client = this.discord
+    if (!client || !this.discordReady) return
+
+    try {
+      const channel = await this.fetchPairedChannel(client, discordChannelId)
+      if (!channel) return
+      const me = channel.client.user
+      if (!me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages)) {
+        if (!this.manageMessagesWarned.has(channel.id)) {
+          this.manageMessagesWarned.add(channel.id)
+          this.log.warn(
+            `Channel ${channel.id}: Discord messages deleted on Harmony stay on Discord; the bot lacks Manage Messages there. Re-link the bot (Add to Discord) or grant it Manage Messages on that channel.`,
+          )
+        }
+        return
+      }
+      await channel.messages.delete(discordId)
+      this.log.info(`Harmony → Discord delete of a Discord message: ${msg.id} → ${discordId}`)
+    } catch (error) {
+      if (discordCode(error) === DISCORD_UNKNOWN_MESSAGE) {
+        this.log.debug(`Discord message ${discordId} already gone`)
+        return
+      }
+      if (!this.noteDrop('Harmony → Discord delete', error)) {
+        this.log.error(`Failed to delete Discord message ${discordId} deleted on Harmony: ${errorText(error)}`)
       }
     }
   }
@@ -1980,27 +2442,41 @@ export class BridgeRuntime {
   }
 
   /**
-   * Harmony emoji → Discord reaction identifier. `discord:name:id` maps back to
-   * the Discord emoji; unicode passes through; a Harmony custom emoji matches
-   * a guild emoji by name or is skipped.
+   * Harmony reaction emoji → Discord reaction identifier. A Harmony custom
+   * emoji (`{id, name}`) becomes the application emoji uploaded from its
+   * image; `discord:name:id` maps back to the Discord emoji; unicode passes
+   * through. A bare name without an emoji row matches a guild emoji by name.
    */
-  private resolveDiscordEmojiForReaction(channel: TextChannel, emojiName: string): string | null {
+  private async resolveDiscordEmojiForReaction(
+    channel: TextChannel,
+    data: any,
+  ): Promise<{ identifier: string; appUrl?: string } | null> {
+    const emoji = data?.emoji
+    if (emoji && typeof emoji === 'object' && typeof emoji.id === 'string' && emoji.id) {
+      // Harmony 1.6.16 sends the image URL with the reaction; older gateways need a lookup.
+      const row = typeof emoji.url === 'string' && /^https?:\/\//.test(emoji.url)
+        ? { name: typeof emoji.name === 'string' && emoji.name ? emoji.name : 'emoji', url: emoji.url }
+        : await this.harmonyEmojiRow(emoji.id)
+      if (!row) return null
+      const app = await this.appEmojiForRow(row)
+      return app ? { identifier: `${app.animated ? 'a:' : ''}${app.name}:${app.id}`, appUrl: row.url } : null
+    }
+
+    const emojiName = BridgeRuntime.reactionEmojiName(data)
+    if (!emojiName) return null
     const discordBridged = emojiName.match(/^discord:([^:]+):(\d+)$/)
     if (discordBridged) {
       const [, name, id] = discordBridged
       const byId = channel.guild.emojis.cache.get(id)
-      if (byId) return byId.identifier
-      const byName = channel.guild.emojis.cache.find(e => e.name === name)
-      if (byName) return byName.identifier
-      return `${name}:${id}`
+      if (byId) return { identifier: byId.identifier }
+      return { identifier: `${name}:${id}` }
     }
 
     if (!/^[a-zA-Z0-9_+\-~]+$/.test(emojiName)) {
-      return emojiName
+      return { identifier: emojiName }
     }
     const guildEmoji = channel.guild.emojis.cache.find(e => e.name === emojiName)
-    if (guildEmoji) return guildEmoji.identifier
-    return null
+    return guildEmoji ? { identifier: guildEmoji.identifier } : null
   }
 
   /** Emoji name from a reaction event; `emoji` is `{id, name}` or a string. */
@@ -2029,18 +2505,15 @@ export class BridgeRuntime {
       const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel) return
 
-      const emojiInput = BridgeRuntime.reactionEmojiName(data)
-      if (!emojiInput) return
-
-      const resolved = this.resolveDiscordEmojiForReaction(discordChannel, emojiInput)
+      const resolved = await this.resolveDiscordEmojiForReaction(discordChannel, data)
       if (!resolved) {
-        this.log.debug(`Harmony reaction: no Discord emoji for "${emojiInput}"`)
+        this.log.debug('Harmony reaction: no Discord emoji for it')
         return
       }
 
-      const reactionId = String(data.reaction_id ?? `${data.user_id ?? data.bot_id ?? '?'}:${resolved}`)
-      if (!this.reactionLedger.add(String(data.message_id), resolved, reactionId)) {
-        this.log.debug(`Harmony reaction added; Discord already shows it (${this.reactionLedger.count(String(data.message_id), resolved)} holder(s))`)
+      const reactionId = String(data.reaction_id ?? `${data.user_id ?? data.bot_id ?? '?'}:${resolved.identifier}`)
+      if (!this.reactionLedger.add(String(data.message_id), resolved.identifier, reactionId)) {
+        this.log.debug(`Harmony reaction added; Discord already shows it (${this.reactionLedger.count(String(data.message_id), resolved.identifier)} holder(s))`)
         return
       }
 
@@ -2050,7 +2523,18 @@ export class BridgeRuntime {
         return
       }
 
-      await discordMessage.react(resolved)
+      try {
+        await discordMessage.react(resolved.identifier)
+      } catch (err) {
+        // The application emoji was deleted elsewhere: upload again once.
+        if (discordCode(err) !== DISCORD_UNKNOWN_EMOJI || !resolved.appUrl) throw err
+        this.appEmojiContext()?.store.invalidate(resolved.appUrl)
+        const again = await this.resolveDiscordEmojiForReaction(discordChannel, data)
+        if (!again) throw err
+        this.reactionLedger.remove(reactionId)
+        this.reactionLedger.add(String(data.message_id), again.identifier, reactionId)
+        await discordMessage.react(again.identifier)
+      }
       this.log.debug(`Harmony → Discord reaction on ${discordMessageId}`)
     } catch (err) {
       this.log.error(`Failed to bridge reaction Harmony → Discord: ${errorText(err)}`)
@@ -2093,7 +2577,8 @@ export class BridgeRuntime {
       if (!discordMessage) return
 
       const reaction = discordMessage.reactions.cache.find(r => r.emoji.identifier === known.emoji
-        || r.emoji.name === known.emoji)
+        || r.emoji.name === known.emoji
+        || (!!r.emoji.id && known.emoji.endsWith(`:${r.emoji.id}`)))
       if (reaction && client.user) {
         await reaction.users.remove(client.user.id)
         this.log.debug(`Harmony → Discord reaction removed on ${discordMessageId}`)

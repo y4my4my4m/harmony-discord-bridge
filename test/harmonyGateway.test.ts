@@ -75,4 +75,26 @@ describe('HarmonyClient gateway', () => {
     client.disconnect()
     expect(states).toEqual([true, false])
   })
+
+  it('reconnects after a 4008 rate-limit close with a growing backoff, reset only after a quiet window', async () => {
+    const gw = await gateway(ws => {
+      ws.send(JSON.stringify({ op: 0, t: 'READY', d: { bot: { id: 'b', username: 'bridge' }, session_id: 's', heartbeat_interval: 30000 } }))
+      setTimeout(() => ws.close(4008, 'rate limited'), 10)
+    })
+    client = new HarmonyClient('good', gw.url, 'http://127.0.0.1:1', {
+      log: silentLogger,
+      reconnectBaseMs: 100,
+      reconnectMaxMs: 10_000,
+    })
+    const limited: Array<{ code: number }> = []
+    client.on('gatewayRateLimited', e => limited.push(e))
+    await client.connect()
+    // Delays 100, 200, 400 ms (±20 %): READY after a 4008 does not reset them.
+    await sleep(500)
+    expect(limited.length).toBeGreaterThanOrEqual(2)
+    const early = gw.connections()
+    await sleep(500)
+    expect(gw.connections() - early).toBeLessThanOrEqual(2)
+    expect(limited[0]).toMatchObject({ code: 4008 })
+  })
 })

@@ -58,6 +58,7 @@ export async function runV1(configPath: string, log: Logger): Promise<Launched> 
       baseUrl: config.harmony.baseUrl,
     },
     permissionStorePath,
+    appEmojiDir: join(dirname(dirname(configPath)), 'data', 'app-emojis'),
     log,
     hooks: {
       afterPairsWritten: async () => { await runtime?.onDirectoryChanged({}) },

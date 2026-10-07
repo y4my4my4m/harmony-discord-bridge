@@ -163,7 +163,8 @@ describe('BridgeRuntime presence sync', () => {
 
     const client = clients[0]
     client.emit(Events.GuildMemberAdd, fakeMember('g1', 'u1'))
-    await vi.advanceTimersByTimeAsync(0)
+    // op 6 waits out its 5 s interval after the READY registration.
+    await vi.advanceTimersByTimeAsync(5_000)
     op6.mockClear()
     return { runtime, client, op6, op7 }
   }
@@ -210,6 +211,10 @@ describe('BridgeRuntime presence sync', () => {
   it('still sends presence fields with op 6 on membership changes', async () => {
     const { runtime, client, op6 } = await setup()
     client.emit(Events.GuildMemberAdd, { ...fakeMember('g1', 'u2'), presence: { status: 'idle', activities: [] } })
+    client.emit(Events.GuildMemberAdd, fakeMember('g1', 'u3'))
+    await vi.advanceTimersByTimeAsync(4_900)
+    expect(op6).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(100)
     expect(op6).toHaveBeenCalledTimes(1)
     const [channels] = op6.mock.calls[0]
     expect(channels[0].members?.find(m => m.id === 'u2')).toMatchObject({ presenceStatus: 'away', customStatus: null })

@@ -1,10 +1,11 @@
 # Harmony ↔ Discord bridge
 
 Connects a Discord server with a [Harmony](https://github.com/y4my4my4m/harmony)
-server. Messages, replies, mentions, reactions, attachments, edits and
+server. Messages, replies, mentions, reactions, files, custom emoji, edits and
 deletions flow both ways between the channels you pair. People on Discord show
 up in Harmony with their Discord name and picture, and Harmony users show up
-in Discord the same way.
+in Discord the same way. See [What gets bridged](#what-gets-bridged) for the
+details.
 
 The bridge is a small program that logs in to Discord as a bot: either the
 bot of your Harmony instance, or **your own Discord bot**.
@@ -50,12 +51,19 @@ you through the one you pick.
    replace `YOUR_APPLICATION_ID` (from **General Information**) in:
 
    ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=536988736&scope=bot%20applications.commands
+   https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=536996928&scope=bot%20applications.commands
    ```
 
    This grants View Channels, Send Messages, Embed Links, Attach Files, Read
-   Message History, Add Reactions and Manage Webhooks. For `/bridge
-   clone-server`, use `permissions=536988752` (adds Manage Channels).
+   Message History, Add Reactions, Manage Messages and Manage Webhooks.
+   Manage Messages lets a message deleted on Harmony (by a moderator or by
+   Harmony's AutoMod) disappear from Discord too. For `/bridge clone-server`,
+   use `permissions=536996944` (adds Manage Channels).
+
+   | Bot | Permission integer |
+   |---|---|
+   | Your own bot (run yourself, or hosted by your instance) | `536996928` (`536996944` with Manage Channels for `/bridge clone-server`) |
+   | The instance's bot (**Add to Discord**) | `537259072` (adds Use External Emojis) |
 
 ### 2. Get a setup code from Harmony
 
@@ -156,6 +164,8 @@ All settings are environment variables (`-e NAME=value`).
 | `DATA_DIR` | no | Where credentials are kept. Default `/data` in Docker, otherwise the `data` folder next to the program. |
 | `LOG_LEVEL` | no | `error`, `warn`, `info` (default) or `debug`. Only `debug` prints message contents. |
 | `HEALTH_PORT` | no | Port of the `/health` status endpoint, default `8080`. `off` disables it. |
+| `MAX_UPLOAD_MB` | no | Harmony files up to this many megabytes per message are uploaded to Discord; bigger ones are sent as a link. Default `8`. Discord's own limit for the server applies on top. `0` sends every file as a link. |
+| `HARMONY_MEDIA_ORIGIN` | no | For a bridge on the same machine as Harmony: where to download Harmony files from instead of the public address, e.g. `http://127.0.0.1:8000` (Supabase's Kong). Saves the round trip through the internet or Cloudflare. |
 
 Which channels are paired and what is synced (member list, presence,
 reactions, edits, deletions) is set in Harmony's Discord Bridge page; the
@@ -165,6 +175,51 @@ Presence (online, away, busy, offline and the custom status of Discord
 members) is light on the network: only real changes are sent, at most every
 5 seconds, and only for people in the bridged member list. Games, music and
 other activities are not sent at all.
+
+## What gets bridged
+
+**Files.** Pictures, videos, voice notes and other files posted on Harmony are
+uploaded to Discord as real attachments, so Discord shows them like any other
+upload. Pictures are fetched in a resized version (at most 1600 pixels) when
+Harmony offers one. Files above `MAX_UPLOAD_MB` (8 MB by default) or above the
+Discord server's limit are posted as a short link with the file name and size
+instead, without a preview of the link. Discord voice messages and audio files
+arrive in Harmony as audio you can play there; Discord stickers arrive as
+pictures (animated "Lottie" stickers as the text `[sticker: name]`); forwarded
+Discord messages arrive with an italic *↪ Forwarded* line.
+
+**Custom emoji.** Harmony's custom emoji appear on Discord as real emoji, in
+messages and as reactions. The bridge uploads each one the first time it is
+used to its Discord application ("application emojis"; Discord allows 2000 per
+application, the bridge keeps at most 1900 and removes the least recently used
+ones). Emoji pictures larger than Discord's 256 KB limit are taken in a smaller
+version from Harmony, or shown as `:name:` when none fits. Animated Discord
+emoji used as reactions stay animated in Harmony.
+
+**Mentions.** Mentioning a Discord person from Harmony pings them on Discord.
+Nobody else is pinged: Harmony users mentioned by name, roles, `@everyone`
+and `@here` show as text and notify nobody on Discord. Role mentions show as
+the Discord role when the role is synced (permission sync), channel mentions
+as the Discord channel when it is paired; otherwise as `@Role` and `#channel`.
+From Discord, channel mentions of paired channels and role mentions that
+pinged on Discord arrive as real Harmony mentions (roles when synced), and
+`@name` typed by hand becomes a Harmony mention, except inside e-mail
+addresses and links.
+
+**Moderation.** Deleting a Discord message removes its copy on Harmony,
+including bulk deletes ("purge"). Deleting a Discord person's message on
+Harmony removes it on Discord too, when the bot has the Manage Messages
+permission there; bridges added before version 2.2 get it by adding the bot
+again (**Add to Discord**, or the own-bot invite link above with
+`permissions=536996928`). Without it the message stays on Discord and the
+bridge logs it once per channel.
+
+**Spam protection.** One Discord person can send at most 8 messages per 10
+seconds in a channel and 30 per minute across channels to Harmony; the same
+text sent again within 30 seconds is dropped. Dropped messages are counted in
+the log, without their contents. Harmony's AutoMod also applies its flood and
+duplicate rules to each Discord person; a message it blocks is not retried
+and is counted in the log the same way.
 
 ## Discord commands
 
@@ -252,6 +307,9 @@ Other messages:
 | `src/v1/runV1.ts`, `src/ChannelMapper.ts` | Legacy `bridge-config.yml`. |
 | `src/HarmonyClient.ts` | bot-gateway WebSocket (IDENTIFY, events) and REST (`/api/v1`). |
 | `src/MessageTranslator.ts` | Discord ↔ Harmony message parts. |
+| `src/runtime/outboundMedia.ts` | Harmony files as Discord attachments: upload budget, render URLs, `HARMONY_MEDIA_ORIGIN`. |
+| `src/runtime/appEmojis.ts` | Harmony custom emoji as Discord application emojis (upload, map in `/data/app-emojis`, LRU). |
+| `src/runtime/antiSpam.ts` | Per Discord author rate limit and duplicate filter. |
 | `src/http.ts` | Bounded retry (429 `Retry-After`, 5xx on idempotent calls), backoff. |
 
 ### From source
@@ -298,7 +356,8 @@ settings). Set the same `BRIDGE_HOST_SECRET` on bot-gateway and here:
 | `HARMONY_URL` | bot-gateway, e.g. `http://bot-gateway:3002` on the Docker network, or the public address. |
 | `BRIDGE_HOST_SECRET` | Shared secret for `GET /bridge/v2/hosted`. |
 | `HARMONY_PUBLIC_URL` | Public Harmony address, when `HARMONY_URL` points at bot-gateway directly. |
-| `DATA_DIR`, `LOG_LEVEL`, `HEALTH_PORT` | As above. |
+| `HARMONY_MEDIA_ORIGIN` | Kong as the container reaches it, e.g. `http://supabase-kong:8000` on the Docker network or `http://127.0.0.1:8000`. Files and emoji whose address starts with the public Harmony address are downloaded from here instead (same path and signed query). Kong routes by path, so the different host name does not matter. |
+| `DATA_DIR`, `LOG_LEVEL`, `HEALTH_PORT`, `MAX_UPLOAD_MB` | As above. |
 
 The container can run on any machine that reaches `HARMONY_URL`. The lists
 are re-read every 60 s: new bridges start, removed ones stop, changed tokens
@@ -324,8 +383,13 @@ Admin → Discord bridge**:
    instance bot on.
 
 The bot asks for View Channels, Send Messages, Read Message History, Embed
-Links, Attach Files, Add Reactions, Use External Emojis and Manage Webhooks
-(permission integer `537250880`).
+Links, Attach Files, Add Reactions, Use External Emojis, Manage Messages and
+Manage Webhooks (permission integer `537259072`). Communities that linked
+before version 2.2 lack Manage Messages until they click **Add to Discord**
+again; until then deletions on Harmony stay on Discord.
+
+Harmony's custom emoji are uploaded to the instance bot's application and
+shared by every community: one map in `/data/app-emojis/<application id>.json`.
 
 All communities share one connection to Discord. Server Members is used when
 any community syncs its member list; Presence only when the presence switch
@@ -344,8 +408,26 @@ rarely granted).
 ### Behavior notes
 
 - Harmony → Discord posts through a channel webhook named "Harmony Bridge"
-  (author name and avatar). Without Manage Webhooks it posts as the bot, as
-  `**Name**: message`. The webhook's own avatar is the Harmony instance icon.
+  (author name and avatar). Without Manage Webhooks, or when a webhook post
+  fails for any reason, it posts as the bot, as `**Name**: message`. A webhook
+  deleted on Discord is created again once. The webhook's own avatar is the
+  Harmony instance icon.
+- The author name is the Harmony server nickname, else the display name,
+  else the username. Discord refuses names containing "clyde" or "discord";
+  those words are removed, and an empty name becomes "Harmony user".
+- Links the Harmony author marked "no preview" are posted as `<link>`; when
+  every link in the message is like that, the Discord message carries
+  SUPPRESS_EMBEDS.
+- Pictures with a signed `render_url` (Harmony 1.6.16, JPEG and PNG in
+  private storage) are uploaded from that resized version; when it fails,
+  from `url`.
+- Uploaded files are recorded in the Harmony message metadata
+  (`discord_uploaded_files`, by storage path) so an edit does not add links
+  for them.
+- `REGISTER_BRIDGE_DATA` (op 6) goes out at most every 5 s and presence
+  updates (op 7) at most every 5 s. bot-gateway closes a connection that sends
+  more than 120 frames per minute (close code 4008); the bridge reconnects
+  with a growing delay and reports `rate_limited`.
 - Messages over 2000 characters are split at line breaks or spaces; code
   blocks are closed and reopened across the split.
 - Edits and deletions after a restart use the Discord ids stored in the

@@ -4,7 +4,12 @@ import { Collection, Events, PermissionFlagsBits, type ClientOptions } from 'dis
 
 /** discord.js Client stand-in: the members BridgeRuntime and SharedDiscordClient touch. */
 export class FakeDiscordClient extends EventEmitter {
-  rest = Object.assign(new EventEmitter(), { put: vi.fn(async (_route: string, _body: unknown) => []) })
+  rest = Object.assign(new EventEmitter(), {
+    put: vi.fn(async (_route: string, _body: unknown) => []),
+    get: vi.fn(async (_route: string): Promise<unknown> => ({ items: [] })),
+    post: vi.fn(async (_route: string, _opts?: unknown): Promise<unknown> => ({})),
+    delete: vi.fn(async (_route: string): Promise<unknown> => undefined),
+  })
   user: any = { id: 'bot-user', tag: 'bot#0001', username: 'bot', displayAvatarURL: () => null }
   application = { id: 'app-1' }
   guilds = {
@@ -71,6 +76,8 @@ export function fakeMember(guildId: string, id: string, username = `user-${id}`)
     id,
     guild: { id: guildId },
     displayName: username,
+    avatar: null,
+    displayAvatarURL: () => `https://cdn.example/${id}.png`,
     joinedAt: null,
     presence: null,
     user: {
@@ -101,4 +108,81 @@ export function fakePresence(
 /** /applications/@me body with the given flags. */
 export function appResponse(flags: number) {
   return () => Response.json({ id: 'app-1', name: 'Bot', flags, bot: { id: 'bot-user', username: 'bot', avatar: null } })
+}
+
+/** Discord REST error as discord.js throws it. */
+export function discordError(code: number, message = `Discord error ${code}`, status = 400) {
+  return Object.assign(new Error(message), { code, status })
+}
+
+export function fakeWebhook(id = 'wh-1') {
+  let n = 0
+  return {
+    id,
+    name: 'Harmony Bridge',
+    token: 'wt',
+    send: vi.fn(async (_payload: any): Promise<any> => ({ id: `${id}-msg-${++n}` })),
+    editMessage: vi.fn(async (_id: string, _payload: any) => ({})),
+    deleteMessage: vi.fn(async (_id: string) => {}),
+  }
+}
+
+/**
+ * Guild text channel with the members BridgeRuntime posts through: webhooks,
+ * bot sends, message fetch/edit/delete. `perms` are the bot's permissions.
+ */
+export function fakeTextChannel(
+  client: FakeDiscordClient,
+  guildId: string,
+  channelId: string,
+  opts: { perms?: bigint[]; premiumTier?: number; webhook?: ReturnType<typeof fakeWebhook> | null } = {},
+) {
+  const perms = opts.perms ?? [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ManageWebhooks,
+    PermissionFlagsBits.AttachFiles,
+  ]
+  let n = 0
+  const webhooks: any[] = opts.webhook === null ? [] : [opts.webhook ?? fakeWebhook()]
+  const created: any[] = []
+  const reactions: string[] = []
+  const channel: any = {
+    id: channelId,
+    name: `ch-${channelId}`,
+    type: 0,
+    guildId,
+    parentId: null,
+    rawPosition: 0,
+    client,
+    guild: { id: guildId, premiumTier: opts.premiumTier ?? 0, emojis: { cache: new Collection<string, any>() } },
+    isTextBased: () => true,
+    isThread: () => false,
+    permissionsFor: () => ({ has: (flag: bigint) => perms.includes(flag) }),
+    webhooks,
+    created,
+    reactions,
+    fetchWebhooks: vi.fn(async () => new Collection(webhooks.map(w => [w.id, w]))),
+    createWebhook: vi.fn(async () => {
+      const w = fakeWebhook(`wh-new-${created.length + 1}`)
+      created.push(w)
+      webhooks.length = 0
+      webhooks.push(w)
+      return w
+    }),
+    send: vi.fn(async (_payload: any): Promise<any> => ({ id: `bot-msg-${++n}` })),
+    messages: {
+      fetch: vi.fn(async (id: string) => ({
+        id,
+        webhookId: null,
+        author: { id: 'someone', bot: false, username: 'someone' },
+        react: vi.fn(async (emoji: string) => { reactions.push(emoji) }),
+        reactions: { cache: new Collection() },
+      })),
+      edit: vi.fn(async () => ({})),
+      delete: vi.fn(async (_id: string) => {}),
+    },
+  }
+  client.channels.cache.set(channelId, channel)
+  return channel
 }

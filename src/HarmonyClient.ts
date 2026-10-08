@@ -55,6 +55,13 @@ export interface HarmonyClientOptions {
  * unreachable(error), rateLimited(info), gatewayRateLimited({code, reason}),
  * bridgeConfigUpdate(data), and the message/reaction events listed in handleEvent.
  */
+export interface HarmonyServerEmoji {
+  id: string
+  name: string
+  url: string | null
+  discord_emoji_id: string | null
+}
+
 export class HarmonyClient extends EventEmitter {
   private ws: WebSocket | null = null
   private botToken: string
@@ -604,6 +611,26 @@ export class HarmonyClient extends EventEmitter {
     const body = await this.getJson<unknown>(`/emojis?id=${encodeURIComponent(id)}`, 'Failed to fetch emojis')
     const rows = Array.isArray(body) ? body : body && typeof body === 'object' ? [body] : []
     return rows as Array<{ id: string; name: string | null; url: string | null }>
+  }
+
+  /** Server emoji with their Discord links (Harmony 1.6.25+). */
+  async getServerEmojis(serverId: string): Promise<HarmonyServerEmoji[]> {
+    return this.getJson<HarmonyServerEmoji[]>(`/servers/${serverId}/emojis`, 'Failed to fetch server emojis')
+  }
+
+  /**
+   * Imports a Discord emoji as a server emoji (Harmony 1.6.25+). Status `existing` for one
+   * imported before, `linked` for a same-name server emoji that now carries the Discord id.
+   */
+  async importDiscordEmoji(
+    serverId: string,
+    emoji: { discordEmojiId: string; name: string; animated: boolean },
+  ): Promise<HarmonyServerEmoji & { status: 'created' | 'existing' | 'linked' }> {
+    return this.sendJson('POST', `/servers/${serverId}/emojis/discord`, {
+      discord_emoji_id: emoji.discordEmojiId,
+      name: emoji.name,
+      animated: emoji.animated,
+    }, 'Failed to import emoji')
   }
 
   async getGuildMembers(guildId: string): Promise<any[]> {

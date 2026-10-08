@@ -106,6 +106,16 @@ export function buildCommands(mode: 'v1' | 'v2') {
         .setDescription('Sync Harmony category/channel order from Discord (mapped channels only)')
         .addBooleanOption(opt =>
           opt.setName('include_voice').setDescription('Include voice channels when syncing order (default: yes)').setRequired(false)))
+    .addSubcommand(sub =>
+      sub
+        .setName('sync-perms')
+        .setDescription('Sync Discord roles and channel permissions onto Harmony (linked channels only)'))
+    .addSubcommand(sub =>
+      sub
+        .setName('import-emojis')
+        .setDescription('Copy this server\'s custom emojis into the Harmony server (rerun adds only new ones)')
+        .addBooleanOption(opt =>
+          opt.setName('dry_run').setDescription('List what would be imported without changes').setRequired(false)))
 
   return [
     addUserOptions(new SlashCommandBuilder()
@@ -366,6 +376,12 @@ async function handleBridgeCommand(rt: BridgeRuntime, command: ChatInputCommandI
       case 'sync-order':
         await runBridgeSyncOrder(rt, command)
         break
+      case 'sync-perms':
+        await runBridgeSyncPerms(rt, command)
+        break
+      case 'import-emojis':
+        await runBridgeImportEmojis(rt, command)
+        break
       default:
         await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
     }
@@ -566,7 +582,7 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
   if (toCreate.length === 0 && rolesToClone.length === 0) {
     await command.editReply({
       content: cloneRoles
-        ? '✅ Nothing to do - every Discord channel and role already exists on Harmony.'
+        ? '✅ Nothing to do - every Discord channel and role already exists on Harmony. `/bridge sync-perms` re-applies permissions.'
         : '✅ Nothing to do - every Discord channel already has a mapping.',
     })
     return
@@ -766,4 +782,114 @@ async function runBridgeSyncOrder(rt: BridgeRuntime, command: ChatInputCommandIn
   } catch (err) {
     await command.editReply({ content: `❌ Order sync failed: ${errorText(err)}` })
   }
+}
+
+/**
+ * `/bridge sync-perms`: Discord roles onto Harmony roles (by mapping, then name; missing ones
+ * created), then every linked channel's permission overwrites. Channels are not created.
+ */
+async function runBridgeSyncPerms(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({ content: notBridgedText(rt) })
+    return
+  }
+  const linked = rt.dir.getAllMappings(guild.id).length
+  if (linked === 0) {
+    await command.editReply({
+      content: '❌ No channel mappings configured. Run `/bridge clone-server` or `/bridge link` first.',
+    })
+    return
+  }
+
+  try {
+    await guild.roles.fetch()
+    await rt.permissionSync.reconcileRoles(guild)
+    await rt.permissionSync.syncAllMappedChannelOverwrites(guild)
+    const roles = cloneableDiscordRoles(guild).length
+    await command.editReply({
+      content: [
+        `✅ Permissions synced for **${guild.name}**`,
+        `• Roles: ${roles} Discord role(s) matched or created on Harmony`,
+        `• Channels: overwrites applied to ${linked} linked channel(s)`,
+        '_Roles Harmony refuses (above the bot, or protected) are skipped; see `/bridge status` and the bridge log._',
+      ].join('\n'),
+    })
+  } catch (err) {
+    await command.editReply({ content: `❌ Permission sync failed: ${errorText(err)}` })
+  }
+}
+
+/** Discord emoji imported per call; Harmony stores each image, so a run is bounded. */
+const EMOJI_IMPORT_LIMIT = 250
+
+/**
+ * `/bridge import-emojis`: the guild's custom emoji become Harmony server emoji with the same
+ * names. Harmony keeps one row per Discord emoji, so a rerun imports only new ones; a server
+ * emoji with the same name is linked instead of duplicated. Linked emoji are one emoji on both
+ * sides for reactions and messages.
+ */
+async function runBridgeImportEmojis(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  const dryRun = command.options.getBoolean('dry_run', false) ?? false
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({ content: notBridgedText(rt) })
+    return
+  }
+  const serverId = bridge.harmonyServerId
+
+  const emojis = [...(await guild.emojis.fetch()).values()]
+    .filter(e => !!e.id && !!e.name && e.available !== false)
+    .slice(0, EMOJI_IMPORT_LIMIT)
+  if (emojis.length === 0) {
+    await command.editReply({ content: '✅ This Discord server has no custom emojis.' })
+    return
+  }
+
+  await rt.emojiLinks.ensure(serverId)
+  const fresh = emojis.filter(e => !rt.emojiLinks.harmonyFor(serverId, e.id))
+  if (dryRun) {
+    await command.editReply({
+      content: joinLinesWithinDiscordLimit([
+        `🧪 **Dry run** for **${guild.name}**: ${fresh.length} of ${emojis.length} emoji not imported yet`,
+        ...fresh.slice(0, 40).map(e => `  • :${e.name}:`),
+        ...(fresh.length > 40 ? [`  • …and ${fresh.length - 40} more`] : []),
+      ]),
+    })
+    return
+  }
+
+  const counts = { created: 0, linked: 0, existing: emojis.length - fresh.length }
+  const failures: string[] = []
+  for (const emoji of fresh) {
+    try {
+      const row = await rt.harmony.importDiscordEmoji(serverId, {
+        discordEmojiId: emoji.id,
+        name: emoji.name!.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 32),
+        animated: emoji.animated === true,
+      })
+      rt.emojiLinks.set(serverId, row)
+      counts[row.status]++
+    } catch (err) {
+      failures.push(`:${emoji.name}: ${errorText(err)}`)
+    }
+  }
+
+  const lines = [
+    `✅ Emoji import for **${guild.name}**`,
+    `• Imported: ${counts.created}`,
+    `• Linked to a Harmony emoji with the same name: ${counts.linked}`,
+    `• Already imported: ${counts.existing}`,
+  ]
+  if (failures.length > 0) {
+    lines.push('', `⚠️ ${failures.length} failure(s):`, ...failures.slice(0, 15).map(f => `  • ${f}`))
+    if (failures.length > 15) lines.push(`  • …and ${failures.length - 15} more`)
+  }
+  await command.editReply({ content: joinLinesWithinDiscordLimit(lines) })
 }

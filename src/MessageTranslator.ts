@@ -183,6 +183,8 @@ export interface DiscordToHarmonyContext {
   harmonyRoleFor?: (discordRoleId: string) => string | undefined
   /** Paired Discord channel → its Harmony channel. */
   harmonyChannelFor?: (discordChannelId: string) => { id: string; serverId: string; name: string } | null
+  /** Discord emoji id → the Harmony server emoji imported from it. */
+  harmonyEmojiFor?: (discordEmojiId: string) => { id: string; name: string; url: string | null } | null
 }
 
 /** Bridge state the Harmony → Discord translation consults. */
@@ -193,6 +195,8 @@ export interface HarmonyToDiscordContext {
   discordChannelFor?: (harmonyChannelId: string) => string | null
   /** Harmony custom emoji part → Discord application emoji. */
   appEmojiFor?: (emoji: any) => { id: string; name: string; animated: boolean } | null
+  /** Harmony emoji imported from Discord → that Discord emoji. */
+  discordEmojiFor?: (emoji: any) => { id: string; name: string; animated: boolean } | null
   /** harmonyFileKey of files sent as Discord attachments; they produce no text. */
   uploadedFiles?: ReadonlySet<string>
 }
@@ -480,7 +484,13 @@ export class MessageTranslator {
     while ((match = tokenRegex.exec(content)) !== null) {
       if (match.index > lastIndex) parts.push({ type: 'text', text: content.substring(lastIndex, match.index) })
 
-      if (match[2] && match[3]) {
+      const linked = match[2] && match[3] ? ctx.harmonyEmojiFor?.(match[3]) ?? null : null
+      if (linked) {
+        parts.push({
+          type: 'emoji',
+          emoji: { id: linked.id, name: linked.name, url: linked.url, domain: null, display_name: linked.name },
+        })
+      } else if (match[2] && match[3]) {
         const animated = match[1] === 'a'
         parts.push({
           type: 'emoji',
@@ -661,6 +671,8 @@ export class MessageTranslator {
       const match = emoji.url.match(/emojis\/(\d+)\.(png|gif|webp)/)
       if (match) return `<${match[2] === 'gif' ? 'a' : ''}:${emoji.name}:${match[1]}>`
     }
+    const linked = ctx.discordEmojiFor?.(emoji)
+    if (linked) return `<${linked.animated ? 'a' : ''}:${linked.name}:${linked.id}>`
     const app = ctx.appEmojiFor?.(emoji)
     if (app) return `<${app.animated ? 'a' : ''}:${app.name}:${app.id}>`
     return `:${emoji.name}:`

@@ -57,6 +57,7 @@ import {
 import { isPublicHttpsUrl } from '../utils/fetchCapped.js'
 import { loadInstanceIcon } from '../utils/instanceIcon.js'
 import { ReactionLedger } from '../utils/reactionLedger.js'
+import { ServerEmojiLinks } from './serverEmojiLinks.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -335,6 +336,8 @@ export class BridgeRuntime {
   private readonly recentlyRefreshedMessages = new Set<string>()
 
   private readonly reactionLedger = new ReactionLedger()
+  /** Harmony server emoji imported from Discord; one emoji on both sides. */
+  readonly emojiLinks = new ServerEmojiLinks(serverId => this.harmony.getServerEmojis(serverId))
 
   private droppedMessages = 0
   /** Discord messages Harmony's AutoMod refused since start. */
@@ -725,9 +728,10 @@ export class BridgeRuntime {
       this.log.info(`Cached ${this.discordMemberDetails.size} Discord members for mention lookups`)
 
       await this.refreshHarmonyUserCache({ verbose: true })
+      await this.refreshEmojiLinks()
       if (!this.harmonyUserCacheTimer) {
         this.harmonyUserCacheTimer = setInterval(
-          () => { void this.refreshHarmonyUserCache({ verbose: false }) },
+          () => { void this.refreshHarmonyUserCache({ verbose: false }); void this.refreshEmojiLinks() },
           HARMONY_USER_CACHE_REFRESH_MS,
         )
       }
@@ -1568,7 +1572,9 @@ export class BridgeRuntime {
    */
   private async resolveAppEmojis(msg: any): Promise<Map<string, AppEmoji>> {
     const found = new Map<string, AppEmoji>()
-    const wanted = collectHarmonyCustomEmoji(msg).slice(0, APP_EMOJI_PER_MESSAGE)
+    const wanted = collectHarmonyCustomEmoji(msg)
+      .filter(emoji => !this.linkedDiscordEmoji(emoji.id))
+      .slice(0, APP_EMOJI_PER_MESSAGE)
     if (wanted.length === 0 || !this.appEmojiContext()) return found
     const work = (async () => {
       for (const emoji of wanted) {
@@ -1640,13 +1646,15 @@ export class BridgeRuntime {
       discordRoleFor: id => this.permissionSyncStore.getDiscordRoleId(id),
       discordChannelFor: id => this.dir.getDiscordChannel(id),
       appEmojiFor: emoji => (typeof emoji?.id === 'string' ? appEmoji.get(emoji.id) : undefined) ?? null,
+      discordEmojiFor: emoji => (typeof emoji?.id === 'string' ? this.linkedDiscordEmoji(emoji.id) : null),
       uploadedFiles: uploaded,
     }
   }
 
   /** Translation context for Discord → Harmony. */
-  private discordToHarmonyContext(): DiscordToHarmonyContext {
+  private discordToHarmonyContext(serverId?: string): DiscordToHarmonyContext {
     return {
+      harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
       harmonyRoleFor: id => this.permissionSyncStore.getHarmonyRoleId(id),
       harmonyChannelFor: id => {
         for (const bridge of this.dir.getBridges()) {
@@ -1842,7 +1850,7 @@ export class BridgeRuntime {
       }
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
-      const contentParts = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(), { content: cleanedContent })
+      const contentParts = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: cleanedContent })
       if (contentParts.length === 0) {
         this.log.debug(`Discord message ${msg.id} has nothing to bridge`)
         return
@@ -1881,11 +1889,14 @@ export class BridgeRuntime {
   }
 
   /** Reaction emoji for Harmony; a custom emoji carries its CDN URL (`.gif` when animated). */
-  private discordReactionIdentifier(reaction: MessageReaction | PartialMessageReaction): {
+  private async discordReactionIdentifier(reaction: MessageReaction | PartialMessageReaction): Promise<{
     identifier: string | null
     metadata: Record<string, unknown>
-  } {
+  }> {
     if (reaction.emoji.id) {
+      const serverId = await this.emojiServerFor(reaction.message.guildId)
+      const linked = this.linkedHarmonyEmoji(reaction.emoji.id, serverId)
+      if (linked) return { identifier: linked.id, metadata: {} }
       const animated = reaction.emoji.animated
         ?? reaction.message.guild?.emojis.cache.get(reaction.emoji.id)?.animated
         ?? false
@@ -1919,7 +1930,7 @@ export class BridgeRuntime {
         return
       }
 
-      const { identifier, metadata: emojiMetadata } = this.discordReactionIdentifier(reaction)
+      const { identifier, metadata: emojiMetadata } = await this.discordReactionIdentifier(reaction)
       if (!identifier) {
         this.log.warn('Could not determine emoji identifier for Discord reaction')
         return
@@ -1967,7 +1978,7 @@ export class BridgeRuntime {
         return
       }
 
-      const { identifier } = this.discordReactionIdentifier(reaction)
+      const { identifier } = await this.discordReactionIdentifier(reaction)
       if (!identifier) {
         this.log.warn('Could not determine emoji identifier for Discord reaction')
         return
@@ -1997,7 +2008,7 @@ export class BridgeRuntime {
         return
       }
 
-      const contentParts = this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext())
+      const contentParts = this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(await this.emojiServerFor(newMsg.guildId)))
       await this.harmony.editMessage(harmonyMessageId, contentParts)
       this.log.info(`Discord → Harmony edit: ${newMsg.id} → ${harmonyMessageId}`)
     } catch (error) {
@@ -2447,12 +2458,56 @@ export class BridgeRuntime {
    * image; `discord:name:id` maps back to the Discord emoji; unicode passes
    * through. A bare name without an emoji row matches a guild emoji by name.
    */
+  /** Harmony server of a bridged guild, with its emoji links loaded. */
+  private async emojiServerFor(guildId: string | null | undefined): Promise<string | undefined> {
+    const serverId = guildId ? this.dir.getBridgeForDiscordGuild(guildId)?.harmonyServerId : undefined
+    if (serverId) await this.emojiLinks.ensure(serverId)
+    return serverId
+  }
+
+  private async refreshEmojiLinks(): Promise<void> {
+    for (const bridge of this.dir.getBridges()) {
+      if (bridge.harmonyServerId) await this.emojiLinks.ensure(bridge.harmonyServerId)
+    }
+  }
+
+  /** Harmony emoji row a Discord emoji is imported as; the message's server first. */
+  private linkedHarmonyEmoji(discordEmojiId: string, serverId?: string) {
+    if (serverId) {
+      const own = this.emojiLinks.harmonyFor(serverId, discordEmojiId)
+      if (own) return own
+    }
+    for (const bridge of this.dir.getBridges()) {
+      const row = bridge.harmonyServerId ? this.emojiLinks.harmonyFor(bridge.harmonyServerId, discordEmojiId) : null
+      if (row) return row
+    }
+    return null
+  }
+
+  /** Discord emoji a Harmony emoji was imported from. */
+  private linkedDiscordEmoji(harmonyEmojiId: string): { id: string; name: string; animated: boolean } | null {
+    for (const bridge of this.dir.getBridges()) {
+      if (!bridge.harmonyServerId) continue
+      const id = this.emojiLinks.discordFor(bridge.harmonyServerId, harmonyEmojiId)
+      if (!id) continue
+      const row = this.emojiLinks.harmonyFor(bridge.harmonyServerId, id)!
+      return { id, name: row.name, animated: /\.gif(\?|$)/i.test(row.url ?? '') }
+    }
+    return null
+  }
+
   private async resolveDiscordEmojiForReaction(
     channel: TextChannel,
     data: any,
   ): Promise<{ identifier: string; appUrl?: string } | null> {
     const emoji = data?.emoji
     if (emoji && typeof emoji === 'object' && typeof emoji.id === 'string' && emoji.id) {
+      await this.emojiServerFor(channel.guild.id)
+      const linked = this.linkedDiscordEmoji(emoji.id)
+      if (linked) {
+        const guildEmoji = channel.guild.emojis.cache.get(linked.id)
+        return { identifier: guildEmoji ? guildEmoji.identifier : `${linked.animated ? 'a:' : ''}${linked.name}:${linked.id}` }
+      }
       // Harmony 1.6.16 sends the image URL with the reaction; older gateways need a lookup.
       const row = typeof emoji.url === 'string' && /^https?:\/\//.test(emoji.url)
         ? { name: typeof emoji.name === 'string' && emoji.name ? emoji.name : 'emoji', url: emoji.url }

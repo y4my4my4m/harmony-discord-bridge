@@ -229,6 +229,8 @@ and is counted in the log the same way.
 - `/bridge clone-server`: create a Harmony channel for every Discord channel
   (and optionally the roles) and pair them. Never overwrites; safe to re-run.
 - `/bridge sync-order`: copy Discord's channel and category order to Harmony.
+- `/bridge sync-perms`: copy Discord roles and the permissions of every linked channel to Harmony.
+- `/bridge import-emojis`: copy the server's custom emoji into the Harmony server under the same names (Harmony 1.6.25+). A rerun adds only new ones; a Harmony emoji with the same name is linked instead of duplicated. Imported emoji are one emoji on both sides, so reactions with it count together.
 
 `/bridge` needs the Discord **Administrator** permission.
 

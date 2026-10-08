@@ -324,3 +324,29 @@ describe('MessageTranslator.discordToHarmonyParts', () => {
     expect(parts).toEqual([{ type: 'text', text: 'yes' }])
   })
 })
+
+describe('imported Discord emoji', () => {
+  const row = { id: 'he-1', name: 'catjam', url: 'https://db.test/emojis/s/discord/111.gif' }
+
+  it('maps a Discord emoji token to the Harmony server emoji imported from it', () => {
+    const parts = translator().discordToHarmonyParts(discordMessage({ content: 'hi <a:catjam:111> <:other:222>' }), {
+      harmonyEmojiFor: id => (id === '111' ? row : null),
+    })
+    expect(parts[1]).toEqual({
+      type: 'emoji',
+      emoji: { id: 'he-1', name: 'catjam', url: row.url, domain: null, display_name: 'catjam' },
+    })
+    expect(parts[3]).toMatchObject({ type: 'emoji', emoji: { id: null, domain: 'discord.com', name: 'other' } })
+  })
+
+  it('renders an imported Harmony emoji as its Discord emoji, not an application emoji', () => {
+    const out = translator().renderHarmonyForDiscord(
+      { content_raw: [{ type: 'emoji', emoji: { id: 'he-1', name: 'catjam', url: row.url } }] },
+      {
+        discordEmojiFor: e => (e.id === 'he-1' ? { id: '111', name: 'catjam', animated: true } : null),
+        appEmojiFor: () => ({ id: '999', name: 'app', animated: false }),
+      },
+    )
+    expect(out.content).toBe('<a:catjam:111>')
+  })
+})

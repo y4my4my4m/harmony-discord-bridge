@@ -2,20 +2,35 @@ import type { EventEmitter } from 'events'
 import {
   ChannelType,
   OverwriteType,
+  PermissionFlagsBits,
   type DMChannel,
   type Guild,
   type Role,
   type NonThreadGuildBasedChannel,
+  type PermissionOverwrites,
 } from 'discord.js'
 import { HarmonyClient, HarmonyHttpError } from './HarmonyClient.js'
 import type { PairDirectory } from './runtime/PairDirectory.js'
 import { PermissionSyncStore } from './PermissionSyncStore.js'
 import { Logger } from './log.js'
 import {
+  discordBitfieldToHarmonyMask,
   discordRoleToHarmonyPermissions,
   discordColorToHex,
   discordOverwriteToHarmonyMasks,
 } from './utils/discordPermissions.js'
+
+const HARMONY_VIEW_CHANNEL = BigInt(discordBitfieldToHarmonyMask(PermissionFlagsBits.ViewChannel))
+
+/**
+ * @everyone's overwrite on the channel denies ViewChannel. Discord computes a channel's
+ * permissions from its own overwrites; a channel synced to its category holds a copy of the
+ * category's.
+ */
+export function hiddenFromEveryone(channel: NonThreadGuildBasedChannel): boolean {
+  const everyone = channel.permissionOverwrites.cache.get(channel.guildId)
+  return !!everyone && (everyone.deny.bitfield & PermissionFlagsBits.ViewChannel) !== 0n
+}
 
 /** Outcome of one role reconcile, as /bridge sync-perms reports it. */
 export interface RoleSyncReport {
@@ -359,29 +374,18 @@ export class PermissionSync {
     }
     const channel = refreshed as NonThreadGuildBasedChannel
 
+    // bot-gateway refuses an override write that grants a bit outside the bot's permissions in
+    // the channel (botChannelMask), and the bot holds @everyone alone: a role VIEW_CHANNEL allow
+    // written after @everyone's VIEW_CHANNEL deny is refused. @everyone's override never widens
+    // that mask, so it is written last.
+    const overwrites = [...channel.permissionOverwrites.cache.values()]
+      .filter(overwrite => overwrite.type === OverwriteType.Role) // skip member-specific overwrites
+    const everyone = overwrites.filter(overwrite => overwrite.id === guild.id)
+
     const discordRoleIds = new Set<string>()
-    for (const overwrite of channel.permissionOverwrites.cache.values()) {
-      if (overwrite.type !== OverwriteType.Role) continue // skip member-specific overwrites
-
-      const harmonyRoleId = await this.resolveHarmonyRoleId(guild, overwrite.id)
-      if (!harmonyRoleId) continue
-
-      discordRoleIds.add(overwrite.id)
-      const { allow, deny } = discordOverwriteToHarmonyMasks(
-        overwrite.allow.bitfield,
-        overwrite.deny.bitfield,
-      )
-
-      if (allow === '0' && deny === '0') {
-        await this.harmony.deleteChannelPermissionOverrideForRole(harmonyChannelId, harmonyRoleId)
-      } else {
-        await this.harmony.upsertChannelPermissionOverride(harmonyChannelId, {
-          target_type: 'role',
-          role_id: harmonyRoleId,
-          allow_permissions: allow,
-          deny_permissions: deny,
-        })
-      }
+    for (const overwrite of overwrites) {
+      if (overwrite.id === guild.id) continue
+      if (await this.writeRoleOverwrite(guild, overwrite, harmonyChannelId)) discordRoleIds.add(overwrite.id)
     }
 
     // Remove Harmony overrides for roles no longer present on the Discord channel.
@@ -393,6 +397,64 @@ export class PermissionSync {
         await this.harmony.deleteChannelPermissionOverrideForRole(harmonyChannelId, row.role_id)
       }
     }
+
+    for (const overwrite of everyone) await this.writeRoleOverwrite(guild, overwrite, harmonyChannelId)
+  }
+
+  /** Mirrors one Discord role overwrite onto the Harmony channel. False when the role has no Harmony role. */
+  private async writeRoleOverwrite(
+    guild: Guild,
+    overwrite: PermissionOverwrites,
+    harmonyChannelId: string,
+  ): Promise<boolean> {
+    const harmonyRoleId = await this.resolveHarmonyRoleId(guild, overwrite.id)
+    if (!harmonyRoleId) return false
+
+    const { allow, deny } = discordOverwriteToHarmonyMasks(
+      overwrite.allow.bitfield,
+      overwrite.deny.bitfield,
+    )
+    if (allow === '0' && deny === '0') {
+      await this.harmony.deleteChannelPermissionOverrideForRole(harmonyChannelId, harmonyRoleId)
+    } else {
+      await this.harmony.upsertChannelPermissionOverride(harmonyChannelId, {
+        target_type: 'role',
+        role_id: harmonyRoleId,
+        allow_permissions: allow,
+        deny_permissions: deny,
+      })
+    }
+    return true
+  }
+
+  /** The Harmony server's default role, read from Harmony and recorded as @everyone's. */
+  async loadDefaultRole(guildId: string): Promise<string> {
+    const roles = await this.harmony.getServerRoles(this.requireServerId(guildId))
+    const id = roles.find((r: any) => r.is_default)?.id
+    if (typeof id !== 'string' || !id) throw new Error('Harmony server has no default role')
+    if (this.store.getDefaultHarmonyRoleId() !== id) this.store.setDefaultHarmonyRoleId(id)
+    return id
+  }
+
+  /**
+   * The default role's override on the channel denies VIEW_CHANNEL; its other bits are kept and a
+   * VIEW_CHANNEL allow is dropped, as an allow outranks a deny in the same override. Dropping an
+   * allow or adding a deny grants nothing, which bot-gateway accepts from any manage_channels bot.
+   */
+  async hideFromEveryone(harmonyChannelId: string, defaultRoleId: string): Promise<void> {
+    const overrides = await this.harmony.getChannelPermissionOverrides(harmonyChannelId)
+    const current = overrides.find((r: any) => r.target_type === 'role' && r.role_id === defaultRoleId)
+    const oldAllow = BigInt(current?.allow_permissions ?? 0)
+    const oldDeny = BigInt(current?.deny_permissions ?? 0)
+    const allow = oldAllow & ~HARMONY_VIEW_CHANNEL
+    const deny = oldDeny | HARMONY_VIEW_CHANNEL
+    if (current && allow === oldAllow && deny === oldDeny) return
+    await this.harmony.upsertChannelPermissionOverride(harmonyChannelId, {
+      target_type: 'role',
+      role_id: defaultRoleId,
+      allow_permissions: allow.toString(),
+      deny_permissions: deny.toString(),
+    })
   }
 
   private async resolveHarmonyRoleId(guild: Guild, discordRoleId: string): Promise<string | null> {

@@ -8,12 +8,13 @@ import {
   type ChatInputCommandInteraction,
   type GuildMember,
   type Interaction,
+  type NonThreadGuildBasedChannel,
   type Role as DiscordRole,
 } from 'discord.js'
 import type { BridgeRuntime, CachedHarmonyUser } from './BridgeRuntime.js'
 import { directionLabel, type NewPair, type PairDirection } from './PairDirectory.js'
 import { joinLinesWithinDiscordLimit } from '../utils/discordMessage.js'
-import type { RoleSyncReport } from '../PermissionSync.js'
+import { hiddenFromEveryone, type RoleSyncReport } from '../PermissionSync.js'
 import { buildDiscordStructurePlan, syncDiscordStructureOrderToHarmony } from '../discordChannelOrder.js'
 import {
   formatHarmonyUserAutocompleteLabel,
@@ -551,6 +552,9 @@ function cloneableDiscordRoles(guild: { roles: { cache: Map<string, DiscordRole>
  * Harmony channels with the same name are reused. With clone_roles, Discord
  * roles are recreated (matched by name) with mapped permissions.
  * The Harmony bot needs manage_channels; the gateway enforces it.
+ *
+ * A channel hidden from @everyone on Discord is hidden from @everyone on
+ * Harmony before it is paired; when that write fails, it stays unpaired.
  */
 async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
   const dryRun = command.options.getBoolean('dry_run', false) ?? false
@@ -573,6 +577,12 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
 
   const alreadyMapped = new Set(rt.dir.getAllMappings(guild.id).map(m => m.discord))
   const toCreate = planned.filter(p => !alreadyMapped.has(p.discordId))
+  const discordChannel = (id: string) => guild.channels.cache.get(id) as NonThreadGuildBasedChannel | undefined
+  // A channel absent from the cache counts as hidden.
+  const isPrivate = (id: string) => {
+    const channel = discordChannel(id)
+    return !channel || hiddenFromEveryone(channel)
+  }
 
   let rolesToClone: DiscordRole[] = []
   if (cloneRoles) {
@@ -608,7 +618,8 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
       if (p.discordCategoryName && !categoryIdByName.has(p.discordCategoryName)) {
         categoriesNeeded.add(p.discordCategoryName)
       }
-      lines.push(`• \`#${p.name}\` (order ${p.position}) → ${action} ${cat}`.trimEnd())
+      const hidden = isPrivate(p.discordId) ? ', hidden from @everyone' : ''
+      lines.push(`• \`#${p.name}\` (order ${p.position}) → ${action} ${cat}`.trimEnd() + hidden)
     }
     if (categoriesNeeded.size > 0) {
       lines.splice(1, 0,
@@ -647,38 +658,7 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
     }
   }
 
-  for (const p of toCreate) {
-    try {
-      const harmonyCategoryId = p.discordCategoryName ? categoryIdByName.get(p.discordCategoryName) ?? null : null
-      let harmonyChannelId: string
-      const reuse = harmonyChannelByName.get(p.name)
-      if (reuse) {
-        harmonyChannelId = reuse.id
-        reused++
-      } else {
-        const newCh = await rt.harmony.createChannel(harmonyServerId, {
-          name: p.name,
-          type: p.harmonyType,
-          categoryId: harmonyCategoryId,
-          order: p.position,
-        })
-        harmonyChannelId = newCh.id
-        created++
-      }
-      newPairs.push({ discord: p.discordId, discordName: p.name, harmony: harmonyChannelId, direction: 'both', name: p.name })
-    } catch (err) {
-      failures.push(`\`#${p.name}\`: ${errorText(err)}`)
-    }
-  }
-
-  let added: NewPair[] = []
-  try {
-    added = await rt.writer.linkMany(guild.id, newPairs)
-    await rt.hooks.afterPairsWritten?.()
-  } catch (err) {
-    failures.push(`pairing: ${errorText(err)}`)
-  }
-
+  // Roles precede channels: a channel's overrides are written before it is paired.
   let rolesCreated = 0
   const rolesAdjusted: string[] = []
   if (cloneRoles) {
@@ -694,6 +674,77 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
     }
     try {
       await rt.permissionSync.reconcileRoles(guild)
+    } catch (err) {
+      failures.push(`permission sync: ${errorText(err)}`)
+    }
+  }
+
+  let defaultRoleId: string | null = null
+  let defaultRoleError = ''
+  if (cloneRoles || toCreate.some(p => isPrivate(p.discordId))) {
+    try {
+      defaultRoleId = await rt.permissionSync.loadDefaultRole(guild.id)
+    } catch (err) {
+      defaultRoleError = errorText(err)
+    }
+  }
+
+  let hidden = 0
+  for (const p of toCreate) {
+    let harmonyChannelId: string
+    try {
+      const harmonyCategoryId = p.discordCategoryName ? categoryIdByName.get(p.discordCategoryName) ?? null : null
+      const reuse = harmonyChannelByName.get(p.name)
+      if (reuse) {
+        harmonyChannelId = reuse.id
+        reused++
+      } else {
+        const newCh = await rt.harmony.createChannel(harmonyServerId, {
+          name: p.name,
+          type: p.harmonyType,
+          categoryId: harmonyCategoryId,
+          order: p.position,
+        })
+        harmonyChannelId = newCh.id
+        created++
+      }
+    } catch (err) {
+      failures.push(`\`#${p.name}\`: ${errorText(err)}`)
+      continue
+    }
+
+    const channel = discordChannel(p.discordId)
+    if (cloneRoles && channel) {
+      try {
+        await rt.permissionSync.syncChannelOverwrites(channel, harmonyChannelId)
+      } catch (err) {
+        failures.push(`permissions \`#${p.name}\`: ${errorText(err)}`)
+      }
+    }
+    if (isPrivate(p.discordId)) {
+      try {
+        if (!defaultRoleId) throw new Error(defaultRoleError || 'Harmony default role unknown')
+        await rt.permissionSync.hideFromEveryone(harmonyChannelId, defaultRoleId)
+        hidden++
+      } catch (err) {
+        rt.log.error(`clone-server: #${p.name} is hidden from @everyone on Discord; hiding Harmony channel ${harmonyChannelId} failed, left unbridged: ${errorText(err)}`)
+        failures.push(`\`#${p.name}\`: left unbridged; it is private on Discord and hiding it from @everyone on Harmony failed: ${errorText(err)}`)
+        continue
+      }
+    }
+    newPairs.push({ discord: p.discordId, discordName: p.name, harmony: harmonyChannelId, direction: 'both', name: p.name })
+  }
+
+  let added: NewPair[] = []
+  try {
+    added = await rt.writer.linkMany(guild.id, newPairs)
+    await rt.hooks.afterPairsWritten?.()
+  } catch (err) {
+    failures.push(`pairing: ${errorText(err)}`)
+  }
+
+  if (cloneRoles) {
+    try {
       await rt.permissionSync.syncAllMappedChannelOverwrites(guild)
     } catch (err) {
       failures.push(`permission sync: ${errorText(err)}`)
@@ -718,6 +769,7 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
     `✅ Clone complete for **${guild.name}**`,
     `• Channels created: ${created}`,
     `• Channels reused (matched by name): ${reused}`,
+    `• Private channels hidden from @everyone: ${hidden}`,
     `• Categories created: ${categoriesCreated}`,
     `• Category orders updated: ${categoriesOrderUpdated}`,
     `• Mappings written: ${added.length}`,
@@ -805,6 +857,7 @@ async function runBridgeSyncPerms(rt: BridgeRuntime, command: ChatInputCommandIn
   try {
     await guild.roles.fetch()
     const report = await rt.permissionSync.reconcileRoles(guild)
+    await rt.permissionSync.loadDefaultRole(guild.id)
     await rt.permissionSync.syncAllMappedChannelOverwrites(guild)
     await command.editReply({ content: joinLinesWithinDiscordLimit(roleSyncSummary(guild.name, report, linked)) })
   } catch (err) {

@@ -118,6 +118,45 @@ describe('MessageTranslator.harmonyToDiscord', () => {
     expect(out).not.toMatch(/(^|\s)https:\/\/h\.example/)
   })
 
+  it('sends GIF picker media as its bare URL so Discord embeds it', () => {
+    const gif = 'https://static.klipy.com/ii/4493325008d34b7bf8cd6813cd5c1619/79/09/1SmrWHK2pCmD.gif'
+    const only = translator().renderHarmonyForDiscord({
+      content_raw: [{ type: 'file', url: `${gif}#harmony-klipy=item=https%3A%2F%2Fklipy.com%2Fgifs%2Fkangaroo-kick-3--klLjSIr5C`, fileType: 'image' }],
+    })
+    expect(only.content).toBe(gif)
+    expect(only.suppressEmbeds).toBe(false)
+
+    const clip = 'https://static.klipy.com/ii/abc/clip.mp4'
+    const mixed = translator().renderHarmonyForDiscord({
+      content_raw: [
+        { type: 'text', text: 'lol' },
+        { type: 'file', url: `${clip}#harmony-klipy=kind=clip`, fileType: 'video' },
+        { type: 'url', url: 'https://x.example/page', preview: false },
+      ],
+    })
+    expect(mixed.content).toBe(`lol\n${clip}\n<https://x.example/page>`)
+    expect(mixed.suppressEmbeds).toBe(false)
+  })
+
+  it('keeps storage, private-host and non-media files as masked links', () => {
+    const out = translator().harmonyToDiscord({
+      content_raw: [
+        { type: 'file', url: 'https://h.example/storage/v1/object/public/emojis/a.gif', fileType: 'image' },
+        { type: 'file', url: 'https://cdn.example/x.gif', path: 'c/1/u/x.gif', fileType: 'image' },
+        { type: 'file', url: 'http://cdn.example/plain.gif', fileType: 'image' },
+        { type: 'file', url: 'https://media.local/a.gif', fileType: 'image' },
+        { type: 'file', url: 'https://cdn.example/notes.gif', fileType: 'file' },
+      ],
+    })
+    expect(out).toBe([
+      '[a.gif](<https://h.example/storage/v1/object/public/emojis/a.gif>)',
+      '[x.gif](<https://cdn.example/x.gif>)',
+      '[plain.gif](<http://cdn.example/plain.gif>)',
+      '[a.gif](<https://media.local/a.gif>)',
+      '[notes.gif](<https://cdn.example/notes.gif>)',
+    ].join('\n'))
+  })
+
   it('leaves uploaded files out of the text and keeps the caption', () => {
     const out = translator().renderHarmonyForDiscord({
       content_raw: [

@@ -110,12 +110,17 @@ export function buildCommands(mode: 'v1' | 'v2') {
       sub
         .setName('sync-perms')
         .setDescription('Sync Discord roles and channel permissions onto Harmony (linked channels only)'))
-    .addSubcommand(sub =>
+
+  // Harmony accepts emoji imports only from the bot of a server's discord_bridges row, which
+  // v1 (YAML-configured) bridges lack.
+  if (mode === 'v2') {
+    bridgeCommand.addSubcommand(sub =>
       sub
         .setName('import-emojis')
         .setDescription('Copy this server\'s custom emojis into the Harmony server (rerun adds only new ones)')
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('List what would be imported without changes').setRequired(false)))
+  }
 
   return [
     addUserOptions(new SlashCommandBuilder()

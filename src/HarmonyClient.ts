@@ -25,11 +25,14 @@ const GATEWAY_FRAME_WINDOW_MS = 60_000
 export class HarmonyHttpError extends Error {
   /** `code` of the gateway's error body, e.g. AUTOMOD_BLOCKED. */
   readonly code: string | null
+  /** The gateway's error body, e.g. `missing_permissions`, `max_position`. */
+  readonly details: Record<string, unknown>
 
-  constructor(message: string, readonly status: number, code: string | null = null) {
+  constructor(message: string, readonly status: number, code: string | null = null, details: Record<string, unknown> = {}) {
     super(message)
     this.name = 'HarmonyHttpError'
     this.code = code
+    this.details = details
   }
 }
 
@@ -338,7 +341,8 @@ export class HarmonyClient extends EventEmitter {
     if (res.ok) return res
     const errorData = await res.json().catch(() => ({})) as any
     const code = typeof errorData?.code === 'string' ? errorData.code : null
-    throw new HarmonyHttpError(errorData?.error || `${fallback} (${res.status})`, res.status, code)
+    const details = errorData && typeof errorData === 'object' ? errorData as Record<string, unknown> : {}
+    throw new HarmonyHttpError(errorData?.error || `${fallback} (${res.status})`, res.status, code, details)
   }
 
   private async getJson<T>(path: string, fallback: string): Promise<T> {

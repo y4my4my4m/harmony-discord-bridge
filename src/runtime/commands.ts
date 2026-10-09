@@ -13,10 +13,7 @@ import {
 import type { BridgeRuntime, CachedHarmonyUser } from './BridgeRuntime.js'
 import { directionLabel, type NewPair, type PairDirection } from './PairDirectory.js'
 import { joinLinesWithinDiscordLimit } from '../utils/discordMessage.js'
-import {
-  discordRoleToHarmonyPermissions,
-  discordColorToHex,
-} from '../utils/discordPermissions.js'
+import type { RoleSyncReport } from '../PermissionSync.js'
 import { buildDiscordStructurePlan, syncDiscordStructureOrderToHarmony } from '../discordChannelOrder.js'
 import {
   formatHarmonyUserAutocompleteLabel,
@@ -683,19 +680,14 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
   }
 
   let rolesCreated = 0
+  const rolesAdjusted: string[] = []
   if (cloneRoles) {
     for (const role of rolesToClone) {
       try {
-        const createdRole = await rt.harmony.createRole(harmonyServerId, {
-          name: role.name,
-          color: discordColorToHex(role.color),
-          position: role.position,
-          permissions: discordRoleToHarmonyPermissions(role),
-          mentionable: role.mentionable,
-          hoist: role.hoist,
-        })
-        rt.permissionSyncStore.setMapping(role.id, createdRole.id, role.name)
+        const notes: string[] = []
+        await rt.permissionSync.upsertHarmonyRole(role, notes)
         rolesCreated++
+        if (notes.length) rolesAdjusted.push(`\`${role.name}\`: ${notes.join('; ')}`)
       } catch (err) {
         failures.push(`role \`${role.name}\`: ${errorText(err)}`)
       }
@@ -731,7 +723,7 @@ async function runBridgeCloneServer(rt: BridgeRuntime, command: ChatInputCommand
     `• Mappings written: ${added.length}`,
     `• Order synced: ${orderSync.categoriesUpdated} categor${orderSync.categoriesUpdated === 1 ? 'y' : 'ies'}, ${orderSync.channelsUpdated} channel(s)`,
   ]
-  if (cloneRoles) summary.push(`• Roles created: ${rolesCreated}`)
+  if (cloneRoles) summary.push(`• Roles created: ${rolesCreated}`, ...rolesAdjusted.map(a => `  • ${a}`))
   if (failures.length) {
     summary.push('', `⚠️ ${failures.length} failure(s):`, ...failures.map(f => `  • ${f}`))
   }
@@ -812,20 +804,35 @@ async function runBridgeSyncPerms(rt: BridgeRuntime, command: ChatInputCommandIn
 
   try {
     await guild.roles.fetch()
-    await rt.permissionSync.reconcileRoles(guild)
+    const report = await rt.permissionSync.reconcileRoles(guild)
     await rt.permissionSync.syncAllMappedChannelOverwrites(guild)
-    const roles = cloneableDiscordRoles(guild).length
-    await command.editReply({
-      content: [
-        `✅ Permissions synced for **${guild.name}**`,
-        `• Roles: ${roles} Discord role(s) matched or created on Harmony`,
-        `• Channels: overwrites applied to ${linked} linked channel(s)`,
-        '_Roles Harmony refuses (above the bot, or protected) are skipped; see `/bridge status` and the bridge log._',
-      ].join('\n'),
-    })
+    await command.editReply({ content: joinLinesWithinDiscordLimit(roleSyncSummary(guild.name, report, linked)) })
   } catch (err) {
     await command.editReply({ content: `❌ Permission sync failed: ${errorText(err)}` })
   }
+}
+
+/** Lines of the /bridge sync-perms reply: what Harmony accepted, adjusted and refused. */
+export function roleSyncSummary(guildName: string, report: RoleSyncReport, linkedChannels: number): string[] {
+  const refused = report.failed.length
+  const lines = [
+    `${refused ? '⚠️' : '✅'} Permissions synced for **${guildName}**`,
+    `• Roles: ${report.created} created, ${report.updated} updated${refused ? `, ${refused} refused` : ''}`,
+    `• Channels: overwrites applied to ${linkedChannels} linked channel(s)`,
+  ]
+  if (report.adjusted.length) {
+    lines.push('', 'Adjusted:', ...report.adjusted.map(a => `  • \`${a.name}\`: ${a.notes.join('; ')}`))
+  }
+  if (refused) {
+    lines.push('', 'Refused by Harmony:', ...report.failed.slice(0, 15).map(f => `  • \`${f.name}\`: ${f.error}`))
+    if (report.failed.some(f => /manage_roles/.test(f.error))) {
+      lines.push('', 'The bridge bot lacks manage_roles on Harmony; Harmony 1.6.27 grants it to bridge bots.')
+    }
+    if (report.failed.some(f => /position/.test(f.error))) {
+      lines.push('', 'A role cannot sit at or above an Administrator role: move the Admin role up in Harmony\'s Server Settings → Roles, then run this again.')
+    }
+  }
+  return lines
 }
 
 /** Discord emoji imported per call; Harmony stores each image, so a run is bounded. */

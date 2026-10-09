@@ -7,7 +7,7 @@ import {
   type Role,
   type NonThreadGuildBasedChannel,
 } from 'discord.js'
-import { HarmonyClient } from './HarmonyClient.js'
+import { HarmonyClient, HarmonyHttpError } from './HarmonyClient.js'
 import type { PairDirectory } from './runtime/PairDirectory.js'
 import { PermissionSyncStore } from './PermissionSyncStore.js'
 import { Logger } from './log.js'
@@ -16,6 +16,67 @@ import {
   discordColorToHex,
   discordOverwriteToHarmonyMasks,
 } from './utils/discordPermissions.js'
+
+/** Outcome of one role reconcile, as /bridge sync-perms reports it. */
+export interface RoleSyncReport {
+  created: number
+  updated: number
+  /** Roles written with less than Discord gives them. */
+  adjusted: Array<{ name: string; notes: string[] }>
+  failed: Array<{ name: string; error: string }>
+}
+
+interface RolePayload {
+  name: string
+  color: string | null
+  position: number
+  permissions: string
+  mentionable: boolean
+  hoist: boolean
+}
+
+function rolePayload(role: Role): RolePayload {
+  return {
+    name: role.name,
+    color: discordColorToHex(role.color),
+    position: role.position,
+    permissions: discordRoleToHarmonyPermissions(role),
+    mentionable: role.mentionable,
+    hoist: role.hoist,
+  }
+}
+
+/**
+ * Writes a role, stepping back from what bot-gateway refuses with 403: permission bits the bot
+ * cannot grant (`missing_permissions`) are left off, and a position at or above its cap
+ * (`max_position`) moves to the cap. Each step back is described in `notes`. Anything else, a
+ * missing manage_roles included, is thrown.
+ */
+export async function writeRoleWithinLimits<T>(
+  write: (payload: RolePayload) => Promise<T>,
+  payload: RolePayload,
+  notes: string[],
+): Promise<T> {
+  let current = { ...payload }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await write(current)
+    } catch (err) {
+      if (attempt >= 2 || !(err instanceof HarmonyHttpError) || err.status !== 403) throw err
+      const missing = err.details.missing_permissions
+      const maxPosition = err.details.max_position
+      if (typeof missing === 'string' && /^\d+$/.test(missing) && /^\d+$/.test(current.permissions)) {
+        current = { ...current, permissions: (BigInt(current.permissions) & ~BigInt(missing)).toString() }
+        notes.push('permissions the bridge bot cannot grant were left off')
+      } else if (typeof maxPosition === 'number' && maxPosition >= 1 && current.position > maxPosition) {
+        current = { ...current, position: maxPosition }
+        notes.push(`placed at position ${maxPosition}, the highest the bridge bot may manage`)
+      } else {
+        throw err
+      }
+    }
+  }
+}
 
 /**
  * Live Discord → Harmony permission sync: server roles + channel overrides.
@@ -178,8 +239,12 @@ export class PermissionSync {
     }
   }
 
-  /** Match Discord roles to Harmony roles by stored mapping or by name. */
-  async reconcileRoles(guild: Guild): Promise<void> {
+  /**
+   * Match Discord roles to Harmony roles by stored mapping or by name, creating the rest. A
+   * mapping whose Harmony role no longer exists is dropped and the role matched or created anew.
+   */
+  async reconcileRoles(guild: Guild): Promise<RoleSyncReport> {
+    const report: RoleSyncReport = { created: 0, updated: 0, adjusted: [], failed: [] }
     const serverId = this.requireServerId(guild.id)
     const harmonyRoles = await this.harmony.getServerRoles(serverId)
     const harmonyById = new Map(harmonyRoles.map((r: any) => [r.id, r]))
@@ -193,57 +258,49 @@ export class PermissionSync {
       if (role.managed) continue
       if (role.id === guild.id) continue // @everyone — channel overrides only
 
+      const notes: string[] = []
       try {
-        const existingId = this.store.getHarmonyRoleId(role.id)
+        let existingId = this.store.getHarmonyRoleId(role.id)
+        if (existingId && !harmonyById.has(existingId)) {
+          this.store.removeMapping(role.id)
+          existingId = undefined
+        }
         if (existingId) {
-          const existing = harmonyById.get(existingId)
-          if (existing && this.isProtectedHarmonyRole(existing)) continue
-
-          await this.harmony.updateRole(serverId, existingId, {
-            name: role.name,
-            color: discordColorToHex(role.color),
-            position: role.position,
-            permissions: discordRoleToHarmonyPermissions(role),
-            mentionable: role.mentionable,
-            hoist: role.hoist,
-          })
-          continue
+          if (this.isProtectedHarmonyRole(harmonyById.get(existingId))) continue
+          await writeRoleWithinLimits(p => this.harmony.updateRole(serverId, existingId!, p), rolePayload(role), notes)
+          report.updated++
+        } else {
+          const byName = harmonyByName.get(role.name)
+          if (byName) {
+            this.store.setMapping(role.id, byName.id, role.name)
+            await writeRoleWithinLimits(p => this.harmony.updateRole(serverId, byName.id, p), rolePayload(role), notes)
+            report.updated++
+          } else {
+            const created = await writeRoleWithinLimits(p => this.harmony.createRole(serverId, p), rolePayload(role), notes)
+            this.store.setMapping(role.id, created.id, role.name)
+            report.created++
+          }
         }
-
-        const byName = harmonyByName.get(role.name)
-        if (byName) {
-          this.store.setMapping(role.id, byName.id, role.name)
-          await this.harmony.updateRole(serverId, byName.id, {
-            color: discordColorToHex(role.color),
-            position: role.position,
-            permissions: discordRoleToHarmonyPermissions(role),
-            mentionable: role.mentionable,
-            hoist: role.hoist,
-          })
-          continue
-        }
-
-        const created = await this.harmony.createRole(serverId, {
-          name: role.name,
-          color: discordColorToHex(role.color),
-          position: role.position,
-          permissions: discordRoleToHarmonyPermissions(role),
-          mentionable: role.mentionable,
-          hoist: role.hoist,
-        })
-        this.store.setMapping(role.id, created.id, role.name)
+        if (notes.length) report.adjusted.push({ name: role.name, notes })
       } catch (err) {
+        report.failed.push({ name: role.name, error: err instanceof Error ? err.message : String(err) })
         this.log.error(`🔐 Failed to sync role "${role.name}":`, err)
       }
     }
+    return report
   }
 
-  async upsertHarmonyRole(role: Role): Promise<string> {
+  /** Creates or updates the Harmony role for `role`; step-backs are appended to `notes`. */
+  async upsertHarmonyRole(role: Role, notes: string[] = []): Promise<string> {
     const serverId = this.requireServerId(role.guild.id)
+    const harmonyRoles = await this.harmony.getServerRoles(serverId)
     let harmonyRoleId = this.store.getHarmonyRoleId(role.id)
+    if (harmonyRoleId && !harmonyRoles.some((r: any) => r.id === harmonyRoleId)) {
+      this.store.removeMapping(role.id)
+      harmonyRoleId = undefined
+    }
 
     if (!harmonyRoleId) {
-      const harmonyRoles = await this.harmony.getServerRoles(serverId)
       const byName = harmonyRoles.find(
         (r: any) => r.name === role.name && !this.isProtectedHarmonyRole(r),
       )
@@ -253,27 +310,17 @@ export class PermissionSync {
       }
     }
 
-    const payload = {
-      name: role.name,
-      color: discordColorToHex(role.color),
-      position: role.position,
-      permissions: discordRoleToHarmonyPermissions(role),
-      mentionable: role.mentionable,
-      hoist: role.hoist,
-    }
-
     if (harmonyRoleId) {
-      const harmonyRoles = await this.harmony.getServerRoles(serverId)
       const existing = harmonyRoles.find((r: any) => r.id === harmonyRoleId)
       if (existing && this.isProtectedHarmonyRole(existing)) {
         return harmonyRoleId
       }
-
-      await this.harmony.updateRole(serverId, harmonyRoleId, payload)
+      const id = harmonyRoleId
+      await writeRoleWithinLimits(p => this.harmony.updateRole(serverId, id, p), rolePayload(role), notes)
       return harmonyRoleId
     }
 
-    const created = await this.harmony.createRole(serverId, payload)
+    const created = await writeRoleWithinLimits(p => this.harmony.createRole(serverId, p), rolePayload(role), notes)
     this.store.setMapping(role.id, created.id, role.name)
     return created.id
   }

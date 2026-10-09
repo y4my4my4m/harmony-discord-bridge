@@ -1,4 +1,5 @@
 import { Logger } from './log.js'
+import { isPublicHttpsUrl } from './utils/fetchCapped.js'
 
 /** Discord MessageFlags.IsVoiceMessage. */
 const VOICE_MESSAGE_FLAG = 1 << 13
@@ -293,6 +294,25 @@ export function maskedFileLink(part: { url: string; fileName?: unknown; fileSize
   const name = harmonyFileName(part).replace(/([\\[\]*_~`|()])/g, '\\$1')
   const size = typeof part.fileSize === 'number' && part.fileSize > 0 ? ` · ${formatFileSize(part.fileSize)}` : ''
   return `[${name}${size}](<${part.url.replace(/>/g, '%3E')}>)`
+}
+
+/**
+ * Bare URL of a file part that Discord embeds from the link: an image or
+ * video on a public https host outside Supabase storage, with no storage
+ * path (GIF picker media). Harmony's `#harmony-…` fragment is dropped.
+ * Null for anything else.
+ */
+export function embeddableMediaUrl(part: { url?: unknown; path?: unknown; fileName?: unknown; fileType?: unknown }): string | null {
+  if (typeof part.url !== 'string' || (typeof part.path === 'string' && part.path)) return null
+  if (!isPublicHttpsUrl(part.url)) return null
+  const u = new URL(part.url)
+  if (u.pathname.includes('/storage/v1/')) return null
+  const type = typeof part.fileType === 'string'
+    ? part.fileType
+    : inferAttachmentFileType(typeof part.fileName === 'string' ? part.fileName : '', '', u.pathname)
+  if (type !== 'image' && type !== 'video') return null
+  if (u.hash.startsWith('#harmony-')) u.hash = ''
+  return u.toString()
 }
 
 /** File parts of a Harmony message, in order. */
@@ -596,8 +616,8 @@ export class MessageTranslator {
    * Harmony message to Discord content. The result can exceed 2000
    * characters; the sender splits it (splitDiscordContent). A mention
    * becomes `<@id>` only for a Discord user (domain discord.com); Harmony
-   * users stay `@user@domain`. Uploaded files produce no text; other files
-   * become masked links.
+   * users stay `@user@domain`. Uploaded files produce no text, external
+   * media its bare URL (embeddableMediaUrl); other files become masked links.
    */
   renderHarmonyForDiscord(harmonyMsg: any, ctx: HarmonyToDiscordContext = {}): DiscordRendering {
     const mentionIds: string[] = []
@@ -632,6 +652,11 @@ export class MessageTranslator {
             return { kind: 'inline', text: this.emojiText(part.emoji, ctx) }
           case 'file': {
             if (!part.url || ctx.uploadedFiles?.has(harmonyFileKey(part))) return { kind: 'file', text: '' }
+            const media = embeddableMediaUrl(part)
+            if (media) {
+              previewable++
+              return { kind: 'file', text: media }
+            }
             return { kind: 'file', text: maskedFileLink(part) }
           }
           case 'url': {

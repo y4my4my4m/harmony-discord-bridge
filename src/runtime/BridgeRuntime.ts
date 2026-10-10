@@ -27,6 +27,7 @@ import {
   MessageTranslator,
   collectHarmonyCustomEmoji,
   collectHarmonyFiles,
+  defuseEveryonePings,
   type DiscordRendering,
   type DiscordToHarmonyContext,
   type HarmonyToDiscordContext,
@@ -242,6 +243,8 @@ interface Outbound {
   username: string
   avatarURL?: string
   mentionUserIds: string[]
+  /** The content pings @everyone or @here (DiscordRendering.mentionEveryone). */
+  mentionEveryone: boolean
   embeds?: APIEmbed[]
   primary: OutboundVariant
   /** Same message with every file as a link; null when `primary` has no attachments. */
@@ -1221,11 +1224,15 @@ export class BridgeRuntime {
     }
   }
 
-  /** Pings only the Discord users the message names; never roles, @everyone or @here. */
-  private allowedMentions(mentionUserIds?: string[]) {
+  /**
+   * Pings the Discord users the message names, and @everyone and @here when the rendering pings
+   * them (the Harmony author's right); never roles.
+   */
+  private allowedMentions(mentionUserIds?: string[], everyone = false) {
+    const parse: Array<'everyone'> = everyone ? ['everyone'] : []
     return mentionUserIds && mentionUserIds.length > 0
-      ? { parse: [] as const, users: mentionUserIds.slice(0, 100) }
-      : { parse: [] as const }
+      ? { parse, users: mentionUserIds.slice(0, 100) }
+      : { parse }
   }
 
   /**
@@ -1292,7 +1299,7 @@ export class BridgeRuntime {
    * Discord refuses fall back to links.
    */
   private async sendHarmonyToDiscord(channel: TextChannel, out: Outbound): Promise<Delivery | null> {
-    const allowedMentions = this.allowedMentions(out.mentionUserIds)
+    const allowedMentions = this.allowedMentions(out.mentionUserIds, out.mentionEveryone)
     const embeds = out.embeds?.length ? out.embeds.slice(0, 10) : undefined
     let variant = out.primary
     const switchToLinks = (failure: unknown): boolean => {
@@ -1352,7 +1359,7 @@ export class BridgeRuntime {
     for (;;) {
       try {
         const ids = await this.postChunks(variant, {
-          prefix: botPostPrefix(out.username),
+          prefix: botPostPrefix(out.mentionEveryone ? defuseEveryonePings(out.username) : out.username),
           embeds,
           send: payload => channel.send({ ...payload, allowedMentions }),
         })
@@ -1379,8 +1386,9 @@ export class BridgeRuntime {
     content: string,
     author: { username: string; avatarURL?: string },
     mentionUserIds?: string[],
+    mentionEveryone = false,
   ): Promise<string[]> {
-    const allowedMentions = this.allowedMentions(mentionUserIds)
+    const allowedMentions = this.allowedMentions(mentionUserIds, mentionEveryone)
 
     if (viaWebhook) {
       const webhook = await this.getOrCreateWebhook(channel.id)
@@ -1409,7 +1417,8 @@ export class BridgeRuntime {
       return ids
     }
 
-    const chunks = splitDiscordContent(`${botPostPrefix(author.username)}${content}`)
+    const name = mentionEveryone ? defuseEveryonePings(author.username) : author.username
+    const chunks = splitDiscordContent(`${botPostPrefix(name)}${content}`)
     const ids: string[] = []
     for (let i = 0; i < chunks.length; i++) {
       if (i < discordMessageIds.length) {
@@ -1644,6 +1653,7 @@ export class BridgeRuntime {
   private harmonyToDiscordContext(appEmoji: Map<string, AppEmoji>, uploaded?: ReadonlySet<string>): HarmonyToDiscordContext {
     return {
       discordRoleFor: id => this.permissionSyncStore.getDiscordRoleId(id),
+      harmonyDefaultRoleId: this.permissionSyncStore.getDefaultHarmonyRoleId(),
       discordChannelFor: id => this.dir.getDiscordChannel(id),
       appEmojiFor: emoji => (typeof emoji?.id === 'string' ? appEmoji.get(emoji.id) : undefined) ?? null,
       discordEmojiFor: emoji => (typeof emoji?.id === 'string' ? this.linkedDiscordEmoji(emoji.id) : null),
@@ -1656,6 +1666,7 @@ export class BridgeRuntime {
     return {
       harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
       harmonyRoleFor: id => this.permissionSyncStore.getHarmonyRoleId(id),
+      harmonyDefaultRoleId: this.permissionSyncStore.getDefaultHarmonyRoleId(),
       harmonyChannelFor: id => {
         for (const bridge of this.dir.getBridges()) {
           const pair = bridge.channelMappings.find(m => m.discord === id)
@@ -2194,6 +2205,7 @@ export class BridgeRuntime {
         mentionUserIds: reply.userId && !primary.mentionUserIds.includes(reply.userId)
           ? [reply.userId, ...primary.mentionUserIds]
           : primary.mentionUserIds,
+        mentionEveryone: primary.mentionEveryone,
         embeds: inviteEmbeds,
         primary: variant(primary, uploads),
         linksOnly: uploads.length > 0 ? variant(links, []) : null,
@@ -2311,6 +2323,7 @@ export class BridgeRuntime {
           avatarURL: this.webhookAvatarUrl(msg.author?.avatar),
         },
         mentionUserIds,
+        rendered.mentionEveryone,
       )
       this.harmonyDiscordViaWebhook.set(msg.id, viaWebhook)
       for (const id of after) {

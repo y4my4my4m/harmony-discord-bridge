@@ -28,13 +28,34 @@ function extractGluedHttpUrls(text: string): string[] {
 }
 
 /** Compare URLs ignoring fragments, query strings, and trailing slashes. */
+const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtube-nocookie.com'])
+const TRACKING_PARAMS = /^(utm_\w+|si|fbclid|gclid|igshid|feature|ref_src|ref_url)$/i
+
+/** YouTube video id of youtu.be/ID, /watch?v=ID, /shorts/ID, /embed/ID or /live/ID. */
+function youtubeVideoId(u: URL): string | null {
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  if (host === 'youtu.be') return u.pathname.split('/')[1] || null
+  if (!YOUTUBE_HOSTS.has(host)) return null
+  if (u.pathname === '/watch') return u.searchParams.get('v')
+  const match = u.pathname.match(/^\/(?:shorts|embed|live)\/([^/]+)/)
+  return match ? match[1] : null
+}
+
+/** Equal for two URLs Discord treats as one link: host without www, no trailing slash, no tracking params. */
 function normalizeUrlForDedup(url: string): string {
   try {
     const u = new URL(url)
+    const videoId = youtubeVideoId(u)
+    if (videoId) return `youtube:${videoId}`
+    const host = u.host.toLowerCase().replace(/^www\./, '')
     const path = u.pathname.replace(/\/+$/, '')
-    return `${u.protocol}//${u.host}${path}` || `${u.protocol}//${u.host}`
+    const params = [...u.searchParams.entries()]
+      .filter(([key]) => !TRACKING_PARAMS.test(key))
+      .sort(([a], [b]) => a.localeCompare(b))
+    const query = params.length ? `?${new URLSearchParams(params).toString()}` : ''
+    return `${host}${path}${query}`
   } catch {
-    return url.replace(/#.*$/, '').replace(/\?.*$/, '').replace(/\/+$/, '')
+    return url.replace(/#.*$/, '').replace(/\/+$/, '')
   }
 }
 
@@ -170,6 +191,18 @@ const PLAIN_MENTION_RE = /(?<=^|[\s([{"'<>,;:!?*~|])@([a-zA-Z0-9_-]+)(?:@([a-zA-
 /** Words that are never user mentions. */
 const RESERVED_MENTIONS = new Set(['everyone', 'here'])
 
+/** Harmony's @here: a role_mention whose roleId is `here`; role ids are UUIDs. */
+const HARMONY_HERE_ROLE_ID = 'here'
+
+/**
+ * A deliberate @everyone or @here while a Harmony message is rendered: NUL and the word. NUL is
+ * removed from every other segment, so no other text becomes a ping.
+ */
+const PING_MARK = '\u0000'
+const PING_MARK_RE = /\u0000(everyone|here)/g
+const PING_MARK_STRIP_RE = /\u0000/g
+const PING_WORD_RE = /@(?=everyone|here)/g
+
 export interface HarmonyMentionLookup {
   id: string
   username: string
@@ -182,6 +215,8 @@ export interface HarmonyMentionLookup {
 export interface DiscordToHarmonyContext {
   /** Discord role id → Harmony role id (permission-sync mapping). */
   harmonyRoleFor?: (discordRoleId: string) => string | undefined
+  /** The Harmony server's default role, the target of @everyone. */
+  harmonyDefaultRoleId?: string
   /** Paired Discord channel → its Harmony channel. */
   harmonyChannelFor?: (discordChannelId: string) => { id: string; serverId: string; name: string } | null
   /** Discord emoji id → the Harmony server emoji imported from it. */
@@ -192,6 +227,8 @@ export interface DiscordToHarmonyContext {
 export interface HarmonyToDiscordContext {
   /** Harmony role id → Discord role id (permission-sync mapping). */
   discordRoleFor?: (harmonyRoleId: string) => string | undefined
+  /** The Harmony server's default role, the target of @everyone. */
+  harmonyDefaultRoleId?: string
   /** Harmony channel id → paired Discord channel id. */
   discordChannelFor?: (harmonyChannelId: string) => string | null
   /** Harmony custom emoji part → Discord application emoji. */
@@ -208,6 +245,8 @@ export interface DiscordRendering {
   mentionUserIds: string[]
   /** Every link the author wrote asks for no preview, and nothing else would embed. */
   suppressEmbeds: boolean
+  /** The content pings @everyone or @here: allowed_mentions.parse 'everyone'. */
+  mentionEveryone: boolean
 }
 
 /** A Harmony file part. */
@@ -258,6 +297,11 @@ export function joinDiscordSegments(segments: Array<{ kind: DiscordSegmentKind; 
     prevKind = seg.kind
   }
   return out
+}
+
+/** `@everyone` and `@here` with a zero-width space after the `@`: shown alike, never a ping. */
+export function defuseEveryonePings(text: string): string {
+  return text.replace(PING_WORD_RE, '@\u200b')
 }
 
 /** File name from a file part, else the last URL path segment without query. */
@@ -483,9 +527,13 @@ export class MessageTranslator {
       }
     }
 
-    // Discord auto-embeds URLs already in the content; only new embed URLs become url parts.
+    // Discord auto-embeds links already in the content, under the resolved URL (youtu.be/ID
+    // becomes youtube.com/watch?v=ID): those are never new links. Only rich embeds (bots,
+    // webhooks) and embeds of a message with no link of its own add url parts.
+    const contentHasLink = collectNormalizedUrls(parts).size > 0
     for (const embed of collectionValues(msg.embeds)) {
       if (!embed?.url) continue
+      if (contentHasLink && embed.type !== 'rich') continue
       if (isUrlAlreadyRepresented(parts, embed.url)) continue
       parts.push({ type: 'url', url: embed.url, preview: true })
     }
@@ -567,6 +615,10 @@ export class MessageTranslator {
     }
     if (lastIndex < content.length) parts.push({ type: 'text', text: content.substring(lastIndex) })
 
+    // mentions.everyone: Discord pinged @everyone or @here, the author holding Mention Everyone.
+    // A webhook post pings through allowed_mentions alone, with no permission behind it, so its
+    // @everyone and @here stay text.
+    const everyone = msg.mentions?.everyone === true && !msg.webhookId ? ctx : null
     const out: any[] = []
     for (const part of parts) {
       if (part.type !== 'text') {
@@ -577,21 +629,29 @@ export class MessageTranslator {
         out.push({ type: 'text', text: part.text })
         continue
       }
-      out.push(...this.plainMentionParts(part.text))
+      out.push(...this.plainMentionParts(part.text, everyone))
     }
 
     // Separate url parts keep Harmony from gluing text and link into one broken URL.
     return expandTextPartsWithUrls(out)
   }
 
-  private plainMentionParts(text: string): any[] {
+  /** `everyone`: the message pinged @everyone or @here, which then become Harmony parts. */
+  private plainMentionParts(text: string, everyone: DiscordToHarmonyContext | null): any[] {
     const out: any[] = []
     let last = 0
     PLAIN_MENTION_RE.lastIndex = 0
     let m: RegExpExecArray | null
     while ((m = PLAIN_MENTION_RE.exec(text)) !== null) {
       const username = m[1]
-      if (RESERVED_MENTIONS.has(username.toLowerCase())) continue
+      if (RESERVED_MENTIONS.has(username.toLowerCase())) {
+        const ping = everyone && !m[2] ? this.harmonyPingPart(username, everyone) : null
+        if (!ping) continue
+        if (m.index > last) out.push({ type: 'text', text: text.substring(last, m.index) })
+        out.push(ping)
+        last = PLAIN_MENTION_RE.lastIndex
+        continue
+      }
       if (m.index > last) out.push({ type: 'text', text: text.substring(last, m.index) })
       const domain = m[2] || null
       const lookup = this.harmonyMemberLookup?.(username, domain) ?? null
@@ -601,6 +661,20 @@ export class MessageTranslator {
     }
     if (last < text.length) out.push({ type: 'text', text: text.substring(last) })
     return out
+  }
+
+  /**
+   * Harmony part of a Discord @everyone or @here; Discord pings the lowercase words only.
+   * @everyone needs the default role; without it the word stays text.
+   */
+  private harmonyPingPart(word: string, ctx: DiscordToHarmonyContext): any | null {
+    if (word === 'here') {
+      return { type: 'role_mention', roleId: HARMONY_HERE_ROLE_ID, roleName: 'here', roleColor: null }
+    }
+    if (word === 'everyone' && ctx.harmonyDefaultRoleId) {
+      return { type: 'role_mention', roleId: ctx.harmonyDefaultRoleId, roleName: 'everyone', roleColor: null }
+    }
+    return null
   }
 
   // ===========================================================================
@@ -618,12 +692,23 @@ export class MessageTranslator {
    * becomes `<@id>` only for a Discord user (domain discord.com); Harmony
    * users stay `@user@domain`. Uploaded files produce no text, external
    * media its bare URL (embeddableMediaUrl); other files become masked links.
+   * @here and @everyone ping only when the gateway reports the Harmony
+   * author's right (mention_everyone); any other `@everyone` or `@here` in
+   * the content is then broken with a zero-width space.
    */
   renderHarmonyForDiscord(harmonyMsg: any, ctx: HarmonyToDiscordContext = {}): DiscordRendering {
     const mentionIds: string[] = []
     let previewable = 0
     let suppressed = 0
     let content = ''
+    const mayPing = harmonyMsg?.mention_everyone === true
+    const pings = new Set<{ kind: DiscordSegmentKind; text: string }>()
+    const ping = (word: 'everyone' | 'here'): { kind: DiscordSegmentKind; text: string } => {
+      if (!mayPing) return { kind: 'inline', text: `@${word}` }
+      const segment = { kind: 'inline' as DiscordSegmentKind, text: PING_MARK + word }
+      pings.add(segment)
+      return segment
+    }
 
     if (Array.isArray(harmonyMsg.content_raw)) {
       const segments = harmonyMsg.content_raw.map((part: any): { kind: DiscordSegmentKind; text: string } => {
@@ -641,6 +726,8 @@ export class MessageTranslator {
             return { kind: 'inline', text: `@${part.username || 'unknown'}@${part.domain || this.getHarmonyDomain()}` }
           }
           case 'role_mention': {
+            if (part.roleId === HARMONY_HERE_ROLE_ID) return ping('here')
+            if (ctx.harmonyDefaultRoleId && part.roleId === ctx.harmonyDefaultRoleId) return ping('everyone')
             const discordRoleId = typeof part.roleId === 'string' ? ctx.discordRoleFor?.(part.roleId) : undefined
             return { kind: 'inline', text: discordRoleId ? `<@&${discordRoleId}>` : `@${part.roleName || 'role'}` }
           }
@@ -674,7 +761,13 @@ export class MessageTranslator {
             return { kind: 'inline', text: '' }
         }
       })
+      if (pings.size > 0) {
+        for (const segment of segments) {
+          if (!pings.has(segment)) segment.text = segment.text.replace(PING_MARK_STRIP_RE, '')
+        }
+      }
       content = joinDiscordSegments(segments)
+      if (pings.size > 0) content = defuseEveryonePings(content).replace(PING_MARK_RE, '@$1')
     } else if (typeof harmonyMsg.content === 'string') {
       content = harmonyMsg.content
       if (/https?:\/\//.test(content)) previewable++
@@ -685,6 +778,7 @@ export class MessageTranslator {
       content: content.replace(/^\*\*\[Discord\]\*\*\s+/, ''),
       mentionUserIds: mentionIds.slice(0, MAX_ALLOWED_USERS),
       suppressEmbeds: suppressed > 0 && previewable === 0,
+      mentionEveryone: pings.size > 0,
     }
   }
 

@@ -182,6 +182,24 @@ describe('Harmony → Discord posting', () => {
     await runtime.stop()
   })
 
+  it('lets @here and @everyone ping Discord only when the Harmony author held the right', async () => {
+    const webhook = fakeWebhook()
+    const { rt, runtime } = await setup({ webhook })
+    runtime.permissionSyncStore.setDefaultHarmonyRoleId('hr-default')
+    const content_raw = [
+      { type: 'role_mention', roleId: 'here', roleName: 'here', roleColor: null },
+      { type: 'text', text: ' and ' },
+      { type: 'role_mention', roleId: 'hr-default', roleName: 'everyone', roleColor: null },
+    ]
+
+    await rt.onHarmonyMessageCreate(harmonyMessage({ id: 'hm-quiet', content_raw }))
+    expect(lastWebhookPayload(webhook)).toMatchObject({ content: '@here and @everyone', allowedMentions: { parse: [] } })
+
+    await rt.onHarmonyMessageCreate(harmonyMessage({ id: 'hm-loud', content_raw, mention_everyone: true }))
+    expect(lastWebhookPayload(webhook)).toMatchObject({ content: '@here and @everyone', allowedMentions: { parse: ['everyone'] } })
+    await runtime.stop()
+  })
+
   it('mentions a reply parent only by its recorded Discord author', async () => {
     const webhook = fakeWebhook()
     const { rt, runtime, client, h } = await setup({ webhook })
@@ -425,6 +443,25 @@ describe('Discord → Harmony', () => {
       { type: 'text', text: ' look in ' },
       { type: 'channel_mention', channelId: 'h1', serverId: 's', name: 'general' },
     ])
+    await runtime.stop()
+  })
+
+  it('sends a pinged @here and @everyone as Harmony parts, an unpinged one as text', async () => {
+    const { rt, runtime, h } = await setup()
+    runtime.permissionSyncStore.setDefaultHarmonyRoleId('hr-default')
+    const mentions = (everyone: boolean) => ({
+      users: new Collection(), roles: new Collection(), channels: new Collection(), repliedUser: null, everyone,
+    })
+    await rt.onDiscordMessage(discordMessage({ id: 'dm-ping', content: '@here and @everyone', mentions: mentions(true) }))
+    await rt.onDiscordMessage(discordMessage({
+      id: 'dm-text', author: discordAuthor('du-2'), content: '@here and @everyone', mentions: mentions(false),
+    }))
+    expect(h.sendMessage.mock.calls[0][1]).toEqual([
+      { type: 'role_mention', roleId: 'here', roleName: 'here', roleColor: null },
+      { type: 'text', text: ' and ' },
+      { type: 'role_mention', roleId: 'hr-default', roleName: 'everyone', roleColor: null },
+    ])
+    expect(h.sendMessage.mock.calls[1][1]).toEqual([{ type: 'text', text: '@here and @everyone' }])
     await runtime.stop()
   })
 

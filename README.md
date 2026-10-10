@@ -197,14 +197,19 @@ version from Harmony, or shown as `:name:` when none fits. Animated Discord
 emoji used as reactions stay animated in Harmony.
 
 **Mentions.** Mentioning a Discord person from Harmony pings them on Discord.
-Nobody else is pinged: Harmony users mentioned by name, roles, `@everyone`
-and `@here` show as text and notify nobody on Discord. Role mentions show as
-the Discord role when the role is synced (permission sync), channel mentions
-as the Discord channel when it is paired; otherwise as `@Role` and `#channel`.
-From Discord, channel mentions of paired channels and role mentions that
-pinged on Discord arrive as real Harmony mentions (roles when synced), and
-`@name` typed by hand becomes a Harmony mention, except inside e-mail
-addresses and links.
+`@everyone` and `@here` ping on Discord when their Harmony author may use them
+(Mention Everyone; Harmony 1.7.0 or later). Nobody else is pinged: Harmony
+users mentioned by name and roles show as text and notify nobody on Discord.
+Role mentions show as the Discord role when the role is synced (permission
+sync), channel mentions as the Discord channel when it is paired; otherwise as
+`@Role` and `#channel`. From Discord, channel mentions of paired channels and
+role mentions that pinged on Discord arrive as real Harmony mentions (roles
+when synced), and `@name` typed by hand becomes a Harmony mention, except
+inside e-mail addresses and links. An `@everyone` or `@here` that pinged on
+Discord arrives as the Harmony mention, which notifies Harmony members when
+the bridge's bot holds Mention Everyone on the Harmony server; otherwise it
+arrives as text. `@everyone` needs the Harmony default role, which the bridge
+learns from permission sync or `clone-server`.
 
 **Moderation.** Deleting a Discord message removes its copy on Harmony,
 including bulk deletes ("purge"). Deleting a Discord person's message on

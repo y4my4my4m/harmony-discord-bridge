@@ -434,3 +434,74 @@ describe('imported Discord emoji', () => {
     expect(out.content).toBe('<a:catjam:111>')
   })
 })
+
+describe('@everyone and @here', () => {
+  const HERE = { type: 'role_mention', roleId: 'here', roleName: 'here', roleColor: null }
+  const EVERYONE = { type: 'role_mention', roleId: 'hr-default', roleName: 'everyone', roleColor: null }
+  const pinged = (content: string) => discordMessage({
+    content,
+    mentions: { users: new Map(), roles: new Map(), channels: new Map(), everyone: true },
+  })
+
+  describe('Discord → Harmony', () => {
+    const ctx = { harmonyDefaultRoleId: 'hr-default' }
+
+    it('makes a pinged @here and @everyone Harmony parts', () => {
+      expect(translator().discordToHarmonyParts(pinged('@here standup, @everyone too'), ctx)).toEqual([
+        HERE,
+        { type: 'text', text: ' standup, ' },
+        EVERYONE,
+        { type: 'text', text: ' too' },
+      ])
+    })
+
+    it('keeps them text when Discord pinged no one', () => {
+      expect(translator().discordToHarmonyParts(discordMessage({ content: '@here and @everyone' }), ctx))
+        .toEqual([{ type: 'text', text: '@here and @everyone' }])
+    })
+
+    it('keeps @everyone text without the Harmony default role, and words Discord does not ping', () => {
+      const parts = translator().discordToHarmonyParts(pinged('@everyone @Here @here@example.com'), {})
+      expect(parts.filter((p: any) => p.type === 'role_mention')).toEqual([])
+      expect(parts.map((p: any) => p.text).join('')).toBe('@everyone @Here @here@example.com')
+    })
+  })
+
+  describe('Harmony → Discord', () => {
+    const ctx = { harmonyDefaultRoleId: 'hr-default' }
+    const render = (content_raw: any[], mention_everyone?: boolean) =>
+      translator().renderHarmonyForDiscord({ content_raw, mention_everyone }, ctx)
+
+    it('writes the words without a ping when the gateway reports no right', () => {
+      for (const flag of [undefined, false]) {
+        expect(render([HERE, { type: 'text', text: ' and ' }, EVERYONE], flag))
+          .toMatchObject({ content: '@here and @everyone', mentionEveryone: false })
+      }
+    })
+
+    it('pings them when the Harmony author held the right', () => {
+      expect(render([{ type: 'text', text: 'standup ' }, HERE], true))
+        .toMatchObject({ content: 'standup @here', mentionEveryone: true })
+      expect(render([EVERYONE], true)).toMatchObject({ content: '@everyone', mentionEveryone: true })
+    })
+
+    it('breaks every other @everyone and @here so that only the parts ping', () => {
+      const r = render([
+        HERE,
+        { type: 'text', text: ' not @everyone, nor @' },
+        { type: 'text', text: 'everyone, nor \u0000everyone ' },
+        { type: 'mention', userId: 'u-1', username: 'here', domain: 'h.example' },
+      ], true)
+      expect(r.content).toBe('@here not @​everyone, nor @​everyone, nor everyone @​here@h.example')
+      expect(r.content.match(/@(everyone|here)/g)).toEqual(['@here'])
+    })
+
+    it('reports no ping when no part pings, whatever the gateway says', () => {
+      const r = translator().renderHarmonyForDiscord(
+        { content_raw: [{ type: 'role_mention', roleId: 'hr-default', roleName: 'everyone' }, { type: 'text', text: ' @here' }], mention_everyone: true },
+        {},
+      )
+      expect(r).toMatchObject({ content: '@everyone @here', mentionEveryone: false })
+    })
+  })
+})

@@ -266,6 +266,51 @@ function discordMessage(over: Record<string, unknown> = {}) {
   }
 }
 
+describe('MessageTranslator embed links', () => {
+  const ctx = { harmonyRoleFor: () => undefined, harmonyChannelFor: () => null }
+  const urls = (parts: any[]) => parts.filter(p => p.type === 'url').map(p => p.url)
+
+  it('does not repeat a youtu.be link under its resolved youtube.com URL', () => {
+    const msg = discordMessage({
+      content: 'https://youtu.be/e0G58LWVWNA',
+      embeds: [{ type: 'video', url: 'https://www.youtube.com/watch?v=e0G58LWVWNA' }],
+    })
+    expect(urls(translator().discordToHarmonyParts(msg, ctx))).toEqual(['https://youtu.be/e0G58LWVWNA'])
+  })
+
+  it('does not repeat a shortened link Discord resolved', () => {
+    const msg = discordMessage({
+      content: 'look https://bit.ly/abc',
+      embeds: [{ type: 'article', url: 'https://news.example/story/1' }],
+    })
+    expect(urls(translator().discordToHarmonyParts(msg, ctx))).toEqual(['https://bit.ly/abc'])
+  })
+
+  it('keeps two different YouTube videos apart', () => {
+    const msg = discordMessage({
+      content: 'https://www.youtube.com/watch?v=aaa https://www.youtube.com/watch?v=bbb',
+      embeds: [
+        { type: 'video', url: 'https://www.youtube.com/watch?v=aaa' },
+        { type: 'video', url: 'https://www.youtube.com/watch?v=bbb' },
+      ],
+    })
+    expect(urls(translator().discordToHarmonyParts(msg, ctx))).toEqual([
+      'https://www.youtube.com/watch?v=aaa',
+      'https://www.youtube.com/watch?v=bbb',
+    ])
+  })
+
+  it('adds the link of a rich embed and of an embed on a message without links', () => {
+    const rich = discordMessage({
+      content: 'see https://a.example',
+      embeds: [{ type: 'rich', url: 'https://b.example/report' }],
+    })
+    expect(urls(translator().discordToHarmonyParts(rich, ctx))).toEqual(['https://a.example', 'https://b.example/report'])
+    const bare = discordMessage({ content: 'build finished', embeds: [{ type: 'rich', url: 'https://ci.example/1' }] })
+    expect(urls(translator().discordToHarmonyParts(bare, ctx))).toEqual(['https://ci.example/1'])
+  })
+})
+
 describe('MessageTranslator.discordToHarmonyParts', () => {
   const ctx = {
     harmonyRoleFor: (id: string) => (id === '555' ? 'hr-mod' : undefined),

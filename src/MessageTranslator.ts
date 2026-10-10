@@ -28,13 +28,34 @@ function extractGluedHttpUrls(text: string): string[] {
 }
 
 /** Compare URLs ignoring fragments, query strings, and trailing slashes. */
+const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtube-nocookie.com'])
+const TRACKING_PARAMS = /^(utm_\w+|si|fbclid|gclid|igshid|feature|ref_src|ref_url)$/i
+
+/** YouTube video id of youtu.be/ID, /watch?v=ID, /shorts/ID, /embed/ID or /live/ID. */
+function youtubeVideoId(u: URL): string | null {
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  if (host === 'youtu.be') return u.pathname.split('/')[1] || null
+  if (!YOUTUBE_HOSTS.has(host)) return null
+  if (u.pathname === '/watch') return u.searchParams.get('v')
+  const match = u.pathname.match(/^\/(?:shorts|embed|live)\/([^/]+)/)
+  return match ? match[1] : null
+}
+
+/** Equal for two URLs Discord treats as one link: host without www, no trailing slash, no tracking params. */
 function normalizeUrlForDedup(url: string): string {
   try {
     const u = new URL(url)
+    const videoId = youtubeVideoId(u)
+    if (videoId) return `youtube:${videoId}`
+    const host = u.host.toLowerCase().replace(/^www\./, '')
     const path = u.pathname.replace(/\/+$/, '')
-    return `${u.protocol}//${u.host}${path}` || `${u.protocol}//${u.host}`
+    const params = [...u.searchParams.entries()]
+      .filter(([key]) => !TRACKING_PARAMS.test(key))
+      .sort(([a], [b]) => a.localeCompare(b))
+    const query = params.length ? `?${new URLSearchParams(params).toString()}` : ''
+    return `${host}${path}${query}`
   } catch {
-    return url.replace(/#.*$/, '').replace(/\?.*$/, '').replace(/\/+$/, '')
+    return url.replace(/#.*$/, '').replace(/\/+$/, '')
   }
 }
 
@@ -483,9 +504,13 @@ export class MessageTranslator {
       }
     }
 
-    // Discord auto-embeds URLs already in the content; only new embed URLs become url parts.
+    // Discord auto-embeds links already in the content, under the resolved URL (youtu.be/ID
+    // becomes youtube.com/watch?v=ID): those are never new links. Only rich embeds (bots,
+    // webhooks) and embeds of a message with no link of its own add url parts.
+    const contentHasLink = collectNormalizedUrls(parts).size > 0
     for (const embed of collectionValues(msg.embeds)) {
       if (!embed?.url) continue
+      if (contentHasLink && embed.type !== 'rich') continue
       if (isUrlAlreadyRepresented(parts, embed.url)) continue
       parts.push({ type: 'url', url: embed.url, preview: true })
     }

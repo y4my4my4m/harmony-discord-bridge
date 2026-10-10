@@ -455,6 +455,11 @@ describe('@everyone and @here', () => {
       ])
     })
 
+    it('keeps them text from a Discord webhook, which pings without a permission', () => {
+      const fromWebhook = { ...pinged('@here deploy done'), webhookId: '42' }
+      expect(translator().discordToHarmonyParts(fromWebhook, ctx)).toEqual([{ type: 'text', text: '@here deploy done' }])
+    })
+
     it('keeps them text when Discord pinged no one', () => {
       expect(translator().discordToHarmonyParts(discordMessage({ content: '@here and @everyone' }), ctx))
         .toEqual([{ type: 'text', text: '@here and @everyone' }])

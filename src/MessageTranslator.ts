@@ -616,7 +616,9 @@ export class MessageTranslator {
     if (lastIndex < content.length) parts.push({ type: 'text', text: content.substring(lastIndex) })
 
     // mentions.everyone: Discord pinged @everyone or @here, the author holding Mention Everyone.
-    const everyone = msg.mentions?.everyone === true ? ctx : null
+    // A webhook post pings through allowed_mentions alone, with no permission behind it, so its
+    // @everyone and @here stay text.
+    const everyone = msg.mentions?.everyone === true && !msg.webhookId ? ctx : null
     const out: any[] = []
     for (const part of parts) {
       if (part.type !== 'text') {

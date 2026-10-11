@@ -29,6 +29,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 
 ### Thread/Reply support
 - [x] Bridge Discord threads to Harmony threads and back (2.4.0)
+- [x] Thread notices name their starter on both sides (2.4.1)
 - [ ] Thread renames, archiving and deletion are not mirrored
 
 ### Attachment handling notes

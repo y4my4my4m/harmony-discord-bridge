@@ -222,8 +222,13 @@ thread on that message's copy, and the other way round; a thread without a
 starter message is a standalone thread. Threads are created on their first
 message or as soon as they are started, and edits, deletes and reactions
 inside them follow. Threads that existed before the bridge are picked up when
-someone next writes in them. The bot needs Create Public Threads and Send
-Messages in Threads on Discord.
+someone next writes in them. On Harmony 1.7.6 or later the "started a thread"
+notice names the Discord member who started the thread. Discord credits every
+thread the bridge creates to its bot; a standalone thread started on Harmony
+therefore hangs off a short message posted as its Harmony author (through the
+channel webhook), so the channel shows that author rather than "Harmony Bridge
+started a thread". The bot needs Create Public Threads and Send Messages in
+Threads on Discord.
 
 **Moderation.** Deleting a Discord message removes its copy on Harmony,
 including bulk deletes ("purge"). Deleting a Discord person's message on

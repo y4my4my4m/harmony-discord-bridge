@@ -11,7 +11,8 @@ import type { PairWriter } from '../src/runtime/PairDirectory.js'
 import type { HarmonyThread } from '../src/HarmonyClient.js'
 import { FakeDiscordClient, appResponse, fakeTextChannel, fakeThread, fakeWebhook } from './fakeDiscord.js'
 
-// Threads across the bridge (bridge 2.4.0 with the Harmony 1.7.5 gateway thread routes).
+// Threads across the bridge (bridge 2.4 with the Harmony 1.7.5 gateway thread routes; thread
+// starters from bridge 2.4.1 with Harmony 1.7.6).
 
 const ALL = APPLICATION_FLAGS.GATEWAY_MESSAGE_CONTENT | APPLICATION_FLAGS.GATEWAY_GUILD_MEMBERS | APPLICATION_FLAGS.GATEWAY_PRESENCE
 const writer: PairWriter = { link: async () => {}, linkMany: async () => [], unlink: async () => false }
@@ -168,6 +169,27 @@ describe('Discord → Harmony threads', () => {
     await runtime.stop()
   })
 
+  it('names the Harmony notice after the member who started the Discord thread', async () => {
+    const { rt, runtime, client, channel, h } = await setup()
+    const dana = {
+      id: 'du-7', displayName: 'Dana', displayAvatarURL: () => 'https://cdn.example/m.png', joinedAt: null,
+      user: { id: 'du-7', username: 'dana', discriminator: '0', globalName: null, displayAvatarURL: () => 'https://cdn.example/d.png' },
+    }
+    channel.guild.members = { fetch: vi.fn(async (id: string) => { if (id === 'du-7') return dana; throw new Error('Unknown Member') }) }
+
+    await rt.onDiscordThreadCreate(fakeThread(client, channel, 'dt-owned', { name: 'Owned', ownerId: 'du-7' }))
+    expect(h.createThread).toHaveBeenLastCalledWith('h1', 'Owned', {
+      messageId: null,
+      discordThreadId: 'dt-owned',
+      discordUser: { id: 'du-7', username: 'dana', discriminator: '0', display_name: 'Dana', avatar_url: 'https://cdn.example/m.png' },
+    })
+
+    // An owner Discord no longer knows leaves the notice under the bridge.
+    await rt.onDiscordThreadCreate(fakeThread(client, channel, 'dt-gone', { name: 'Gone', ownerId: 'du-8' }))
+    expect(h.createThread).toHaveBeenLastCalledWith('h1', 'Gone', { messageId: null, discordThreadId: 'dt-gone' })
+    await runtime.stop()
+  })
+
   it('routes edits and reactions in a Discord thread through the parent pair', async () => {
     const { rt, runtime, client, channel } = await setup()
     const dThread = fakeThread(client, channel, 'dt-1')
@@ -194,21 +216,44 @@ describe('Harmony → Discord threads', () => {
     await runtime.stop()
   })
 
-  it('a thread started on Harmony gets its Discord thread from the notice, before any reply', async () => {
+  it('a thread started on Harmony gets its Discord thread from the notice, on a message posted as its author', async () => {
     const { rt, runtime, channel, webhook, h } = await setup()
     h.getThread.mockResolvedValue(thread({ id: 'ht-2', parent_message_id: 'hm-notice', name: 'Standalone' }))
     await rt.onHarmonyMessageCreate(harmonyMessage({
       id: 'hm-notice', is_system: true, content: 'started a thread',
       metadata: { type: 'thread_created', thread_id: 'ht-2', thread_name: 'Standalone', standalone: true },
     }))
-    expect(channel.threads.create).toHaveBeenCalledWith({ name: 'Standalone', type: 11 })
-    expect(h.pairThread).toHaveBeenCalledWith('ht-2', 'thread-1')
-    expect(webhook.send).not.toHaveBeenCalled()
+    expect(webhook.send).toHaveBeenCalledTimes(1)
+    expect(webhook.send.mock.calls[0][0]).toMatchObject({ content: '-# started a thread', username: 'Alice', allowedMentions: { parse: [] } })
+    expect(channel.threads.create).toHaveBeenCalledWith({ name: 'Standalone', startMessage: 'wh-1-msg-1' })
+    expect(h.pairThread).toHaveBeenCalledWith('ht-2', 'wh-1-msg-1')
+    await runtime.stop()
+  })
+
+  it('without a webhook, or when Discord refuses the thread on that message, the thread is created bare', async () => {
+    const { rt, runtime, channel, webhook, h } = await setup()
+    const notice = (threadId: string) => harmonyMessage({
+      id: `hm-notice-${threadId}`, is_system: true, content: 'started a thread',
+      metadata: { type: 'thread_created', thread_id: threadId, thread_name: 'Bare', standalone: true },
+    })
+
+    h.getThread.mockResolvedValue(thread({ id: 'ht-a', parent_message_id: 'hm-notice-ht-a', name: 'Bare' }))
+    channel.threads.create.mockRejectedValueOnce(new Error('Missing Permissions'))
+    await rt.onHarmonyMessageCreate(notice('ht-a'))
+    expect(webhook.deleteMessage).toHaveBeenCalledWith('wh-1-msg-1')
+    expect(channel.threads.create).toHaveBeenLastCalledWith({ name: 'Bare', type: 11 })
+
+    vi.spyOn(rt, 'getOrCreateWebhook').mockResolvedValue(null)
+    h.getThread.mockResolvedValue(thread({ id: 'ht-b', parent_message_id: 'hm-notice-ht-b', name: 'Bare' }))
+    await rt.onHarmonyMessageCreate(notice('ht-b'))
+    expect(webhook.send).toHaveBeenCalledTimes(1)
+    expect(channel.threads.create).toHaveBeenLastCalledWith({ name: 'Bare', type: 11 })
+    expect(h.pairThread.mock.calls.map(c => c[0])).toEqual(['ht-a', 'ht-b'])
     await runtime.stop()
   })
 
   it('a thread another bridge process paired first keeps that pair', async () => {
-    const { rt, runtime, client, channel, h } = await setup()
+    const { rt, runtime, client, channel, webhook, h } = await setup()
     fakeThread(client, channel, 'dt-standing')
     h.getThread.mockResolvedValue(thread({ id: 'ht-3', parent_message_id: 'hm-x' }))
     h.pairThread.mockResolvedValue('dt-standing')
@@ -216,6 +261,13 @@ describe('Harmony → Discord threads', () => {
     expect(found?.id).toBe('dt-standing')
     const created = client.channels.cache.get('thread-1')
     expect(created).toBeUndefined()
+
+    // A losing thread started on a message takes that message with it.
+    h.getThread.mockResolvedValue(thread({ id: 'ht-4', parent_message_id: 'hm-y' }))
+    const again = await runtime.threads.discordThreadFor('ht-4', 'h1', channel, true, { username: 'Alice' })
+    expect(again?.id).toBe('dt-standing')
+    expect(client.channels.cache.get('wh-1-msg-1')).toBeUndefined()
+    expect(webhook.deleteMessage).toHaveBeenCalledWith('wh-1-msg-1')
     await runtime.stop()
   })
 

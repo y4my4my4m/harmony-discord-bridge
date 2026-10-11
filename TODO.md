@@ -28,8 +28,8 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Handle edge case: message edited while bridge was offline
 
 ### Thread/Reply support
-- [ ] Bridge Discord thread messages to Harmony replies
-- [ ] Bridge Harmony replies to Discord threads or reply references
+- [x] Bridge Discord threads to Harmony threads and back (2.4.0)
+- [ ] Thread renames, archiving and deletion are not mirrored
 
 ### Attachment handling notes
 - Discord CDN URLs in messages expire (~24–72h); Discord has no permanent public link

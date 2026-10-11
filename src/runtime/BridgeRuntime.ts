@@ -9,6 +9,7 @@ import {
   Events,
   type Guild,
   MessageFlags,
+  MessageType,
   PermissionFlagsBits,
   Routes,
   type APIEmbed,
@@ -21,6 +22,7 @@ import {
   type User,
   type PartialUser,
   type PartialMessage,
+  type AnyThreadChannel,
 } from 'discord.js'
 import { HarmonyClient, HarmonyHttpError, isAutomodBlocked } from '../HarmonyClient.js'
 import {
@@ -35,6 +37,7 @@ import {
 import { PermissionSync } from '../PermissionSync.js'
 import { PermissionSyncStore } from '../PermissionSyncStore.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
+import { ThreadSync } from './threadSync.js'
 import {
   buildDiscordJumpLink,
   formatHarmonyReplyForDiscord,
@@ -274,6 +277,8 @@ export class BridgeRuntime {
   readonly dir: PairDirectory
   readonly writer: PairWriter
   readonly harmony: HarmonyClient
+  /** Discord ↔ Harmony thread pairs (threadSync.ts). */
+  readonly threads: ThreadSync
   readonly translator: MessageTranslator
   readonly log: Logger
   readonly hooks: RuntimeHooks
@@ -368,6 +373,12 @@ export class BridgeRuntime {
       log: this.log,
       fetchImpl: opts.fetchImpl,
       retry: { timeoutMs: 30_000 },
+    })
+    this.threads = new ThreadSync({
+      harmony: this.harmony,
+      harmonyMessageFor: (discordId, harmonyChannelId) => this.resolveParentHarmonyId(discordId, harmonyChannelId),
+      discordMessageFor: (harmonyId, harmonyChannelId) => this.resolveParentDiscordId(harmonyId, harmonyChannelId),
+      log: this.log,
     })
 
     this.permissionSyncStore = new PermissionSyncStore(opts.permissionStorePath)
@@ -625,6 +636,9 @@ export class BridgeRuntime {
     })
 
     events.on(Events.MessageCreate, (msg: DiscordMessage) => { if (current()) void this.onDiscordMessage(msg) })
+    events.on(Events.ThreadCreate, (thread: AnyThreadChannel, newlyCreated: boolean) => {
+      if (current() && newlyCreated) void this.onDiscordThreadCreate(thread)
+    })
     events.on(Events.MessageReactionAdd, (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
       if (current()) void this.onDiscordReactionAdd(reaction, user)
     })
@@ -1298,7 +1312,9 @@ export class BridgeRuntime {
    * again once; any other webhook failure falls back to the bot. Attachments
    * Discord refuses fall back to links.
    */
-  private async sendHarmonyToDiscord(channel: TextChannel, out: Outbound): Promise<Delivery | null> {
+  private async sendHarmonyToDiscord(channel: TextChannel, out: Outbound, thread: AnyThreadChannel | null = null): Promise<Delivery | null> {
+    const target = thread ?? channel
+    const threadOption = thread ? { threadId: thread.id } : {}
     const allowedMentions = this.allowedMentions(out.mentionUserIds, out.mentionEveryone)
     const embeds = out.embeds?.length ? out.embeds.slice(0, 10) : undefined
     let variant = out.primary
@@ -1321,6 +1337,7 @@ export class BridgeRuntime {
           embeds,
           send: payload => hook.send({
             ...payload,
+            ...threadOption,
             username: sanitizeWebhookUsername(out.username),
             avatarURL: out.avatarURL,
             allowedMentions,
@@ -1330,7 +1347,7 @@ export class BridgeRuntime {
         return delivered(ids, true)
       } catch (err) {
         const { failure, sentIds } = unwrapSend(err)
-        for (const id of sentIds) await hook.deleteMessage(id).catch(() => {})
+        for (const id of sentIds) await hook.deleteMessage(id, thread?.id).catch(() => {})
         if (discordCode(failure) === DISCORD_UNKNOWN_WEBHOOK) {
           this.webhookCache.delete(channel.id)
           if (!recreated) {
@@ -1351,8 +1368,9 @@ export class BridgeRuntime {
       this.log.error('Discord client not ready')
       return null
     }
-    if (!channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
-      this.log.error(`Cannot send to #${channel.name} (${channel.id}): bot lacks Send Messages`)
+    const sendBit = thread ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages
+    if (!channel.permissionsFor(me)?.has(sendBit)) {
+      this.log.error(`Cannot send to #${channel.name} (${target.id}): bot lacks ${thread ? 'Send Messages in Threads' : 'Send Messages'}`)
       return null
     }
 
@@ -1361,12 +1379,12 @@ export class BridgeRuntime {
         const ids = await this.postChunks(variant, {
           prefix: botPostPrefix(out.mentionEveryone ? defuseEveryonePings(out.username) : out.username),
           embeds,
-          send: payload => channel.send({ ...payload, allowedMentions }),
+          send: payload => target.send({ ...payload, allowedMentions }),
         })
         return delivered(ids, false)
       } catch (err) {
         const { failure, sentIds } = unwrapSend(err)
-        for (const id of sentIds) await channel.messages.delete(id).catch(() => {})
+        for (const id of sentIds) await target.messages.delete(id).catch(() => {})
         if (switchToLinks(failure)) continue
         throw failure
       }
@@ -1387,8 +1405,11 @@ export class BridgeRuntime {
     author: { username: string; avatarURL?: string },
     mentionUserIds?: string[],
     mentionEveryone = false,
+    thread: AnyThreadChannel | null = null,
   ): Promise<string[]> {
     const allowedMentions = this.allowedMentions(mentionUserIds, mentionEveryone)
+    const target = thread ?? channel
+    const threadOption = thread ? { threadId: thread.id } : {}
 
     if (viaWebhook) {
       const webhook = await this.getOrCreateWebhook(channel.id)
@@ -1399,11 +1420,12 @@ export class BridgeRuntime {
       const ids: string[] = []
       for (let i = 0; i < chunks.length; i++) {
         if (i < discordMessageIds.length) {
-          await webhook.editMessage(discordMessageIds[i], { content: chunks[i], allowedMentions })
+          await webhook.editMessage(discordMessageIds[i], { content: chunks[i], allowedMentions, ...threadOption })
           ids.push(discordMessageIds[i])
         } else {
           const sent = await webhook.send({
             content: chunks[i],
+            ...threadOption,
             username: sanitizeWebhookUsername(author.username),
             avatarURL: author.avatarURL,
             allowedMentions,
@@ -1412,7 +1434,7 @@ export class BridgeRuntime {
         }
       }
       for (const surplus of discordMessageIds.slice(chunks.length)) {
-        await webhook.deleteMessage(surplus).catch(() => {})
+        await webhook.deleteMessage(surplus, thread?.id).catch(() => {})
       }
       return ids
     }
@@ -1422,15 +1444,15 @@ export class BridgeRuntime {
     const ids: string[] = []
     for (let i = 0; i < chunks.length; i++) {
       if (i < discordMessageIds.length) {
-        await channel.messages.edit(discordMessageIds[i], { content: chunks[i], allowedMentions })
+        await target.messages.edit(discordMessageIds[i], { content: chunks[i], allowedMentions })
         ids.push(discordMessageIds[i])
       } else {
-        const sent = await channel.send({ content: chunks[i], allowedMentions })
+        const sent = await target.send({ content: chunks[i], allowedMentions })
         ids.push(sent.id)
       }
     }
     for (const surplus of discordMessageIds.slice(chunks.length)) {
-      await channel.messages.delete(surplus).catch(() => {})
+      await target.messages.delete(surplus).catch(() => {})
     }
     return ids
   }
@@ -1443,32 +1465,39 @@ export class BridgeRuntime {
     channel: TextChannel,
     discordMessageIds: string[],
     viaWebhook: boolean,
+    thread: AnyThreadChannel | null = null,
   ): Promise<void> {
+    const target = thread ?? channel
     if (!viaWebhook) {
-      for (const id of discordMessageIds) await channel.messages.delete(id)
+      for (const id of discordMessageIds) await target.messages.delete(id)
       return
     }
 
     const webhook = await this.getOrCreateWebhook(channel.id)
     if (webhook) {
-      for (const id of discordMessageIds) await webhook.deleteMessage(id)
+      for (const id of discordMessageIds) await webhook.deleteMessage(id, thread?.id)
       return
     }
 
     const me = channel.client.user
     if (me && channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages)) {
-      for (const id of discordMessageIds) await channel.messages.delete(id)
+      for (const id of discordMessageIds) await target.messages.delete(id)
       return
     }
     throw new Error('Cannot delete a webhook post: the bot needs Manage Webhooks (or Manage Messages) on the channel')
   }
 
-  private deliveryModeFor(channel: TextChannel, harmonyMsg: any, discordMessageId: string): Promise<boolean | null> {
+  private deliveryModeFor(
+    channel: TextChannel,
+    harmonyMsg: any,
+    discordMessageId: string,
+    thread: AnyThreadChannel | null = null,
+  ): Promise<boolean | null> {
     return resolveDeliveryMode({
       cached: this.harmonyDiscordViaWebhook.get(harmonyMsg.id),
       metadata: harmonyMsg.metadata,
       botUserId: channel.client.user?.id,
-      fetchDiscordMessage: () => channel.messages.fetch(discordMessageId),
+      fetchDiscordMessage: () => (thread ?? channel).messages.fetch(discordMessageId),
     })
   }
 
@@ -1685,6 +1714,7 @@ export class BridgeRuntime {
     msg: any,
     discordChannel: TextChannel,
     content: string,
+    thread: AnyThreadChannel | null = null,
   ): Promise<{ apply: (content: string) => string; userId: string | null }> {
     const none = { apply: (c: string) => c, userId: null }
     if (!msg.reply_to || !discordChannel.guildId) return none
@@ -1695,7 +1725,7 @@ export class BridgeRuntime {
       return none
     }
 
-    const jumpLink = buildDiscordJumpLink(discordChannel.guildId, discordChannel.id, parentDiscordId)
+    const jumpLink = buildDiscordJumpLink(discordChannel.guildId, (thread ?? discordChannel).id, parentDiscordId)
     const { mention, userId } = await this.resolveReplyParentAuthorMention(
       msg.reply_to,
       parentDiscordId,
@@ -1821,6 +1851,31 @@ export class BridgeRuntime {
     return DiscordAuthorLimiter.contentKey(msg.content ?? '', extras)
   }
 
+  /** The pair key of a Discord channel: a thread's parent channel, else the channel. */
+  private discordPairId(channelId: string, channel?: unknown): string {
+    const ch = (channel ?? this.discord?.channels.cache.get(channelId)) as
+      | { isThread?: () => boolean; parentId?: string | null }
+      | null
+      | undefined
+    return ch?.isThread?.() && ch.parentId ? ch.parentId : channelId
+  }
+
+  /** A new Discord thread under a paired channel gets its Harmony thread at once. */
+  private async onDiscordThreadCreate(thread: AnyThreadChannel) {
+    if (!thread.parentId) return
+    // The bridge's own threads mirror Harmony threads; ThreadSync pairs them as it creates them.
+    if (thread.ownerId && thread.ownerId === this.discord?.user?.id) return
+    const harmonyChannelId = this.dir.getHarmonyChannel(thread.parentId)
+    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(thread.parentId)) return
+    try {
+      await this.threads.harmonyThreadFor(thread, harmonyChannelId)
+    } catch (error) {
+      if (!this.noteDrop('Discord thread → Harmony', error)) {
+        this.log.error(`Failed to bridge Discord thread ${thread.id}: ${errorText(error)}`)
+      }
+    }
+  }
+
   private async onDiscordMessage(msg: DiscordMessage) {
     if (msg.author.bot) return
 
@@ -1833,9 +1888,14 @@ export class BridgeRuntime {
       }
     }
 
-    const harmonyChannelId = this.dir.getHarmonyChannel(msg.channelId)
+    // "Started a thread" in the parent channel and a thread's starter reference: the thread
+    // itself is bridged (onDiscordThreadCreate, harmonyThreadFor), not these notices.
+    if (msg.type === MessageType.ThreadCreated || msg.type === MessageType.ThreadStarterMessage) return
+
+    const pairId = this.discordPairId(msg.channelId, msg.channel)
+    const harmonyChannelId = this.dir.getHarmonyChannel(pairId)
     if (!harmonyChannelId) return
-    if (!this.dir.shouldBridgeFromDiscord(msg.channelId)) return
+    if (!this.dir.shouldBridgeFromDiscord(pairId)) return
 
     // Without the Message Content intent Discord delivers empty messages.
     const hasBody = !!msg.content || msg.attachments.size > 0 || (msg.stickers?.size ?? 0) > 0 || (msg.messageSnapshots?.size ?? 0) > 0
@@ -1876,7 +1936,14 @@ export class BridgeRuntime {
         discord_message_id: msg.id,
       }
 
-      const result = await this.harmony.sendMessage(harmonyChannelId, contentParts, metadata, replyTo)
+      const thread = msg.channel?.isThread?.() ? msg.channel : null
+      const harmonyThreadId = thread ? await this.threads.harmonyThreadFor(thread, harmonyChannelId) : null
+      if (thread && !harmonyThreadId) {
+        this.log.warn(`Discord thread ${thread.id}: no Harmony thread; message ${msg.id} not bridged`)
+        return
+      }
+
+      const result = await this.harmony.sendMessage(harmonyChannelId, contentParts, metadata, replyTo, harmonyThreadId)
 
       // The gateway returns the message at top level (BotRestAPI.formatMessage).
       const harmonyMessageId = result?.id ?? result?.message?.id
@@ -1929,9 +1996,9 @@ export class BridgeRuntime {
       }
     }
 
-    const harmonyChannelId = this.dir.getHarmonyChannel(reaction.message.channelId)
+    const harmonyChannelId = this.dir.getHarmonyChannel(this.discordPairId(reaction.message.channelId, reaction.message.channel))
     if (!harmonyChannelId) return
-    if (!this.dir.shouldBridgeFromDiscord(reaction.message.channelId)) return
+    if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
     if (!this.settings().syncReactions) return
 
     try {
@@ -1977,9 +2044,9 @@ export class BridgeRuntime {
       }
     }
 
-    const harmonyChannelId = this.dir.getHarmonyChannel(reaction.message.channelId)
+    const harmonyChannelId = this.dir.getHarmonyChannel(this.discordPairId(reaction.message.channelId, reaction.message.channel))
     if (!harmonyChannelId) return
-    if (!this.dir.shouldBridgeFromDiscord(reaction.message.channelId)) return
+    if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
     if (!this.settings().syncReactions) return
 
     try {
@@ -2009,8 +2076,9 @@ export class BridgeRuntime {
     if (!this.settings().syncEdits) return
     if (!newMsg.author || newMsg.author.bot) return
 
-    const harmonyChannelId = this.dir.getHarmonyChannel(newMsg.channelId)
-    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(newMsg.channelId)) return
+    const updatePairId = this.discordPairId(newMsg.channelId, newMsg.channel)
+    const harmonyChannelId = this.dir.getHarmonyChannel(updatePairId)
+    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(updatePairId)) return
 
     try {
       const harmonyMessageId = this.discordToHarmonyMessages.get(newMsg.id)
@@ -2061,8 +2129,9 @@ export class BridgeRuntime {
     if (msg.author?.bot || msg.webhookId) return false
     if (this.harmonyOriginCopies.has(msg.id)) return false
 
-    const harmonyChannelId = this.dir.getHarmonyChannel(msg.channelId)
-    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(msg.channelId)) return false
+    const deletePairId = this.discordPairId(msg.channelId, msg.channel)
+    const harmonyChannelId = this.dir.getHarmonyChannel(deletePairId)
+    if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(deletePairId)) return false
 
     const harmonyMessageId = this.discordToHarmonyMessages.get(msg.id)
     if (!harmonyMessageId) {
@@ -2139,6 +2208,41 @@ export class BridgeRuntime {
     this.notify('harmony:ready')
   }
 
+  /**
+   * A Discord message bridged for a Harmony message: in the paired channel, else in the Discord
+   * thread of the Harmony message's thread (reaction events carry no thread id).
+   */
+  private async fetchBridgedDiscordMessage(
+    channel: TextChannel,
+    discordMessageId: string,
+    harmonyMessageId: string,
+    harmonyChannelId: string,
+  ): Promise<DiscordMessage | null> {
+    const inChannel = await channel.messages.fetch(discordMessageId).catch(() => null)
+    if (inChannel) return inChannel
+    const harmonyMessage = await this.harmony.getMessage(harmonyMessageId).catch(() => null)
+    if (!harmonyMessage?.thread_id) return null
+    const thread = await this.threads.discordThreadFor(harmonyMessage.thread_id, harmonyChannelId, channel, false)
+    return thread ? thread.messages.fetch(discordMessageId).catch(() => null) : null
+  }
+
+  /** The "started a thread" notice of a Harmony thread: its Discord thread is created now. */
+  private async onHarmonyThreadCreated(msg: any) {
+    const discordChannelId = this.dir.getDiscordChannel(msg.channel_id)
+    if (!discordChannelId || !this.dir.shouldBridgeFromHarmony(msg.channel_id)) return
+    const client = this.discord
+    if (!client || !this.discordReady) return
+    try {
+      const channel = await this.fetchPairedChannel(client, discordChannelId)
+      if (!channel) return
+      await this.threads.discordThreadFor(String(msg.metadata.thread_id), msg.channel_id, channel)
+    } catch (error) {
+      if (!this.noteDrop('Harmony thread → Discord', error)) {
+        this.log.error(`Failed to bridge Harmony thread ${msg.metadata.thread_id}: ${errorText(error)}`)
+      }
+    }
+  }
+
   private async onHarmonyMessageCreate(msg: any) {
     this.log.debug('Harmony message:', {
       id: msg.id,
@@ -2158,6 +2262,12 @@ export class BridgeRuntime {
     const botId = (this.harmony as any).botId
     if (msg.author?.id === botId) return
     if (msg.author?.bot && !msg.author?.discord_user) return
+
+    // A thread started on Harmony gets its Discord thread at once, before any reply.
+    if (msg.is_system && msg.metadata?.type === 'thread_created' && msg.metadata?.thread_id) {
+      await this.onHarmonyThreadCreated(msg)
+      return
+    }
 
     if (!shouldBridgeHarmonyMessageToDiscord(msg)) return
 
@@ -2181,6 +2291,12 @@ export class BridgeRuntime {
         return
       }
 
+      const thread = msg.thread_id ? await this.threads.discordThreadFor(msg.thread_id, msg.channel_id, discordChannel) : null
+      if (msg.thread_id && !thread) {
+        this.log.warn(`Harmony thread ${msg.thread_id}: no Discord thread; message ${msg.id} not bridged`)
+        return
+      }
+
       const appEmoji = await this.resolveAppEmojis(msg)
       const links = this.translator.renderHarmonyForDiscord(msg, this.harmonyToDiscordContext(appEmoji))
       if (!links.content.trim()) {
@@ -2194,7 +2310,7 @@ export class BridgeRuntime {
         ? this.translator.renderHarmonyForDiscord(msg, this.harmonyToDiscordContext(appEmoji, new Set(uploads.map(u => u.key))))
         : links
 
-      const reply = await this.replyFormatting(msg, discordChannel, primary.content)
+      const reply = await this.replyFormatting(msg, discordChannel, primary.content, thread)
       const inviteEmbeds = await buildHarmonyInviteDiscordEmbeds(msg, this.harmony, this.harmonyBaseUrl.hostname)
       const variant = (r: DiscordRendering, attached: PreparedUpload[]): OutboundVariant =>
         ({ content: reply.apply(r.content), files: attached, suppressEmbeds: r.suppressEmbeds })
@@ -2209,7 +2325,7 @@ export class BridgeRuntime {
         embeds: inviteEmbeds,
         primary: variant(primary, uploads),
         linksOnly: uploads.length > 0 ? variant(links, []) : null,
-      })
+      }, thread)
 
       if (!outbound) {
         this.log.error(`Could not send Harmony message ${msg.id} to Discord`)
@@ -2297,7 +2413,10 @@ export class BridgeRuntime {
         return
       }
 
-      const viaWebhook = await this.deliveryModeFor(discordChannel, msg, discordMessageId)
+      const thread = msg.thread_id ? await this.threads.discordThreadFor(msg.thread_id, msg.channel_id, discordChannel, false) : null
+      if (msg.thread_id && !thread) return
+
+      const viaWebhook = await this.deliveryModeFor(discordChannel, msg, discordMessageId, thread)
       if (viaWebhook === null) {
         this.log.warn(`Harmony edit ${msg.id}: Discord copy ${discordMessageId} is gone or unreadable; not edited`)
         return
@@ -2307,7 +2426,7 @@ export class BridgeRuntime {
       const uploaded = new Set(this.harmonyDiscordUploads.get(msg.id) ?? (Array.isArray(recorded) ? recorded.map(String) : []))
       const appEmoji = await this.resolveAppEmojis(msg)
       const rendered = this.translator.renderHarmonyForDiscord(msg, this.harmonyToDiscordContext(appEmoji, uploaded))
-      const reply = await this.replyFormatting(msg, discordChannel, rendered.content)
+      const reply = await this.replyFormatting(msg, discordChannel, rendered.content, thread)
       const mentionUserIds = reply.userId && !rendered.mentionUserIds.includes(reply.userId)
         ? [reply.userId, ...rendered.mentionUserIds]
         : rendered.mentionUserIds
@@ -2324,6 +2443,7 @@ export class BridgeRuntime {
         },
         mentionUserIds,
         rendered.mentionEveryone,
+        thread,
       )
       this.harmonyDiscordViaWebhook.set(msg.id, viaWebhook)
       for (const id of after) {
@@ -2373,12 +2493,13 @@ export class BridgeRuntime {
         return
       }
 
-      const viaWebhook = await this.deliveryModeFor(discordChannel, msg, discordMessageId)
+      const thread = msg.thread_id ? await this.threads.discordThreadFor(msg.thread_id, msg.channel_id, discordChannel, false) : null
+      const viaWebhook = msg.thread_id && !thread ? null : await this.deliveryModeFor(discordChannel, msg, discordMessageId, thread)
       if (viaWebhook === null) {
         this.log.debug(`Harmony delete ${msg.id}: Discord copy ${discordMessageId} already gone`)
       } else {
         const ids = this.chunkIdsFor(msg, discordMessageId)
-        await this.deleteHarmonyOnDiscord(discordChannel, ids, viaWebhook)
+        await this.deleteHarmonyOnDiscord(discordChannel, ids, viaWebhook, thread)
         for (const id of ids) this.discordToHarmonyMessages.delete(id)
         this.log.info(`Harmony → Discord delete: ${msg.id} → ${ids.join(',')}`)
       }
@@ -2430,7 +2551,8 @@ export class BridgeRuntime {
         }
         return
       }
-      await channel.messages.delete(discordId)
+      const thread = msg.thread_id ? await this.threads.discordThreadFor(msg.thread_id, msg.channel_id, channel, false) : null
+      await (thread ?? channel).messages.delete(discordId)
       this.log.info(`Harmony → Discord delete of a Discord message: ${msg.id} → ${discordId}`)
     } catch (error) {
       if (discordCode(error) === DISCORD_UNKNOWN_MESSAGE) {
@@ -2585,7 +2707,7 @@ export class BridgeRuntime {
         return
       }
 
-      const discordMessage = await discordChannel.messages.fetch(discordMessageId).catch(() => null)
+      const discordMessage = await this.fetchBridgedDiscordMessage(discordChannel, discordMessageId, data.message_id, data.channel_id)
       if (!discordMessage) {
         this.log.debug(`Harmony reaction: Discord message ${discordMessageId} not found`)
         return
@@ -2641,7 +2763,7 @@ export class BridgeRuntime {
       const discordChannel = await this.fetchPairedChannel(client, discordChannelId)
       if (!discordChannel) return
 
-      const discordMessage = await discordChannel.messages.fetch(discordMessageId).catch(() => null)
+      const discordMessage = await this.fetchBridgedDiscordMessage(discordChannel, discordMessageId, data.message_id, data.channel_id)
       if (!discordMessage) return
 
       const reaction = discordMessage.reactions.cache.find(r => r.emoji.identifier === known.emoji

@@ -65,6 +65,17 @@ export interface HarmonyServerEmoji {
   discord_emoji_id: string | null
 }
 
+/** A Harmony thread as the bot gateway answers it (Harmony 1.7.5). */
+export interface HarmonyThread {
+  id: string
+  channel_id: string
+  parent_message_id: string
+  name: string
+  archived: boolean
+  locked: boolean
+  discord_thread_id: string | null
+}
+
 export class HarmonyClient extends EventEmitter {
   private ws: WebSocket | null = null
   private botToken: string
@@ -358,17 +369,62 @@ export class HarmonyClient extends EventEmitter {
     return res.json() as Promise<T>
   }
 
+  /** `threadId`: a thread of `channelId` (Harmony 1.7.5 gateway). */
   async sendMessage(
     channelId: string,
     content: string | any[],
     metadata?: any,
     replyTo?: string | null,
+    threadId?: string | null,
   ): Promise<any> {
     return this.sendJson('POST', `/channels/${channelId}/messages`, {
       content,
       metadata,
       reply_to: replyTo || undefined,
+      ...(threadId ? { thread_id: threadId } : {}),
     }, 'Failed to send message')
+  }
+
+  /**
+   * Creates a Harmony thread: on `messageId`, else standalone with a "started a thread" notice.
+   * With `discordThreadId` the call is idempotent: the thread already paired comes back.
+   */
+  async createThread(
+    channelId: string,
+    name: string,
+    opts: { messageId?: string | null; discordThreadId?: string | null } = {},
+  ): Promise<HarmonyThread> {
+    return this.sendJson('POST', `/channels/${channelId}/threads`, {
+      name,
+      ...(opts.messageId ? { message_id: opts.messageId } : {}),
+      ...(opts.discordThreadId ? { discord_thread_id: opts.discordThreadId } : {}),
+    }, 'Failed to create thread')
+  }
+
+  /** The Harmony thread paired with a Discord thread, or null. */
+  async lookupThreadByDiscordId(channelId: string, discordThreadId: string): Promise<HarmonyThread | null> {
+    const response = await this.request(
+      `/channels/${channelId}/threads/lookup?discord_thread_id=${encodeURIComponent(discordThreadId)}`,
+    )
+    if (!response.ok) return null
+    return response.json() as Promise<HarmonyThread>
+  }
+
+  async getThread(threadId: string): Promise<HarmonyThread | null> {
+    const response = await this.request(`/threads/${threadId}`)
+    if (!response.ok) return null
+    return response.json() as Promise<HarmonyThread>
+  }
+
+  /** Pairs a Harmony thread with a Discord thread; answers the standing pair (409 carries it). */
+  async pairThread(threadId: string, discordThreadId: string): Promise<string | null> {
+    const response = await this.request(`/threads/${threadId}/discord`, {
+      method: 'PUT',
+      body: JSON.stringify({ discord_thread_id: discordThreadId }),
+    })
+    const body = await response.json().catch(() => ({})) as { discord_thread_id?: string | null }
+    if (response.ok || response.status === 409) return body.discord_thread_id ?? null
+    return null
   }
 
   async getMessage(messageId: string): Promise<any | null> {

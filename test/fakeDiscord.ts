@@ -188,7 +188,9 @@ export function fakeTextChannel(
     },
     threads: {
       fetch: vi.fn(async (id: string) => client.channels.cache.get(id) ?? null),
-      create: vi.fn(async ({ name }: { name: string }) => fakeThread(client, channel, `thread-${++n}`, { name, ownerId: client.user?.id })),
+      // A thread started from a message takes the message's id.
+      create: vi.fn(async ({ name, startMessage }: { name: string; startMessage?: string }) =>
+        fakeThread(client, channel, startMessage ?? `thread-${++n}`, { name, ownerId: client.user?.id })),
     },
   }
   client.channels.cache.set(channelId, channel)

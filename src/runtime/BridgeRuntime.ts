@@ -37,7 +37,7 @@ import {
 import { PermissionSync } from '../PermissionSync.js'
 import { PermissionSyncStore } from '../PermissionSyncStore.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
-import { ThreadSync } from './threadSync.js'
+import { ThreadSync, type ThreadAnchor, type ThreadAuthor } from './threadSync.js'
 import {
   buildDiscordJumpLink,
   formatHarmonyReplyForDiscord,
@@ -203,6 +203,8 @@ const SPAM_LOG_EVERY = 50
 
 /** Discord REST error codes. */
 const DISCORD_UNKNOWN_WEBHOOK = 10015
+/** Discord subtext: the message a standalone thread started on Harmony hangs off. */
+const THREAD_ANCHOR_TEXT = '-# started a thread'
 const DISCORD_UNKNOWN_MESSAGE = 10008
 const DISCORD_UNKNOWN_EMOJI = 10014
 const DISCORD_MISSING_PERMISSIONS = 50013
@@ -378,6 +380,8 @@ export class BridgeRuntime {
       harmony: this.harmony,
       harmonyMessageFor: (discordId, harmonyChannelId) => this.resolveParentHarmonyId(discordId, harmonyChannelId),
       discordMessageFor: (harmonyId, harmonyChannelId) => this.resolveParentDiscordId(harmonyId, harmonyChannelId),
+      threadStarter: thread => this.discordThreadStarter(thread),
+      postAnchor: (parent, author) => this.postThreadAnchor(parent, author),
       log: this.log,
     })
 
@@ -1860,6 +1864,16 @@ export class BridgeRuntime {
     return ch?.isThread?.() && ch.parentId ? ch.parentId : channelId
   }
 
+  /** The discord_user of the member who started a Discord thread; null for the bridge's own. */
+  private async discordThreadStarter(thread: Pick<AnyThreadChannel, 'id' | 'ownerId'>): Promise<Record<string, unknown> | null> {
+    const ownerId = thread.ownerId
+    if (!ownerId || ownerId === this.discord?.user?.id) return null
+    const guild = (thread as Partial<AnyThreadChannel>).guild
+    const member = guild ? await guild.members.fetch(ownerId).catch(() => null) : null
+    if (!member?.user) return null
+    return buildDiscordUserMetadata(member.user, member, this.discordMemberDetails.get(ownerId)).discord_user
+  }
+
   /** A new Discord thread under a paired channel gets its Harmony thread at once. */
   private async onDiscordThreadCreate(thread: AnyThreadChannel) {
     if (!thread.parentId) return
@@ -2226,6 +2240,25 @@ export class BridgeRuntime {
     return thread ? thread.messages.fetch(discordMessageId).catch(() => null) : null
   }
 
+  /** The message a standalone Discord thread starts from, posted through the channel's webhook. */
+  private async postThreadAnchor(parent: TextChannel, author: ThreadAuthor): Promise<ThreadAnchor | null> {
+    const webhook = await this.getOrCreateWebhook(parent.id)
+    if (!webhook) return null
+    try {
+      const sent = await webhook.send({
+        content: THREAD_ANCHOR_TEXT,
+        username: sanitizeWebhookUsername(author.username),
+        avatarURL: author.avatarURL,
+        allowedMentions: { parse: [] },
+      })
+      return { id: sent.id, remove: () => webhook.deleteMessage(sent.id) }
+    } catch (error) {
+      if (discordCode(error) === DISCORD_UNKNOWN_WEBHOOK) this.webhookCache.delete(parent.id)
+      this.log.warn(`Thread starting message in channel ${parent.id} failed: ${errorText(error)}`)
+      return null
+    }
+  }
+
   /** The "started a thread" notice of a Harmony thread: its Discord thread is created now. */
   private async onHarmonyThreadCreated(msg: any) {
     const discordChannelId = this.dir.getDiscordChannel(msg.channel_id)
@@ -2235,7 +2268,8 @@ export class BridgeRuntime {
     try {
       const channel = await this.fetchPairedChannel(client, discordChannelId)
       if (!channel) return
-      await this.threads.discordThreadFor(String(msg.metadata.thread_id), msg.channel_id, channel)
+      const author = msg.author ? { username: harmonyAuthorName(msg.author), avatarURL: this.webhookAvatarUrl(msg.author.avatar) } : null
+      await this.threads.discordThreadFor(String(msg.metadata.thread_id), msg.channel_id, channel, true, author)
     } catch (error) {
       if (!this.noteDrop('Harmony thread → Discord', error)) {
         this.log.error(`Failed to bridge Harmony thread ${msg.metadata.thread_id}: ${errorText(error)}`)

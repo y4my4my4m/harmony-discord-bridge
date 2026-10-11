@@ -51,19 +51,24 @@ you through the one you pick.
    replace `YOUR_APPLICATION_ID` (from **General Information**) in:
 
    ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=536996928&scope=bot%20applications.commands
+   https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=309774642240&scope=bot%20applications.commands
    ```
 
    This grants View Channels, Send Messages, Embed Links, Attach Files, Read
-   Message History, Add Reactions, Manage Messages and Manage Webhooks.
-   Manage Messages lets a message deleted on Harmony (by a moderator or by
-   Harmony's AutoMod) disappear from Discord too. For `/bridge clone-server`,
-   use `permissions=536996944` (adds Manage Channels).
+   Message History, Add Reactions, Manage Messages, Manage Webhooks, Create
+   Public Threads and Send Messages in Threads. Manage Messages lets a message
+   deleted on Harmony (by a moderator or by Harmony's AutoMod) disappear from
+   Discord too; the two thread permissions carry threads across (bridge 2.4).
+   For `/bridge clone-server`, use `permissions=309774642256` (adds Manage
+   Channels).
 
    | Bot | Permission integer |
    |---|---|
-   | Your own bot (run yourself, or hosted by your instance) | `536996928` (`536996944` with Manage Channels for `/bridge clone-server`) |
-   | The instance's bot (**Add to Discord**) | `537259072` (adds Use External Emojis) |
+   | Your own bot (run yourself, or hosted by your instance) | `309774642240` (`309774642256` with Manage Channels for `/bridge clone-server`) |
+   | The instance's bot (**Add to Discord**) | `309774904384` (adds Use External Emojis) |
+
+   A bot added before bridge 2.4 lacks the thread permissions until it is added
+   again with the link above (or **Add to Discord**).
 
 ### 2. Get a setup code from Harmony
 
@@ -211,12 +216,20 @@ the bridge's bot holds Mention Everyone on the Harmony server; otherwise it
 arrives as text. `@everyone` needs the Harmony default role, which the bridge
 learns from permission sync or `clone-server`.
 
+**Threads.** A thread on either side is a thread on the other (Harmony 1.7.5
+or later). A Discord thread started from a bridged message becomes a Harmony
+thread on that message's copy, and the other way round; a thread without a
+starter message is a standalone thread. Threads are created on their first
+message or as soon as they are started, and edits, deletes and reactions
+inside them follow. Threads that existed before the bridge are picked up when
+someone next writes in them. The bot needs Create Public Threads and Send
+Messages in Threads on Discord.
+
 **Moderation.** Deleting a Discord message removes its copy on Harmony,
 including bulk deletes ("purge"). Deleting a Discord person's message on
 Harmony removes it on Discord too, when the bot has the Manage Messages
 permission there; bridges added before version 2.2 get it by adding the bot
-again (**Add to Discord**, or the own-bot invite link above with
-`permissions=536996928`). Without it the message stays on Discord and the
+again (**Add to Discord**, or the own-bot invite link above). Without it the message stays on Discord and the
 bridge logs it once per channel.
 
 **Spam protection.** One Discord person can send at most 8 messages per 10
@@ -394,10 +407,12 @@ Admin → Discord bridge**:
    instance bot on.
 
 The bot asks for View Channels, Send Messages, Read Message History, Embed
-Links, Attach Files, Add Reactions, Use External Emojis, Manage Messages and
-Manage Webhooks (permission integer `537259072`). Communities that linked
-before version 2.2 lack Manage Messages until they click **Add to Discord**
-again; until then deletions on Harmony stay on Discord.
+Links, Attach Files, Add Reactions, Use External Emojis, Manage Messages,
+Manage Webhooks, Create Public Threads and Send Messages in Threads
+(permission integer `309774904384`, Harmony 1.7.5). Communities that linked
+earlier lack the newer permissions until they click **Add to Discord** again:
+before version 2.2 deletions on Harmony stay on Discord, before 2.4 threads
+do not cross.
 
 Harmony's custom emoji are uploaded to the instance bot's application and
 shared by every community: one map in `/data/app-emojis/<application id>.json`.

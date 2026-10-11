@@ -55,6 +55,7 @@ export const ROUTED_EVENTS: Readonly<Record<string, GuildOf>> = {
   [Events.ChannelCreate]: (_c, ch) => ch.guildId,
   [Events.ChannelDelete]: (_c, ch) => ch.guildId,
   [Events.ChannelUpdate]: (_c, _old, ch) => ch.guildId,
+  [Events.ThreadCreate]: (_c, thread) => thread.guildId,
 }
 
 export const INSTANCE_DISCORD_TOKEN_HINT =

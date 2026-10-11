@@ -178,11 +178,54 @@ export function fakeTextChannel(
         author: { id: 'someone', bot: false, username: 'someone' },
         react: vi.fn(async (emoji: string) => { reactions.push(emoji) }),
         reactions: { cache: new Collection() },
+        hasThread: false,
+        thread: null,
+        // A thread started from a message takes the message's id.
+        startThread: vi.fn(async ({ name }: { name: string }) => fakeThread(client, channel, id, { name })),
       })),
       edit: vi.fn(async () => ({})),
       delete: vi.fn(async (_id: string) => {}),
     },
+    threads: {
+      fetch: vi.fn(async (id: string) => client.channels.cache.get(id) ?? null),
+      create: vi.fn(async ({ name }: { name: string }) => fakeThread(client, channel, `thread-${++n}`, { name, ownerId: client.user?.id })),
+    },
   }
   client.channels.cache.set(channelId, channel)
   return channel
+}
+
+/** A public thread under `parent`, cached on the client like discord.js threads. */
+export function fakeThread(
+  client: FakeDiscordClient,
+  parent: any,
+  id: string,
+  opts: { name?: string; ownerId?: string | null; archived?: boolean; locked?: boolean } = {},
+) {
+  let n = 0
+  const thread: any = {
+    id,
+    name: opts.name ?? `thread ${id}`,
+    type: 11,
+    guildId: parent.guildId,
+    parentId: parent.id,
+    parent,
+    ownerId: opts.ownerId ?? 'someone',
+    archived: opts.archived ?? false,
+    locked: opts.locked ?? false,
+    client,
+    guild: parent.guild,
+    isTextBased: () => true,
+    isThread: () => true,
+    send: vi.fn(async (_payload: any): Promise<any> => ({ id: `${id}-bot-msg-${++n}` })),
+    setArchived: vi.fn(async (archived: boolean) => { thread.archived = archived }),
+    delete: vi.fn(async () => { client.channels.cache.delete(id) }),
+    messages: {
+      fetch: vi.fn(async (mid: string) => ({ id: mid, webhookId: 'wh', author: { id: 'someone', bot: false, username: 'someone' } })),
+      edit: vi.fn(async () => ({})),
+      delete: vi.fn(async (_id: string) => {}),
+    },
+  }
+  client.channels.cache.set(id, thread)
+  return thread
 }

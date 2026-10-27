@@ -78,6 +78,37 @@ function isUrlAlreadyRepresented(parts: any[], candidateUrl: string): boolean {
   return collectNormalizedUrls(parts).has(normalized)
 }
 
+// Discord masked link: [label](url), [label](<url>) without preview. Mirrors the grammar of
+// Harmony's src/utils/maskedLinks.ts.
+const MASKED_LINK = /\[([^\[\]\n]+)\]\((?:<(https?:\/\/[^\s<>]+)>|(https?:\/\/(?:[^\s()<>]|\([^\s()<>]*\))+))\)/gi
+
+/** A url part with a label for each masked link, text and bare URLs between them. */
+function splitTextForLinkParts(text: string): any[] {
+  if (!text || !text.includes('](')) return splitTextForUrlParts(text)
+  const parts: any[] = []
+  let last = 0
+  MASKED_LINK.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = MASKED_LINK.exec(text)) !== null) {
+    const before = m.index > 0 ? text[m.index - 1] : ''
+    const label = m[1].trim()
+    if (before === '\\' || before === '!' || !label) continue
+    if (m.index > last) parts.push(...splitTextForUrlParts(text.slice(last, m.index)))
+    parts.push({ type: 'url', url: m[2] ?? m[3], preview: !m[2], label })
+    last = m.index + m[0].length
+  }
+  if (last < text.length) parts.push(...splitTextForUrlParts(text.slice(last)))
+  return parts.length > 0 ? parts : [{ type: 'text', text }]
+}
+
+/** The label Discord can hold for a url part, or null. Discord refuses masked links whose
+ * text is itself a link. */
+function discordLinkLabel(part: any): string | null {
+  const label = typeof part.label === 'string' ? part.label.replace(/[[\]\n]/g, ' ').trim() : ''
+  if (!label || /[a-z][a-z0-9+.-]*:\/\//i.test(label) || /^www\./i.test(label)) return null
+  return label
+}
+
 /** Split prose into text + url parts (Discord `<https://...>` suppresses preview). */
 function splitTextForUrlParts(text: string): any[] {
   if (!text) return []
@@ -127,7 +158,7 @@ function expandTextPartsWithUrls(parts: any[]): any[] {
   const result: any[] = []
   for (const part of parts) {
     if (part.type === 'text' && part.text) {
-      result.push(...splitTextForUrlParts(part.text))
+      result.push(...splitTextForLinkParts(part.text))
     } else {
       result.push(part)
     }
@@ -748,12 +779,13 @@ export class MessageTranslator {
           }
           case 'url': {
             if (!part.url) return { kind: 'url', text: '' }
+            const label = discordLinkLabel(part)
             if (part.preview === false) {
               suppressed++
-              return { kind: 'url', text: `<${part.url}>` }
+              return { kind: 'url', text: label ? `[${label}](<${part.url}>)` : `<${part.url}>` }
             }
             previewable++
-            return { kind: 'url', text: part.url }
+            return { kind: 'url', text: label ? `[${label}](${part.url})` : part.url }
           }
           case 'hashtag':
             return { kind: 'inline', text: `#${part.name || ''}` }

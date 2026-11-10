@@ -3,6 +3,7 @@ import { EventEmitter } from 'events'
 import { Backoff, fetchWithRetry, type FetchLike, type RetryOptions } from './http.js'
 import { Logger, errorText } from './log.js'
 import type { PresenceDelta } from './runtime/presenceDeltas.js'
+import type { DesiredSound } from './runtime/soundSync.js'
 
 interface HarmonyMessage {
   id: string
@@ -63,6 +64,16 @@ export interface HarmonyServerEmoji {
   name: string
   url: string | null
   discord_emoji_id: string | null
+}
+
+export interface HarmonyServerSound {
+  id: string
+  name: string
+  emoji: string | null
+  emoji_id: string | null
+  /** numeric(3,2): PostgREST may answer a string such as "0.50". */
+  volume: number | string
+  discord_sound_id: string | null
 }
 
 /** A Harmony thread as the bot gateway answers it (Harmony 1.7.5). */
@@ -693,6 +704,33 @@ export class HarmonyClient extends EventEmitter {
       name: emoji.name,
       animated: emoji.animated,
     }, 'Failed to import emoji')
+  }
+
+  async getServerSounds(serverId: string): Promise<HarmonyServerSound[]> {
+    return this.getJson<HarmonyServerSound[]>(`/servers/${serverId}/sounds`, 'Failed to fetch server sounds')
+  }
+
+  /** Imports (or with `update`, refreshes) a Discord soundboard sound as a server sound. */
+  async importDiscordSound(
+    serverId: string,
+    sound: DesiredSound,
+    update: boolean,
+  ): Promise<HarmonyServerSound & { status: 'created' | 'existing' | 'updated' }> {
+    return this.sendJson('POST', `/servers/${serverId}/sounds/discord`, {
+      discord_sound_id: sound.id,
+      name: sound.name,
+      emoji: sound.emoji,
+      emoji_id: sound.emojiId,
+      volume: sound.volume,
+      update,
+    }, 'Failed to import sound')
+  }
+
+  async deleteServerSound(serverId: string, soundId: string): Promise<void> {
+    await this.expectOk(
+      await this.request(`/servers/${serverId}/sounds/${soundId}`, { method: 'DELETE' }),
+      'Failed to delete sound',
+    )
   }
 
   async getGuildMembers(guildId: string): Promise<any[]> {

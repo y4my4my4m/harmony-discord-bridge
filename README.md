@@ -258,6 +258,7 @@ and is counted in the log the same way.
 - `/bridge sync-order`: copy Discord's channel and category order to Harmony.
 - `/bridge sync-perms`: copy Discord roles and the permissions of every linked channel to Harmony.
 - `/bridge import-emojis`: copy the server's custom emoji into the Harmony server under the same names (Harmony 1.6.25+). A rerun adds only new ones; a Harmony emoji with the same name is linked instead of duplicated. Imported emoji are one emoji on both sides, so reactions with it count together.
+- `/bridge sync-sounds [mode] [dry_run]`: make the Harmony soundboard match the Discord one (needs a Harmony with the bridge soundboard endpoints). Modes: `mirror` (default; makes Harmony match Discord exactly: adds, updates, replaces same-name sounds and deletes every Harmony sound not on Discord; the only mode that deletes), `merge` (adds new sounds and updates linked ones), `add` (only adds new sounds). Merge and add never delete: a Harmony sound with a Discord sound's name that isn't linked to it is left as is and listed as a name clash, with how to fix it. `dry_run` lists the changes. A real run that deletes or replaces anything asks Confirm/Cancel first (60 s, only you can press). Run `/bridge import-emojis` first to keep custom emoji on sounds. Harmony allows 48 sounds per server; a rerun finishes whatever failed.
 
 `/bridge` needs the Discord **Administrator** permission.
 

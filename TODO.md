@@ -49,6 +49,12 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Bridge Harmony link previews to Discord embeds
 - [ ] Support Discord stickers
 - [ ] Bridge Discord slash commands other than `/m`
+- [ ] Expression/server sync follow-ups (reuse `expressionSync.ts` modes, dry run, confirm):
+  - [x] `/bridge sync-emojis` (`import-emojis` is now `mode:add`, with the old import as fallback on an older Harmony)
+  - [ ] Stickers sync (Harmony cap 15, alt text required, png/apng/webp/gif; Lottie not importable)
+  - [ ] Server profile sync (name, icon, banner, description)
+  - [ ] Channel details sync (topic, slowmode, NSFW on linked channels)
+  - [ ] Scheduled events, if Harmony gains them
 
 ### Monitoring
 - [ ] Expose metrics (messages bridged, errors, latency)
@@ -63,6 +69,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [x] Reaction bridging (Discord → Harmony with user attribution)
 - [x] Reaction bridging (Harmony → Discord; bot-gateway now emits MESSAGE_REACTION_ADD/REMOVE)
 - [x] Custom emoji bridging
+- [x] `/bridge sync-sounds`: Discord soundboard to Harmony (mirror/merge/add, dry run, Confirm/Cancel before deletes)
 - [x] Media/attachment bridging
 - [x] Webhook puppeting (Harmony users appear with their name/avatar in Discord)
 - [x] Discord users in Harmony autosuggest

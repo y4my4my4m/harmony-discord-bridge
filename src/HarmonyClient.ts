@@ -3,6 +3,8 @@ import { EventEmitter } from 'events'
 import { Backoff, fetchWithRetry, type FetchLike, type RetryOptions } from './http.js'
 import { Logger, errorText } from './log.js'
 import type { PresenceDelta } from './runtime/presenceDeltas.js'
+import type { DesiredSound } from './runtime/soundSync.js'
+import type { DesiredSticker } from './runtime/stickerSync.js'
 
 interface HarmonyMessage {
   id: string
@@ -63,6 +65,33 @@ export interface HarmonyServerEmoji {
   name: string
   url: string | null
   discord_emoji_id: string | null
+}
+
+export interface HarmonyEmojiSyncRow {
+  id: string
+  name: string
+  url: string | null
+  discord_emoji_id: string | null
+  removed: boolean
+}
+
+export interface HarmonyStickerSyncRow {
+  id: string
+  name: string
+  description: string
+  url: string
+  discord_sticker_id: string | null
+  removed: boolean
+}
+
+export interface HarmonyServerSound {
+  id: string
+  name: string
+  emoji: string | null
+  emoji_id: string | null
+  /** numeric(3,2): PostgREST may answer a string such as "0.50". */
+  volume: number | string
+  discord_sound_id: string | null
 }
 
 /** A Harmony thread as the bot gateway answers it (Harmony 1.7.5). */
@@ -687,12 +716,79 @@ export class HarmonyClient extends EventEmitter {
   async importDiscordEmoji(
     serverId: string,
     emoji: { discordEmojiId: string; name: string; animated: boolean },
-  ): Promise<HarmonyServerEmoji & { status: 'created' | 'existing' | 'linked' }> {
+    update = false,
+  ): Promise<HarmonyServerEmoji & { status: 'created' | 'existing' | 'linked' | 'updated'; removed?: boolean }> {
     return this.sendJson('POST', `/servers/${serverId}/emojis/discord`, {
       discord_emoji_id: emoji.discordEmojiId,
       name: emoji.name,
       animated: emoji.animated,
+      // Only sent when true so an older Harmony sees the body it always did.
+      ...(update ? { update: true } : {}),
     }, 'Failed to import emoji')
+  }
+
+  async getEmojiSyncState(serverId: string): Promise<{ limit: number; emojis: HarmonyEmojiSyncRow[] }> {
+    return this.getJson(`/servers/${serverId}/emojis/discord`, 'Failed to fetch server emojis')
+  }
+
+  async removeServerEmoji(serverId: string, emojiId: string): Promise<void> {
+    await this.expectOk(
+      await this.request(`/servers/${serverId}/emojis/${emojiId}`, { method: 'DELETE' }),
+      'Failed to delete emoji',
+    )
+  }
+
+  async getStickerSyncState(serverId: string): Promise<{ limit: number; stickers: HarmonyStickerSyncRow[] }> {
+    return this.getJson(`/servers/${serverId}/stickers/discord`, 'Failed to fetch server stickers')
+  }
+
+  /** Imports (or with `update`, refreshes) a Discord sticker as a server sticker. */
+  async importDiscordSticker(
+    serverId: string,
+    s: DesiredSticker,
+    update = false,
+  ): Promise<HarmonyStickerSyncRow & { status: 'created' | 'existing' | 'updated' }> {
+    return this.sendJson('POST', `/servers/${serverId}/stickers/discord`, {
+      discord_sticker_id: s.id,
+      name: s.name,
+      description: s.description,
+      format_type: s.formatType,
+      ...(update ? { update: true } : {}),
+    }, 'Failed to import sticker')
+  }
+
+  async removeServerSticker(serverId: string, stickerId: string): Promise<void> {
+    await this.expectOk(
+      await this.request(`/servers/${serverId}/stickers/${stickerId}`, { method: 'DELETE' }),
+      'Failed to delete sticker',
+    )
+  }
+
+  async getServerSounds(serverId: string): Promise<HarmonyServerSound[]> {
+    return this.getJson<HarmonyServerSound[]>(`/servers/${serverId}/sounds`, 'Failed to fetch server sounds')
+  }
+
+  /** Imports (or with `update`, refreshes) a Discord soundboard sound as a server sound. */
+  async importDiscordSound(
+    serverId: string,
+    sound: DesiredSound,
+    update: boolean,
+  ): Promise<HarmonyServerSound & { status: 'created' | 'existing' | 'updated' }> {
+    return this.sendJson('POST', `/servers/${serverId}/sounds/discord`, {
+      discord_sound_id: sound.id,
+      name: sound.name,
+      emoji: sound.emoji,
+      emoji_id: sound.emojiId,
+      volume: sound.volume,
+      update,
+    }, 'Failed to import sound')
+  }
+
+  async deleteServerSound(serverId: string, soundId: string): Promise<void> {
+    await this.expectOk(
+      await this.request(`/servers/${serverId}/sounds/${soundId}`, { method: 'DELETE' }),
+      'Failed to delete sound',
+    )
   }
 
   async getGuildMembers(guildId: string): Promise<any[]> {

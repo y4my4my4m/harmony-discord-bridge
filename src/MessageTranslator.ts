@@ -252,6 +252,8 @@ export interface DiscordToHarmonyContext {
   harmonyChannelFor?: (discordChannelId: string) => { id: string; serverId: string; name: string } | null
   /** Discord emoji id → the Harmony server emoji imported from it. */
   harmonyEmojiFor?: (discordEmojiId: string) => { id: string; name: string; url: string | null } | null
+  /** Discord sticker id → the Harmony server sticker synced from it. */
+  harmonyStickerFor?: (discordStickerId: string) => { id: string; url: string; name: string; description: string } | null
 }
 
 /** Bridge state the Harmony → Discord translation consults. */
@@ -519,7 +521,8 @@ export class MessageTranslator {
 
     const parts: any[] = [{ type: 'text', text: '*↪ Forwarded*\n' }]
     for (const snapshot of snapshots) {
-      parts.push(...this.messageBody(snapshot, discordMsg, ctx, snapshot.content))
+      // Only the message's own stickers are ever native; a snapshot's stay images.
+      parts.push(...this.messageBody(snapshot, discordMsg, { ...ctx, harmonyStickerFor: undefined }, snapshot.content))
     }
     if (own.length > 0) parts.push({ type: 'text', text: '\n' }, ...own)
     return parts
@@ -549,7 +552,18 @@ export class MessageTranslator {
       })
     }
 
+    let nativeSticker = false
     for (const sticker of collectionValues(msg.stickers)) {
+      const linked = nativeSticker ? null : ctx.harmonyStickerFor?.(sticker.id) ?? null
+      if (linked) {
+        nativeSticker = true
+        const ext = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(linked.url)?.[1]?.toLowerCase() ?? 'png'
+        parts.push(
+          { type: 'sticker', id: linked.id, url: linked.url, name: linked.name, description: linked.description },
+          { type: 'file', fileType: 'image', stickerId: linked.id, url: linked.url, fileName: `${linked.name}.${ext}`, altText: linked.description },
+        )
+        continue
+      }
       const url = stickerImageUrl(sticker)
       if (url) {
         parts.push({ type: 'file', url, fileName: `${sticker.name || 'sticker'}.${url.endsWith('.gif') ? 'gif' : 'png'}`, fileType: 'image' })

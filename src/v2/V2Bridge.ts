@@ -1,4 +1,5 @@
 import { join } from 'path'
+import { setHarmonyPermissionBits } from '../utils/discordPermissions.js'
 import { BridgeApi, BridgeApiError, type BridgeV2Config } from './BridgeApi.js'
 import { V2Directory, type DirectoryChange } from './V2Directory.js'
 import { buildStatusPayload } from './selfCheck.js'
@@ -258,6 +259,7 @@ export class V2Bridge {
       this.statusSoon()
       return
     }
+    setHarmonyPermissionBits(config.permission_bits ?? null)
     const hadError = this.configError !== null
     this.configError = null
     this.lastConfigErrorLogged = ''

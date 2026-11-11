@@ -20,7 +20,8 @@ import {
   discordOverwriteToHarmonyMasks,
 } from './utils/discordPermissions.js'
 
-const HARMONY_VIEW_CHANNEL = BigInt(discordBitfieldToHarmonyMask(PermissionFlagsBits.ViewChannel))
+// Computed per call: bit positions depend on the instance's /config permission_bits.
+const harmonyViewChannel = (): bigint => BigInt(discordBitfieldToHarmonyMask(PermissionFlagsBits.ViewChannel))
 
 /**
  * @everyone's overwrite on the channel denies ViewChannel. Discord computes a channel's
@@ -446,8 +447,8 @@ export class PermissionSync {
     const current = overrides.find((r: any) => r.target_type === 'role' && r.role_id === defaultRoleId)
     const oldAllow = BigInt(current?.allow_permissions ?? 0)
     const oldDeny = BigInt(current?.deny_permissions ?? 0)
-    const allow = oldAllow & ~HARMONY_VIEW_CHANNEL
-    const deny = oldDeny | HARMONY_VIEW_CHANNEL
+    const allow = oldAllow & ~harmonyViewChannel()
+    const deny = oldDeny | harmonyViewChannel()
     if (current && allow === oldAllow && deny === oldDeny) return
     await this.harmony.upsertChannelPermissionOverride(harmonyChannelId, {
       target_type: 'role',

@@ -26,6 +26,8 @@ export interface BridgeV2Config {
   }>
   /** Read when present; the contract does not list it. */
   base_url?: string
+  /** Harmony permission names, index = bit position. Absent on older Harmony. */
+  permission_bits?: string[]
 }
 
 /** POST /bridge/v2/redeem */
@@ -130,6 +132,7 @@ export class BridgeApi {
       pairs: Array.isArray(body.pairs) ? body.pairs : [],
       harmony_channels: Array.isArray(body.harmony_channels) ? body.harmony_channels : [],
       ...(typeof body.base_url === 'string' && body.base_url ? { base_url: body.base_url } : {}),
+      ...(Array.isArray(body.permission_bits) ? { permission_bits: body.permission_bits.map(String) } : {}),
     }
   }
 

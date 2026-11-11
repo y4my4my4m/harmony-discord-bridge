@@ -6,6 +6,7 @@ import type { BridgeV2Config } from '../src/v2/BridgeApi.js'
 import type { BridgeRuntimeOptions } from '../src/runtime/BridgeRuntime.js'
 import type { DiscordGuildView } from '../src/problems.js'
 import { silentLogger } from '../src/log.js'
+import { ImportSlots } from '../src/runtime/importScheduler.js'
 
 function config(overrides: Partial<BridgeV2Config> = {}): BridgeV2Config {
   return {
@@ -84,11 +85,11 @@ function bridge(fetchImpl: any, runtimes: FakeRuntime[], extra: Partial<Construc
     authHint: 'auth hint',
     fetchImpl,
     statusDebounceMs: 10,
-    createRuntime: (opts) => {
+    createRuntime: extra.createRuntime ?? ((opts) => {
       const r = new FakeRuntime(opts)
       runtimes.push(r)
       return r
-    },
+    }),
   })
 }
 
@@ -279,5 +280,78 @@ describe('V2Directory', () => {
     const noGuild = new V2Directory(config({ discord_guild_id: null }))
     expect(noGuild.getBridges()).toEqual([])
     expect(noGuild.getHarmonyServerIds()).toEqual(['s-1'])
+  })
+})
+
+describe('V2Bridge history import', () => {
+  const queuedJob = { id: 'j1', state: 'queued', phase: 'messages', created_at: '2026-01-01T00:00:00Z', cancel_requested: false }
+
+  function importGateway(intent: boolean) {
+    const g = gateway()
+    const imports: any[] = [queuedJob]
+    const inner = g.fetchImpl.getMockImplementation()!
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (String(url).endsWith('/bridge/v2/imports') && (init?.method ?? 'GET') === 'GET') return Response.json({ imports })
+      return inner(url, init)
+    })
+    class ImportRuntime extends FakeRuntime {
+      discordIdentity() {
+        return { ...super.discordIdentity(), intents: { message_content: intent, members: true, presence: false } }
+      }
+      discordClientForImport() { return null }
+      translateForImport = vi.fn(async () => null)
+      threadStarterForImport = vi.fn(async () => null)
+    }
+    return { ...g, imports, fetchImpl, ImportRuntime }
+  }
+
+  function importBridge(g: ReturnType<typeof importGateway>, runtimes: FakeRuntime[]) {
+    return bridge(g.fetchImpl, runtimes, {
+      import: { slots: new ImportSlots(1), settings: { pollMs: 3_600_000, pageDelayMs: 0 } },
+      createRuntime: (opts) => { const r = new g.ImportRuntime(opts); runtimes.push(r); return r },
+    })
+  }
+
+  it('reports message_content_needed_for_import while a job is queued and the intent is off', async () => {
+    const g = importGateway(false)
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes)
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(b.currentProblems().map(p => p.code)).toContain('message_content_needed_for_import')
+    expect(g.state.statuses.at(-1).problems.map((p: any) => p.code)).toContain('message_content_needed_for_import')
+
+    // The job goes away: the next poll drops the problem.
+    g.imports.length = 0
+    runtimes[0].opts.hooks!.kickImports!()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(b.currentProblems().map(p => p.code)).not.toContain('message_content_needed_for_import')
+    await b.stop()
+  })
+
+  it('starts the job when the intent is on, and leaves imports unwired without options', async () => {
+    const g = importGateway(true)
+    const patches: string[] = []
+    const inner = g.fetchImpl.getMockImplementation()!
+    g.fetchImpl.mockImplementation(async (url: any, init?: RequestInit) => {
+      if (init?.method === 'PATCH') { patches.push(String(url)); return Response.json({ import: { ...queuedJob, state: 'running' } }) }
+      return inner(url, init)
+    })
+    const b = importBridge(g, [])
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(patches.some(u => u.endsWith('/imports/j1'))).toBe(true)
+    // The unconnected client makes the importer back off; stop() waits for it to pause.
+    const stopping = b.stop()
+    await vi.advanceTimersByTimeAsync(40_000)
+    await stopping
+
+    const plain = gateway()
+    const none = bridge(plain.fetchImpl, [])
+    await none.start()
+    none.kickImports()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(plain.fetchImpl.mock.calls.some(c => String(c[0]).includes('/imports'))).toBe(false)
+    await none.stop()
   })
 })

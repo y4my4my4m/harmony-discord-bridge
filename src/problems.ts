@@ -14,6 +14,8 @@ export type ProblemCode =
   | 'rate_limited'
   | 'discord_unreachable'
   | 'harmony_unreachable'
+  | 'private_threads_skipped'
+  | 'message_content_needed_for_import'
 
 export type PrivilegedIntent = 'message_content' | 'members' | 'presence'
 
@@ -22,9 +24,12 @@ export interface Problem {
   params?: Record<string, string>
 }
 
+/** Params that describe a problem without identifying it: a new count replaces the old entry. */
+const UNKEYED_PARAMS = new Set(['count'])
+
 export function problemKey(p: Problem): string {
   const params = p.params
-    ? Object.keys(p.params).sort().map(k => `${k}=${p.params![k]}`).join(',')
+    ? Object.keys(p.params).filter(k => !UNKEYED_PARAMS.has(k)).sort().map(k => `${k}=${p.params![k]}`).join(',')
     : ''
   return `${p.code}${params ? `:${params}` : ''}`
 }
@@ -129,6 +134,16 @@ export function describeProblem(p: Problem): { summary: string; fix: string } {
       return {
         summary: 'The bridge cannot reach Harmony.',
         fix: 'Check HARMONY_URL and the internet connection of the machine running the bridge.',
+      }
+    case 'private_threads_skipped':
+      return {
+        summary: `History import left out ${p.params?.count ? `${p.params.count} private thread(s)` : 'the private threads'} of ${ch}: Harmony has no private threads yet, so everyone in the channel could read them.`,
+        fix: 'Nothing to do. Private threads stay on Discord until Harmony supports them.',
+      }
+    case 'message_content_needed_for_import':
+      return {
+        summary: 'A history import is waiting: Discord returns empty messages while the Message Content Intent is off.',
+        fix: 'Discord Developer Portal → your app → Bot → Privileged Gateway Intents → switch on "Message Content Intent". The import starts by itself.',
       }
   }
 }

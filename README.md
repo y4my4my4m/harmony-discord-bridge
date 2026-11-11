@@ -171,6 +171,10 @@ All settings are environment variables (`-e NAME=value`).
 | `HEALTH_PORT` | no | Port of the `/health` status endpoint, default `8080`. `off` disables it. |
 | `MAX_UPLOAD_MB` | no | Harmony files up to this many megabytes per message are uploaded to Discord; bigger ones are sent as a link. Default `8`. Discord's own limit for the server applies on top. `0` sends every file as a link. |
 | `HARMONY_MEDIA_ORIGIN` | no | For a bridge on the same machine as Harmony: where to download Harmony files from instead of the public address, e.g. `http://127.0.0.1:8000` (Supabase's Kong). Saves the round trip through the internet or Cloudflare. |
+| `BRIDGE_IMPORT_POLL_MS` | no | How often the bridge looks for history import jobs, in milliseconds. Default `10000`, minimum `1000`. |
+| `BRIDGE_IMPORT_PAGE_DELAY_MS` | no | Pause between pages of Discord history while importing, to stay gentle on Discord's rate limits. Default `1000`, `0` for none. |
+| `BRIDGE_IMPORT_CONCURRENCY` | no | How many imports run at once in this process. Default `1`. |
+| `BRIDGE_IMPORT_TEST_AUTHORS` | no | Testing only. Comma-separated bot or webhook ids whose messages the history import treats as a person's, so a test server seeded through a webhook can be imported. Leave unset in production. |
 
 Which channels are paired and what is synced (member list, presence,
 reactions, edits, deletions) is set in Harmony's Discord Bridge page; the
@@ -259,7 +263,45 @@ and is counted in the log the same way.
 - `/bridge sync-perms`: copy Discord roles and the permissions of every linked channel to Harmony.
 - `/bridge import-emojis`: copy the server's custom emoji into the Harmony server under the same names (Harmony 1.6.25+). A rerun adds only new ones; a Harmony emoji with the same name is linked instead of duplicated. Imported emoji are one emoji on both sides, so reactions with it count together.
 
+- `/bridge import-history`: import a channel's old Discord messages into Harmony (bridge 2.6.0 or later; see below). `action:` is `start` (default), `status` or `cancel`; `scope:` is `channel` (default; inside a thread, its parent channel) or `all` bridged channels.
+
 `/bridge` needs the Discord **Administrator** permission.
+
+## Importing old messages
+
+Messages written before a channel was bridged can be copied into Harmony. Start
+it either way:
+
+- in Harmony, under Server settings → Discord Bridge, for one channel or all
+  paired channels (progress is shown there), or
+- in Discord, with `/bridge import-history` in the channel (or `scope:all`);
+  `action:status` shows the state, percent and number of messages, and
+  `action:cancel` stops it.
+
+The channel's pair must bring Discord messages to Harmony (direction "both" or
+"Discord → Harmony") and the Harmony channel must not be encrypted. The bot
+needs the **Message Content** intent and permission to read the channel's
+history on Discord.
+
+Voice and stage channels import their text chat too (they have no threads).
+
+What is imported: normal messages and replies, with their original time,
+author, edit time, embeds, stickers, mentions, custom emoji and attachments;
+pinned state (up to Harmony's 50 pins per channel; further pins are skipped and
+counted); and public threads with their messages. Replies are linked to their original afterwards.
+Authors who have left the server are imported as plain Discord users.
+
+What is skipped: private threads (they are never imported, and never relayed
+live either: Harmony has no private threads yet, so everyone in the channel
+could read them; the Manage Threads permission is not needed and does not
+change this), reactions (they are not imported), messages from bots
+(including webhooks), system messages (joins, boosts, pin notices and so on),
+and messages already in Harmony. An import can be re-run or resumed after a
+restart without duplicates.
+
+A bridge runs one import at a time; `BRIDGE_IMPORT_CONCURRENCY` sets how many
+imports run at once across the whole bridge process (default 1). The other
+`BRIDGE_IMPORT_*` settings above tune the pace.
 
 ## Troubleshooting
 

@@ -5,7 +5,9 @@ import { CredentialsError, obtainCredentials, type StoredCredentials } from './c
 import { EndpointError, endpointsFor, probeEndpoints, type HarmonyEndpoints } from './endpoints.js'
 import { HostRunner } from './HostRunner.js'
 import { InstanceHost } from './InstanceHost.js'
-import { V2Bridge } from './V2Bridge.js'
+import { V2Bridge, type V2ImportOptions } from './V2Bridge.js'
+import { DEFAULT_IMPORT_SETTINGS, type ImportSettings } from '../env.js'
+import { ImportSlots } from '../runtime/importScheduler.js'
 import { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
 import { Backoff, sleep, type FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -53,6 +55,11 @@ async function untilReachable<T>(
   }
 }
 
+/** History import wiring for one process: a slot pool sized by BRIDGE_IMPORT_CONCURRENCY. */
+function importOptions(settings: ImportSettings = DEFAULT_IMPORT_SETTINGS): V2ImportOptions {
+  return { slots: new ImportSlots(settings.concurrency), settings }
+}
+
 function ensureDataDir(dataDir: string) {
   try {
     mkdirSync(dataDir, { recursive: true })
@@ -75,6 +82,7 @@ export async function runSelf(opts: {
   log: Logger
   version: string
   ignoredLegacyConfig: string | null
+  import?: ImportSettings
   fetchImpl?: FetchLike
 }): Promise<Launched> {
   const { log } = opts
@@ -138,6 +146,7 @@ export async function runSelf(opts: {
     log,
     version: opts.version,
     authHint: SELF_AUTH_HINT,
+    import: importOptions(opts.import),
     fetchImpl: opts.fetchImpl,
   })
   await bridge.start()
@@ -167,11 +176,14 @@ export async function runHost(opts: {
   dataDir: string
   log: Logger
   version: string
+  import?: ImportSettings
   fetchImpl?: FetchLike
 }): Promise<Launched> {
   const { log } = opts
   let stopped = false
   ensureDataDir(opts.dataDir)
+  // One slot pool for every bridge of this process, own-token and instance alike.
+  const importing = importOptions(opts.import)
 
   const endpoints = await untilReachable(
     log,
@@ -208,6 +220,7 @@ export async function runHost(opts: {
       log,
       version: opts.version,
       authHint: HOSTED_AUTH_HINT,
+      import: importing,
       fetchImpl: opts.fetchImpl,
     }),
   })
@@ -228,6 +241,7 @@ export async function runHost(opts: {
       log,
       version: opts.version,
       authHint: HOSTED_AUTH_HINT,
+      import: importing,
       discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
       fetchImpl: opts.fetchImpl,
     }),

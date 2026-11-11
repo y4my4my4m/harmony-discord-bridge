@@ -188,3 +188,12 @@ describe('buildStatusPayload', () => {
     })
   })
 })
+
+describe('problemKey', () => {
+  it('keys a problem by what it is about, not by its count', () => {
+    const a = problemKey({ code: 'private_threads_skipped', params: { discord_channel_id: '1', count: '2' } } as any)
+    const b = problemKey({ code: 'private_threads_skipped', params: { discord_channel_id: '1', count: '5' } } as any)
+    expect(a).toBe(b)
+    expect(a).toBe('private_threads_skipped:discord_channel_id=1')
+  })
+})

@@ -69,7 +69,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [x] Reaction bridging (Discord → Harmony with user attribution)
 - [x] Reaction bridging (Harmony → Discord; bot-gateway now emits MESSAGE_REACTION_ADD/REMOVE)
 - [x] Custom emoji bridging
-- [x] `/bridge sync-sounds`: Discord soundboard to Harmony (mirror/merge/add, dry run, Confirm/Cancel before deletes)
+- [x] `/bridge sync-sounds`: Discord soundboard to Harmony (merge/mirror/add, dry run, Confirm/Cancel before deletes)
 - [x] Media/attachment bridging
 - [x] Webhook puppeting (Harmony users appear with their name/avatar in Discord)
 - [x] Discord users in Harmony autosuggest

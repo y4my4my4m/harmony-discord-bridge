@@ -27,6 +27,7 @@ import { isAutomodBlocked, HarmonyHttpError } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
 import { confirmAction } from './confirmPrompt.js'
 import { CONFLICT_HINT, planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
+import { byDiscordId, desiredEmoji, emojiDiffers, harmonyEmojiSyncItem, type DesiredEmoji } from './emojiSync.js'
 import { desiredSound, harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
 
 // =============================================================================
@@ -121,6 +122,17 @@ export function buildCommands(mode: 'v1' | 'v2') {
         .setDescription('Copy this server\'s custom emojis into the Harmony server (rerun adds only new ones)')
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('List what would be imported without changes').setRequired(false)))
+    bridgeCommand.addSubcommand(sub =>
+      sub
+        .setName('sync-emojis')
+        .setDescription('Make Harmony\'s emoji match this Discord server')
+        .addStringOption(opt =>
+          opt.setName('mode')
+            .setDescription('How to reconcile (default: mirror)')
+            .setRequired(false)
+            .addChoices(...SYNC_MODE_CHOICES))
+        .addBooleanOption(opt =>
+          opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
     bridgeCommand.addSubcommand(sub =>
       sub
         .setName('sync-sounds')
@@ -397,7 +409,10 @@ async function handleBridgeCommand(rt: BridgeRuntime, command: ChatInputCommandI
         await runBridgeSyncPerms(rt, command)
         break
       case 'import-emojis':
-        await runBridgeImportEmojis(rt, command)
+        await runBridgeSyncEmojis(rt, command, { mode: 'add' })
+        break
+      case 'sync-emojis':
+        await runBridgeSyncEmojis(rt, command)
         break
       case 'sync-sounds':
         await runBridgeSyncSounds(rt, command)
@@ -914,9 +929,9 @@ const EMOJI_IMPORT_LIMIT = 250
  * emoji with the same name is linked instead of duplicated. Linked emoji are one emoji on both
  * sides for reactions and messages.
  */
-async function runBridgeImportEmojis(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+async function runBridgeImportEmojisLegacy(rt: BridgeRuntime, command: ChatInputCommandInteraction, alreadyDeferred = false) {
   const dryRun = command.options.getBoolean('dry_run', false) ?? false
-  await command.deferReply({ flags: MessageFlags.Ephemeral })
+  if (!alreadyDeferred) await command.deferReply({ flags: MessageFlags.Ephemeral })
 
   const guild = command.guild!
   const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
@@ -947,7 +962,7 @@ async function runBridgeImportEmojis(rt: BridgeRuntime, command: ChatInputComman
     return
   }
 
-  const counts = { created: 0, linked: 0, existing: emojis.length - fresh.length }
+  const counts = { created: 0, linked: 0, updated: 0, existing: emojis.length - fresh.length }
   const failures: string[] = []
   for (const emoji of fresh) {
     try {
@@ -1145,6 +1160,218 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
   const noEmoji = applied.filter(d => d.hadUnimportedEmoji).length
   if (noEmoji > 0) {
     lines.push('', `Run \`/bridge import-emojis\` first to keep custom emoji on ${noEmoji} sound(s).`)
+  }
+  if (failures.length > 0) {
+    lines.push('', `⚠️ ${failures.length} failure(s):`, ...failures.slice(0, 15).map(f => `  • ${f}`))
+    if (failures.length > 15) lines.push(`  • …and ${failures.length - 15} more`)
+  }
+  await command.editReply({ content: joinLinesWithinDiscordLimit(lines), components: [] })
+}
+
+/**
+ * `/bridge sync-emojis`: makes Harmony's emoji match the guild's. Mirror (default) also removes
+ * Harmony emoji that are not on Discord, so a real run that removes or replaces anything asks
+ * Confirm/Cancel first. `/bridge import-emojis` is this in add mode, falling back to the old
+ * import on a Harmony without the sync endpoints.
+ * Order: removals, replace holders, creates, then renames and restores.
+ */
+export async function runBridgeSyncEmojis(
+  rt: BridgeRuntime,
+  command: ChatInputCommandInteraction,
+  opts: { mode?: SyncMode } = {},
+) {
+  const shortcut = opts.mode !== undefined
+  const mode = (opts.mode ?? command.options.getString('mode', false) ?? 'mirror') as SyncMode
+  const dryRun = command.options.getBoolean('dry_run', false) ?? false
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({ content: notBridgedText(rt) })
+    return
+  }
+  const serverId = bridge.harmonyServerId
+
+  let state
+  try {
+    state = await rt.harmony.getEmojiSyncState(serverId)
+  } catch (err) {
+    if (err instanceof HarmonyHttpError && err.status === 404) {
+      if (shortcut) {
+        await runBridgeImportEmojisLegacy(rt, command, true)
+      } else {
+        await command.editReply({ content: '❌ Emoji sync needs a newer Harmony (bridge emoji sync endpoints).' })
+      }
+      return
+    }
+    throw err
+  }
+
+  let fetched
+  try {
+    fetched = [...(await guild.emojis.fetch()).values()]
+  } catch (err) {
+    await command.editReply({ content: `❌ Could not read the Discord emoji: ${errorText(err)}` })
+    return
+  }
+  const presentIds = fetched.filter(e => e.available === false).map(e => e.id)
+  const discord = fetched
+    .filter(e => e.available !== false)
+    .map(e => desiredEmoji({ id: e.id, name: e.name, animated: e.animated === true, available: true }))
+    .filter((d): d is DesiredEmoji => d !== null)
+    .sort(byDiscordId)
+
+  const rawPlan = planSync({
+    mode,
+    discord,
+    presentIds,
+    harmony: state.emojis.map(harmonyEmojiSyncItem),
+    differs: emojiDiffers,
+    limit: state.limit,
+  })
+  // A clash report already covers an emoji the planner also wanted to rename or restore.
+  const clashing = new Set(rawPlan.conflict.map(c => c.discord.id))
+  const plan = {
+    ...rawPlan,
+    update: rawPlan.update.filter(u => !clashing.has(u.discord.id)),
+    restore: rawPlan.restore.filter(u => !clashing.has(u.discord.id)),
+  }
+  const limitHint = '  An instance admin can raise "max custom emojis per server", then run this again.'
+  const reportOpts = { label: (n: string) => `:${n}:`, noun: 'emoji', nounPlural: 'emoji', limitHint, removeVerb: { dry: 'Would remove', real: 'Remove' } }
+
+  if (dryRun) {
+    await command.editReply({
+      content: joinLinesWithinDiscordLimit([
+        `🧪 **Dry run** (${mode}) for **${guild.name}**`,
+        ...syncReportLines(plan, { ...reportOpts, dryRun: true }),
+      ]),
+    })
+    return
+  }
+
+  const removals = [...plan.delete, ...plan.replace.flatMap(r => r.harmony)]
+  const creations = [...plan.add, ...plan.replace.map(r => r.discord)]
+  if (removals.length + creations.length + plan.update.length + plan.restore.length === 0) {
+    const left = plan.conflict.length + plan.outdated + plan.overLimit.length > 0
+    await command.editReply({
+      content: left
+        ? joinLinesWithinDiscordLimit([
+          `${plan.conflict.length > 0 ? '⚠️' : '✅'} Nothing to apply (${mode}) for **${guild.name}**`,
+          ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
+        ])
+        : '✅ Emoji already match.',
+    })
+    return
+  }
+
+  if (removals.length > 0) {
+    const prompt = joinLinesWithinDiscordLimit([
+      ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
+      `⚠️ This removes ${removals.length} Harmony emoji. Removed emoji stay in old messages and can be restored in Harmony. Confirm?`,
+    ])
+    if (!(await confirmAction(command, prompt, undefined, rt.log))) return
+  }
+
+  const failures: string[] = []
+  const fail = (name: string, err: unknown) => {
+    let text: string
+    if (err instanceof HarmonyHttpError && err.code === 'EMOJI_LIMIT') {
+      text = `the Harmony emoji list is full (${state.limit} per server)`
+    } else if (err instanceof HarmonyHttpError && err.code === 'EMOJI_NAME_TAKEN') {
+      text = 'name already used by another Harmony emoji'
+    } else {
+      text = errorText(err)
+    }
+    failures.push(`:${name}: ${text}`)
+  }
+  const counts = { removed: 0, created: 0, renamed: 0, restored: 0, replaced: 0 }
+
+  // Resolves to the error, or null once the emoji is gone (404 counts as gone).
+  const tryRemove = async (h: { id: string }): Promise<unknown> => {
+    try {
+      await rt.harmony.removeServerEmoji(serverId, h.id)
+    } catch (err) {
+      if (!(err instanceof HarmonyHttpError && err.status === 404)) return err
+    }
+    return null
+  }
+  for (const h of plan.delete) {
+    const err = await tryRemove(h)
+    if (err) fail(h.name, err)
+    else counts.removed++
+  }
+  // A replaced emoji is only recreated on Discord's name if every old Harmony row is gone.
+  const blocked = new Set<string>()
+  for (const r of plan.replace) {
+    let removeError: unknown = null
+    for (const h of r.harmony) {
+      const err = await tryRemove(h)
+      if (err) removeError ??= err
+    }
+    if (removeError) {
+      blocked.add(r.discord.id)
+      failures.push(`:${r.discord.name}: not replaced, removing the Harmony emoji failed: ${errorText(removeError)}`)
+    }
+  }
+  const replacing = new Set(plan.replace.map(r => r.discord.id))
+  const send = (d: DesiredEmoji, update: boolean) =>
+    rt.harmony.importDiscordEmoji(serverId, { discordEmojiId: d.id, name: d.name, animated: d.animated }, update)
+  for (const d of creations) {
+    if (blocked.has(d.id)) continue
+    try {
+      await send(d, false)
+      if (replacing.has(d.id)) counts.replaced++
+      else counts.created++
+    } catch (err) {
+      fail(d.name, err)
+    }
+  }
+  for (const { discord: d } of plan.update) {
+    try {
+      await send(d, true)
+      counts.renamed++
+    } catch (err) {
+      fail(d.name, err)
+    }
+  }
+  for (const { discord: d } of plan.restore) {
+    try {
+      await send(d, true)
+      counts.restored++
+    } catch (err) {
+      fail(d.name, err)
+    }
+  }
+
+  try {
+    rt.emojiLinks.replace(serverId, await rt.harmony.getServerEmojis(serverId))
+  } catch (err) {
+    rt.log.warn(`Could not refresh emoji links after sync: ${errorText(err)}`)
+  }
+
+  const lines = [
+    failures.length > 0
+      ? `⚠️ Emoji sync finished with ${failures.length} failure(s) (${mode}) for **${guild.name}**`
+      : `✅ Emoji sync (${mode}) for **${guild.name}**`,
+    `• Added: ${counts.created}`,
+    `• Renamed: ${counts.renamed}`,
+    `• Restored: ${counts.restored}`,
+    ...(plan.replace.length > 0 ? [`• Replaced (same name on Harmony): ${counts.replaced}`] : []),
+    `• Removed: ${counts.removed}`,
+    ...(plan.outdated > 0 ? [`• Not updated (add mode): ${plan.outdated}; use merge or mirror to update`] : []),
+  ]
+  if (plan.overLimit.length > 0) {
+    const names = plan.overLimit.map(d => d.name)
+    lines.push('', `⚠️ ${names.length} skipped: limit reached (${plan.limit} per server)`, ...names.slice(0, 20).map(n => `  • :${n}:`))
+    if (names.length > 20) lines.push(`  • …and ${names.length - 20} more`)
+    lines.push(limitHint)
+  }
+  if (plan.conflict.length > 0) {
+    const names = plan.conflict.map(c => c.discord.name)
+    lines.push('', `⚠️ ${names.length} name clash(es), left as they are:`, ...names.slice(0, 20).map(n => `  • :${n}:`))
+    if (names.length > 20) lines.push(`  • …and ${names.length - 20} more`)
+    lines.push(CONFLICT_HINT)
   }
   if (failures.length > 0) {
     lines.push('', `⚠️ ${failures.length} failure(s):`, ...failures.slice(0, 15).map(f => `  • ${f}`))

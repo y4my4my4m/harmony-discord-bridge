@@ -172,7 +172,7 @@ describe('runBridgeSyncSounds', () => {
     expect(content).toContain('⚠️ Nothing to apply (add)')
     expect(content).toContain('Name clash: 1 sound')
     expect(content).toContain('  • horn')
-    expect(content).toContain('Not updated (add mode): 1 changed on Discord')
+    expect(content).toContain('Not updated (add mode): 1; use merge or mirror to update')
     expect(content).not.toContain('already matches')
   })
 

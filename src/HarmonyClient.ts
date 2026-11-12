@@ -66,6 +66,14 @@ export interface HarmonyServerEmoji {
   discord_emoji_id: string | null
 }
 
+export interface HarmonyEmojiSyncRow {
+  id: string
+  name: string
+  url: string | null
+  discord_emoji_id: string | null
+  removed: boolean
+}
+
 export interface HarmonyServerSound {
   id: string
   name: string
@@ -698,12 +706,26 @@ export class HarmonyClient extends EventEmitter {
   async importDiscordEmoji(
     serverId: string,
     emoji: { discordEmojiId: string; name: string; animated: boolean },
-  ): Promise<HarmonyServerEmoji & { status: 'created' | 'existing' | 'linked' }> {
+    update = false,
+  ): Promise<HarmonyServerEmoji & { status: 'created' | 'existing' | 'linked' | 'updated'; removed?: boolean }> {
     return this.sendJson('POST', `/servers/${serverId}/emojis/discord`, {
       discord_emoji_id: emoji.discordEmojiId,
       name: emoji.name,
       animated: emoji.animated,
+      // Only sent when true so an older Harmony sees the body it always did.
+      ...(update ? { update: true } : {}),
     }, 'Failed to import emoji')
+  }
+
+  async getEmojiSyncState(serverId: string): Promise<{ limit: number; emojis: HarmonyEmojiSyncRow[] }> {
+    return this.getJson(`/servers/${serverId}/emojis/discord`, 'Failed to fetch server emojis')
+  }
+
+  async removeServerEmoji(serverId: string, emojiId: string): Promise<void> {
+    await this.expectOk(
+      await this.request(`/servers/${serverId}/emojis/${emojiId}`, { method: 'DELETE' }),
+      'Failed to delete emoji',
+    )
   }
 
   async getServerSounds(serverId: string): Promise<HarmonyServerSound[]> {

@@ -58,13 +58,13 @@ describe('planLaunch', () => {
 })
 
 describe('parseImportSettings', () => {
-  it('defaults to a 10 s poll, 1 s page delay and one import at a time', () => {
-    expect(parseImportSettings({})).toEqual({ ok: true, settings: { pollMs: 10000, pageDelayMs: 1000, concurrency: 1 } })
+  it('defaults to a 10 s poll and a 1 s page delay', () => {
+    expect(parseImportSettings({})).toEqual({ ok: true, settings: { pollMs: 10000, pageDelayMs: 1000 } })
   })
 
   it('reads the BRIDGE_IMPORT_* variables', () => {
-    expect(parseImportSettings({ BRIDGE_IMPORT_POLL_MS: '5000', BRIDGE_IMPORT_PAGE_DELAY_MS: '0', BRIDGE_IMPORT_CONCURRENCY: '3' }))
-      .toEqual({ ok: true, settings: { pollMs: 5000, pageDelayMs: 0, concurrency: 3 } })
+    expect(parseImportSettings({ BRIDGE_IMPORT_POLL_MS: '5000', BRIDGE_IMPORT_PAGE_DELAY_MS: '0' }))
+      .toEqual({ ok: true, settings: { pollMs: 5000, pageDelayMs: 0 } })
   })
 
   it('rejects values that are not whole numbers in range', () => {
@@ -72,8 +72,7 @@ describe('parseImportSettings', () => {
       { BRIDGE_IMPORT_POLL_MS: 'fast' },
       { BRIDGE_IMPORT_POLL_MS: '10' },
       { BRIDGE_IMPORT_PAGE_DELAY_MS: '-1' },
-      { BRIDGE_IMPORT_CONCURRENCY: '0' },
-      { BRIDGE_IMPORT_CONCURRENCY: '1.5' },
+      { BRIDGE_IMPORT_PAGE_DELAY_MS: '1.5' },
     ]) {
       const res = parseImportSettings(env)
       expect(res.ok).toBe(false)

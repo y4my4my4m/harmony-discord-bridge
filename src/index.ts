@@ -47,8 +47,6 @@ process.on('unhandledRejection', (reason) => {
 async function main() {
   const plan = planLaunch(process.env, findLegacyConfigPath())
   if (plan.kind === 'error') fatal(plan.message)
-  const importSettings = parseImportSettings(process.env)
-  if (!importSettings.ok) fatal(importSettings.message)
 
   log.info(`Harmony Discord bridge ${version} (${plan.kind === 'self' ? 'self-hosted' : plan.kind === 'host' ? 'host mode' : 'legacy v1 config'})`)
 
@@ -66,6 +64,9 @@ async function main() {
     if (plan.kind === 'v1') {
       launched = await runV1(plan.configPath, log)
     } else if (plan.kind === 'self') {
+      // BRIDGE_IMPORT_* is read by the one mode that imports.
+      const importSettings = parseImportSettings(process.env)
+      if (!importSettings.ok) fatal(importSettings.message)
       launched = await runSelf({
         harmonyUrl: plan.harmonyUrl,
         setupCode: plan.setupCode,
@@ -84,7 +85,6 @@ async function main() {
         dataDir: resolveDataDir(),
         log,
         version,
-        import: importSettings.settings,
       })
     }
   } catch (err) {

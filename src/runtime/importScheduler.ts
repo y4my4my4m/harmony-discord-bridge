@@ -1,9 +1,9 @@
-import type { BridgeApi, ImportJob } from '../v2/BridgeApi.js'
-import type { ImportResult } from './historyImport.js'
+import { BridgeApiError, type BridgeApi, type ImportJob } from '../v2/BridgeApi.js'
+import type { ImportOutcome, ImportResult } from './historyImport.js'
 import { errorText, type Logger } from '../log.js'
 import type { Problem, ProblemCode } from '../problems.js'
 
-/** Counting semaphore shared by every bridge of one process: BRIDGE_IMPORT_CONCURRENCY imports at once. */
+/** Counting semaphore: how many imports run at once among the schedulers that share it. */
 export class ImportSlots {
   private free: number
   private readonly waiters: { grant: () => void }[] = []
@@ -52,8 +52,8 @@ export class ImportSlots {
 }
 
 export interface ImportSchedulerDeps {
-  api: Pick<BridgeApi, 'listImports' | 'updateImport'>
-  importer: { run(job: ImportJob, signal: AbortSignal): Promise<ImportResult> }
+  api: Pick<BridgeApi, 'listImports' | 'getImport' | 'updateImport'>
+  importer: { run(job: ImportJob, signal: AbortSignal): Promise<ImportResult | ImportOutcome> }
   slots: ImportSlots
   pollMs: number
   /** Whether the Message Content intent is on. Without it Discord returns empty history. */
@@ -61,10 +61,11 @@ export interface ImportSchedulerDeps {
   /** Whether Discord is connected; jobs wait (silently) until it is. Default: always. */
   ready?(): boolean
   /**
-   * Problems of this bridge raised by imports. `clear()` with no code drops all of them (the job
-   * that raised them is over, or none is queued).
+   * Problems of this bridge raised by imports. `clear(code)` drops the ones of that code;
+   * `beginChannel` drops the notices an earlier import of the channel left.
    */
-  problems?: { raise(problem: Problem): void; clear(code?: ProblemCode): void }
+  problems?: { raise(problem: Problem): void; clear(code: ProblemCode): void; beginChannel?(discordChannelId: string): void }
+  now?: () => number
   log?: Pick<Logger, 'info' | 'warn' | 'error' | 'debug'>
 }
 
@@ -72,6 +73,8 @@ const PRIORITY: Partial<Record<ImportJob['state'], number>> = { running: 0, paus
 
 /** Consecutive pauses without any progress after which a job is failed as stalled. */
 const STALL_LIMIT = 3
+/** A job Harmony asked to wait for, with no Retry-After. */
+const WAIT_DEFAULT_MS = 60_000
 
 /** What counts as progress between two pauses of a job. */
 const fingerprint = (j: ImportJob) =>
@@ -80,10 +83,10 @@ const fingerprint = (j: ImportJob) =>
 /**
  * Picks the job to work on: jobs this process did not just pause first (`running` left by a crash,
  * then `paused`, then `queued` by creation time), then the ones it paused, least recently paused
- * first, so one stuck job never blocks the others.
+ * first, so one stuck job never blocks the others. A job told to wait is skipped until `notBefore`.
  */
-function nextJob(jobs: ImportJob[], pausedAt: ReadonlyMap<string, number>): ImportJob | null {
-  const pending = jobs.filter(j => PRIORITY[j.state] !== undefined)
+function nextJob(jobs: ImportJob[], pausedAt: ReadonlyMap<string, number>, notBefore: ReadonlyMap<string, number>, now: number): ImportJob | null {
+  const pending = jobs.filter(j => PRIORITY[j.state] !== undefined && (notBefore.get(j.id) ?? 0) <= now)
   pending.sort((a, b) =>
     (pausedAt.get(a.id) ?? 0) - (pausedAt.get(b.id) ?? 0)
     || PRIORITY[a.state]! - PRIORITY[b.state]!
@@ -92,45 +95,65 @@ function nextJob(jobs: ImportJob[], pausedAt: ReadonlyMap<string, number>): Impo
   return pending[0] ?? null
 }
 
+const isRefusal = (err: unknown): boolean => err instanceof BridgeApiError && (err.status === 403 || err.status === 404)
+
 /**
- * Runs one history import at a time for one bridge. Polls GET /imports; a job also needs a free
- * slot of the process-wide ImportSlots before it starts.
+ * Runs one history import at a time for one bridge. While armed it polls GET /imports; a job
+ * also needs a free slot of the process-wide ImportSlots before it starts. It is armed only
+ * while Harmony's configuration enables import, and disarms itself when the import routes
+ * answer 403 or 404: an unarmed scheduler sends nothing.
  */
 export class ImportScheduler {
   private timer: NodeJS.Timeout | null = null
   private current: Promise<void> | null = null
   private polling = false
   private abort: AbortController | null = null
-  private stopped = true
+  private stopped = false
   private lastPollError = ''
+  private readonly now: () => number
   /** In memory: when (a counter) this process last saw each job pause; 0/absent = not paused by us. */
   private readonly pausedAt = new Map<string, number>()
   private pauseCounter = 0
   /** In memory: the progress fingerprint at the last pause and how many pauses in a row left it unchanged. */
   private readonly stalls = new Map<string, { fingerprint: string; count: number }>()
+  /** In memory: the time before which a job is not picked; Harmony asked for a wait. */
+  private readonly notBefore = new Map<string, number>()
 
-  constructor(private readonly deps: ImportSchedulerDeps) {}
+  constructor(private readonly deps: ImportSchedulerDeps) {
+    this.now = deps.now ?? Date.now
+  }
 
-  start(): void {
-    if (!this.stopped) return
-    this.stopped = false
+  /** Whether the scheduler polls. */
+  isArmed(): boolean {
+    return this.timer !== null
+  }
+
+  /** Starts polling, at once and then every `pollMs`. No-op while armed or after stop(). */
+  arm(): void {
+    if (this.stopped || this.timer) return
+    this.lastPollError = ''
     this.timer = setInterval(() => this.kick(), this.deps.pollMs)
     this.timer.unref?.()
     this.kick()
   }
 
-  /** Aborts the running job (the importer patches it `paused`) and waits for it. */
-  async stop(): Promise<void> {
-    this.stopped = true
+  /** Stops polling and aborts the running job (the importer leaves it `paused`). arm() resumes. */
+  disarm(): void {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     this.abort?.abort()
+  }
+
+  /** Disarms for good and waits for the running job to unwind. */
+  async stop(): Promise<void> {
+    this.stopped = true
+    this.disarm()
     await this.current
   }
 
-  /** Polls now instead of at the next interval. */
+  /** Polls now instead of at the next interval. No-op while not armed. */
   kick(): void {
-    if (this.stopped || this.polling || this.current) return
+    if (this.stopped || !this.timer || this.polling || this.current) return
     this.polling = true
     void this.poll().finally(() => { this.polling = false })
   }
@@ -142,6 +165,12 @@ export class ImportScheduler {
       jobs = await api.listImports()
       this.lastPollError = ''
     } catch (err) {
+      if (isRefusal(err)) {
+        // Import is off for this bridge, or the gateway has no import routes.
+        log?.info(`History import is not available (${errorText(err)}); polling stops until the configuration changes`)
+        this.disarm()
+        return
+      }
       const line = errorText(err)
       if (line !== this.lastPollError) {
         this.lastPollError = line
@@ -149,14 +178,14 @@ export class ImportScheduler {
       }
       return
     }
-    if (this.stopped || this.current) return
+    if (this.stopped || !this.timer || this.current) return
 
-    for (const id of [...this.pausedAt.keys()]) {
-      if (!jobs.some(j => j.id === id && PRIORITY[j.state] !== undefined)) { this.pausedAt.delete(id); this.stalls.delete(id) }
+    for (const id of [...new Set([...this.pausedAt.keys(), ...this.notBefore.keys()])]) {
+      if (!jobs.some(j => j.id === id && PRIORITY[j.state] !== undefined)) this.forget(id)
     }
-    const job = nextJob(jobs, this.pausedAt)
+    const job = nextJob(jobs, this.pausedAt, this.notBefore, this.now())
     if (!job) {
-      problems?.clear()
+      if (!jobs.some(j => PRIORITY[j.state] !== undefined)) problems?.clear('message_content_needed_for_import')
       return
     }
     if (this.deps.ready && !this.deps.ready()) return
@@ -177,25 +206,40 @@ export class ImportScheduler {
   private async runJob(first: ImportJob, signal: AbortSignal): Promise<void> {
     const { api, importer, slots, problems, log } = this.deps
     let release: (() => void) | null = null
-    let result: ImportResult | null = null
+    let outcome: ImportOutcome | null = null
     try {
       release = await slots.acquire(signal)
       // The wait for a slot can be long; the job may have been cancelled or changed meanwhile.
-      const fresh = (await api.listImports()).find(j => j.id === first.id)
-      if (!fresh || PRIORITY[fresh.state] === undefined || signal.aborted) return
-      result = await importer.run(fresh, signal)
-      log?.info(`History import ${first.id}: ${result}`)
+      const fresh = await api.getImport(first.id, { signal })
+      if (PRIORITY[fresh.state] === undefined || signal.aborted) return
+      problems?.beginChannel?.(fresh.discord_channel_id)
+      const out = await importer.run(fresh, signal)
+      outcome = typeof out === 'string' ? { result: out } : out
+      log?.info(`History import ${first.id}: ${outcome.result}`)
     } catch (err) {
-      if (!signal.aborted) log?.warn(`History import ${first.id} could not run: ${errorText(err)}`)
+      if (signal.aborted) return
+      if (isRefusal(err) && !(err instanceof BridgeApiError && err.code === 'import_not_found')) {
+        this.disarm()
+        return
+      }
+      log?.warn(`History import ${first.id} could not run: ${errorText(err)}`)
     } finally {
       release?.()
     }
-    // Over for good: the problems it raised no longer apply. A paused job resumes and keeps them.
-    if (result === 'done' || result === 'failed' || result === 'cancelled') problems?.clear()
-    if (!result || signal.aborted) return
+    if (!outcome || signal.aborted) return
+    const { result } = outcome
+    if (result === 'disabled') {
+      this.disarm()
+      return
+    }
+    if (result === 'waiting') {
+      // Harmony's own wait: not a pause, so no stall is counted.
+      this.notBefore.set(first.id, this.now() + (outcome.retryAfterMs ?? WAIT_DEFAULT_MS))
+      return
+    }
     // A job still pending after pausing (or after a failed PATCH) waits for the normal poll.
     let again = true
-    if (result === 'paused' || result === 'failed') again = !(await this.afterStop(first.id, result))
+    if (result === 'paused' || result === 'failed') again = !(await this.afterStop(first.id))
     else this.forget(first.id)
     if (again && !this.stopped) setImmediate(() => this.kick())
   }
@@ -203,6 +247,7 @@ export class ImportScheduler {
   private forget(id: string): void {
     this.pausedAt.delete(id)
     this.stalls.delete(id)
+    this.notBefore.delete(id)
   }
 
   /**
@@ -210,15 +255,19 @@ export class ImportScheduler {
    * fails a job that paused STALL_LIMIT times in a row without progress. Returns whether the job
    * is still pending on the server.
    */
-  private async afterStop(id: string, result: ImportResult): Promise<boolean> {
+  private async afterStop(id: string): Promise<boolean> {
     const { api, log } = this.deps
-    let latest: ImportJob | undefined
+    let latest: ImportJob
     try {
-      latest = (await api.listImports()).find(j => j.id === id)
-    } catch {
+      latest = await api.getImport(id)
+    } catch (err) {
+      if (err instanceof BridgeApiError && err.status === 404) {
+        this.forget(id)
+        return false
+      }
       return true
     }
-    if (!latest || PRIORITY[latest.state] === undefined) {
+    if (PRIORITY[latest.state] === undefined) {
       this.forget(id)
       return false
     }
@@ -230,12 +279,14 @@ export class ImportScheduler {
     if (count >= STALL_LIMIT) {
       log?.warn(`History import ${id}: no progress after ${count} pauses, failing it`)
       try {
-        // Harmony only lets a running job fail; a paused one goes back to running first.
-        if (latest.state === 'paused') await api.updateImport(id, { state: 'running' })
+        // Harmony only lets a running job fail; a queued or paused one goes to running first.
+        if (latest.state !== 'running') await api.updateImport(id, { state: 'running' })
         await api.updateImport(id, { state: 'failed', error: 'bridge_stalled' })
         this.forget(id)
         return false
       } catch (err) {
+        // A job Harmony will not let run now (its cap on imports) is waiting, not stalled.
+        if (err instanceof BridgeApiError && err.status === 429) this.stalls.delete(id)
         log?.warn(`History import ${id}: could not PATCH it failed: ${errorText(err)}`)
       }
     }

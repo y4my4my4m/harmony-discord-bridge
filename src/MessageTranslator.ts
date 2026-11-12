@@ -254,6 +254,11 @@ export interface DiscordToHarmonyContext {
   harmonyEmojiFor?: (discordEmojiId: string) => { id: string; name: string; url: string | null } | null
   /** Discord sticker id → the Harmony server sticker synced from it. */
   harmonyStickerFor?: (discordStickerId: string) => { id: string; url: string; name: string; description: string } | null
+  /**
+   * History import: nothing in the result names a Harmony member or role. A plain `@name` stays
+   * text with no member lookup, and @everyone, @here and role pings are written as text.
+   */
+  quiet?: boolean
 }
 
 /** Bridge state the Harmony → Discord translation consults. */
@@ -639,7 +644,7 @@ export class MessageTranslator {
         const id = match[5]
         const pinged = msg.mentions?.roles?.get(id)
         const role = pinged ?? msg.guild?.roles?.cache?.get(id)
-        const harmonyRoleId = pinged ? ctx.harmonyRoleFor?.(id) : undefined
+        const harmonyRoleId = pinged && !ctx.quiet ? ctx.harmonyRoleFor?.(id) : undefined
         if (harmonyRoleId) {
           const color = typeof role?.hexColor === 'string' && role.hexColor !== '#000000' ? role.hexColor : null
           parts.push({ type: 'role_mention', roleId: harmonyRoleId, roleName: role?.name ?? 'role', roleColor: color })
@@ -670,7 +675,7 @@ export class MessageTranslator {
         out.push(part)
         continue
       }
-      if (part.literal) {
+      if (part.literal || ctx.quiet) {
         out.push({ type: 'text', text: part.text })
         continue
       }

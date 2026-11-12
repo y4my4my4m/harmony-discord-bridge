@@ -9,10 +9,12 @@ import {
 } from '../runtime/BridgeRuntime.js'
 import type { NewPair, PairWriter } from '../runtime/PairDirectory.js'
 import type { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
-import { detectProblems, dedupeProblems, problemKey, type DiscordGuildView, type Problem, type ProblemCode } from '../problems.js'
+import { detectProblems, dedupeProblems, type DiscordGuildView, type Problem } from '../problems.js'
+import { ImportProblems } from './importProblems.js'
 import { HistoryImporter } from '../runtime/historyImport.js'
 import { discordImportAccess } from '../runtime/importDiscord.js'
 import { ImportScheduler, type ImportSlots } from '../runtime/importScheduler.js'
+import type { OptOutList } from '../runtime/optOuts.js'
 import type { ImportSettings } from '../env.js'
 import type { Client as DiscordJsClient } from 'discord.js'
 import { Backoff, type FetchLike } from '../http.js'
@@ -34,11 +36,16 @@ export interface RuntimeLike {
   discordClientForImport?(): DiscordJsClient | null
   translateForImport?: BridgeRuntime['translateForImport']
   threadStarterForImport?: BridgeRuntime['threadStarterForImport']
+  forgetStickerLink?: BridgeRuntime['forgetStickerLink']
+  /** Opted-out Discord users; the orchestrator keeps it in step with Harmony. */
+  optOuts?: OptOutList
 }
 
-/** History import wiring; omitted → this bridge never imports. */
+/**
+ * History import wiring. Only a self-run bridge is given it: a hosted bridge and the instance
+ * bot never import, and Harmony refuses them (`history_import.reason: 'bridge_mode'`).
+ */
 export interface V2ImportOptions {
-  /** One per process, shared by every bridge. */
   slots: ImportSlots
   settings: Pick<ImportSettings, 'pollMs' | 'pageDelayMs'>
 }
@@ -138,8 +145,8 @@ export class V2Bridge {
   private readonly authBackoff = new Backoff(60_000, 15 * 60_000)
   private lastConfigErrorLogged = ''
   private scheduler: ImportScheduler | null = null
-  /** Problems raised by the running import; shown in status until its job ends. */
-  private readonly importProblems = new Map<string, Problem>()
+  private readonly importProblems = new ImportProblems(() => this.statusSoon())
+  private optOutLoad: Promise<void> | null = null
 
   constructor(private readonly opts: V2BridgeOptions) {
     this.log = opts.label ? opts.log.child(opts.label) : opts.log
@@ -161,42 +168,49 @@ export class V2Bridge {
     this.runtime = null
     const scheduler = this.scheduler
     this.scheduler = null
+    // The running import unwinds on its abort signal: no page, wait or request is waited out.
     await scheduler?.stop()
-    this.importProblems.clear()
+    this.importProblems.reset()
     await runtime?.stop()
   }
 
-  /** Polls for import jobs now; no-op when imports are not wired. */
+  /** Polls for import jobs now; no-op while import is off for this bridge. */
   kickImports(): void {
     this.scheduler?.kick()
   }
 
-  private startImports(runtime: RuntimeLike) {
+  /** Whether this bridge may import at all: self-run, with its own Discord client. */
+  private importCapable(): boolean {
+    return this.opts.import !== undefined && this.opts.sharedDiscord === undefined
+  }
+
+  private importEnabled(): boolean {
+    return this.importCapable() && this.directory?.config().history_import?.enabled === true
+  }
+
+  /** Builds the importer and its scheduler, unarmed. Nothing is built for a bridge that may not import. */
+  private buildImports(runtime: RuntimeLike) {
     const opts = this.opts.import
     const { discordClientForImport, translateForImport, threadStarterForImport } = runtime
-    if (!opts || !discordClientForImport || !translateForImport || !threadStarterForImport) return
-    const access = discordImportAccess(() => runtime.discordClientForImport!())
-    const raise = (problem: Problem) => {
-      const key = problemKey(problem)
-      if (this.importProblems.has(key)) return
-      this.importProblems.set(key, problem)
-      this.statusSoon()
-    }
-    const clear = (code?: ProblemCode) => {
-      let changed = false
-      for (const [key, p] of this.importProblems) {
-        if (code && p.code !== code) continue
-        this.importProblems.delete(key)
-        changed = true
-      }
-      if (changed) this.statusSoon()
-    }
+    if (!opts || !this.importCapable() || !discordClientForImport || !translateForImport || !threadStarterForImport) return
+    const access = discordImportAccess(
+      () => runtime.discordClientForImport!(),
+      () => this.directory?.config().discord_guild_id ?? null,
+    )
+    const problems = this.importProblems
+    const optOuts = runtime.optOuts
     const importer = new HistoryImporter({
       api: this.api,
       ...access,
-      translate: msg => runtime.translateForImport!(msg),
+      translate: (msg, member, o) => runtime.translateForImport!(msg, member, o),
       threadStarter: thread => runtime.threadStarterForImport!(thread),
-      reportProblem: raise,
+      onStickerRefused: id => runtime.forgetStickerLink?.(id),
+      optOuts: optOuts && {
+        refresh: signal => this.loadOptOuts(signal),
+        has: id => optOuts.has(id),
+        add: id => optOuts.add(id),
+      },
+      reportProblem: problem => problems.raise(problem),
       pageDelayMs: opts.settings.pageDelayMs,
       log: this.log,
     })
@@ -207,10 +221,50 @@ export class V2Bridge {
       pollMs: opts.settings.pollMs,
       intentsOk: () => runtime.discordIdentity().intents.message_content,
       ready: () => runtime.isDiscordConnected(),
-      problems: { raise, clear },
+      problems: {
+        raise: problem => problems.raise(problem),
+        clear: code => problems.clear(code),
+        beginChannel: channelId => problems.beginChannel(channelId),
+      },
       log: this.log,
     })
-    this.scheduler.start()
+  }
+
+  /**
+   * Arms the import scheduler while the configuration enables import and disarms it otherwise.
+   * Runs after the configuration loads or changes and on Harmony's READY, which also re-arms a
+   * scheduler that disarmed itself on a refusal.
+   */
+  private syncImports(): void {
+    const scheduler = this.scheduler
+    if (!scheduler) return
+    if (this.importEnabled()) scheduler.arm()
+    else scheduler.disarm()
+  }
+
+  /**
+   * Reads the server's opt-out list. No-op on a gateway without the privacy routes
+   * (`privacy_version` absent). Rejects when the list cannot be read.
+   */
+  private async loadOptOuts(signal?: AbortSignal): Promise<void> {
+    const list = this.runtime?.optOuts
+    const version = this.directory?.config().privacy_version ?? null
+    if (!list || version === null) return
+    // One attempt: the importer retries at job level, the orchestrator at its next configuration read.
+    const { version: listVersion, remoteUserIds } = await this.api.getOptOuts(signal ? { signal } : {})
+    list.replace(listVersion ?? version, remoteUserIds)
+    this.log.debug(`Opt-out list read: ${remoteUserIds.length} user(s)`)
+  }
+
+  /** Reads the opt-out list when the configuration's `privacy_version` is not the list's. */
+  private refreshOptOuts(): Promise<void> {
+    const list = this.runtime?.optOuts
+    const version = this.directory?.config().privacy_version ?? null
+    if (!list || version === null || list.version() === version) return Promise.resolve()
+    this.optOutLoad ??= this.loadOptOuts()
+      .catch(err => this.log.warn(`Could not read the opt-out list; trying again at the next configuration read: ${errorText(err)}`))
+      .finally(() => { this.optOutLoad = null })
+    return this.optOutLoad
   }
 
   private noteConfigError(err: unknown): 'auth' | 'unreachable' {
@@ -280,7 +334,9 @@ export class V2Bridge {
         harmonyAuthHint: this.opts.authHint,
         discordTokenHint: this.opts.discordTokenHint,
         kickImports: () => this.kickImports(),
-        importApi: this.opts.import ? this.api : undefined,
+        importApi: this.importCapable() ? this.api : undefined,
+        importEnabled: () => this.importEnabled(),
+        privacyApi: this.api,
       },
     }
     const runtime = (this.opts.createRuntime ?? ((o) => new BridgeRuntime(o)))(runtimeOptions)
@@ -290,6 +346,11 @@ export class V2Bridge {
       if (data?.bridge_id && data.bridge_id !== directory.config().bridge_id) return
       this.refreshConfigSoon()
     })
+    runtime.harmony.on('ready', () => {
+      if (this.stopped) return
+      this.syncImports()
+      void this.refreshOptOuts()
+    })
 
     this.log.info(
       `Bridge ${config.bridge_id || '?'}: ${config.pairs.length} pair(s), guild ${config.discord_guild_id ?? '(not chosen)'}`,
@@ -298,12 +359,18 @@ export class V2Bridge {
     this.configTimer = setInterval(() => { void this.refreshConfig('interval') }, this.opts.configRefreshMs ?? 60_000)
     this.heartbeatTimer = setInterval(() => { void this.sendStatus() }, this.opts.heartbeatMs ?? 30_000)
 
+    // Before the runtime relays anything, so an opted-out author's first message is not sent.
+    // A list that cannot be read does not hold the bridge back: Harmony refuses such a message.
+    await this.refreshOptOuts()
     try {
       await runtime.start()
     } catch (err) {
       this.log.error(`Bridge runtime failed to start: ${errorText(err)}`)
     }
-    if (!this.stopped) this.startImports(runtime)
+    if (!this.stopped) {
+      this.buildImports(runtime)
+      this.syncImports()
+    }
     this.statusSoon()
   }
 
@@ -352,6 +419,8 @@ export class V2Bridge {
     } catch (err) {
       this.log.error(`Applying configuration failed: ${errorText(err)}`)
     }
+    this.syncImports()
+    void this.refreshOptOuts()
     this.statusSoon()
   }
 
@@ -389,7 +458,7 @@ export class V2Bridge {
         harmony_channels: config.harmony_channels.map(c => ({ id: String(c.id), encrypted: c.encrypted === true })),
       },
     })
-    return dedupeProblems([...detected, ...this.importProblems.values()])
+    return dedupeProblems([...detected, ...this.importProblems.current()])
   }
 
   async sendStatus(): Promise<void> {

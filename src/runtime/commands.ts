@@ -177,7 +177,7 @@ export function buildCommands(mode: 'v1' | 'v2', features: CommandFeatures = NO_
         .setDescription('Import old Discord messages into Harmony (start, check or cancel)')
         .addStringOption(opt =>
           opt.setName('action')
-            .setDescription('What to do (default: start)')
+            .setDescription('What to do (default: start, which asks before it begins)')
             .setRequired(false)
             .addChoices(
               { name: 'Start', value: 'start' },
@@ -979,7 +979,11 @@ const ACTIVE_IMPORT_STATES = new Set(['queued', 'running', 'paused'])
 function importErrorText(code: string): string {
   switch (code) {
     case 'pair_removed': return 'pair removed'
+    case 'pair_not_importable': return "the pair no longer brings Discord messages to Harmony"
     case 'channel_encrypted': return 'channel is now encrypted'
+    case 'import_disabled': return 'history import was turned off'
+    case 'discord_approval_required': return 'the Discord channel is hidden from @everyone: run `/bridge import-history` in it on Discord'
+    case 'discord_channel_unsupported': return 'this kind of Discord channel cannot be imported'
     case 'discord_access_lost': return 'the bot lost access to the Discord channel'
     case 'bridge_stalled': return 'the import stopped making progress'
   }
@@ -987,15 +991,28 @@ function importErrorText(code: string): string {
   return refused ? `Harmony refused the import (${refused[1]})` : code
 }
 
+/** Why the import routes refuse this bridge, for the person who ran the command. */
+function importDisabledText(err: BridgeApiError): string {
+  return err.details.reason === 'bridge_mode'
+    ? '❌ Only a bridge you run yourself can import history; a hosted bridge and the instance bot cannot.'
+    : '❌ History import is turned off on this Harmony instance. An instance admin can turn it on.'
+}
+
+function memberCanView(channel: unknown, member: unknown): boolean {
+  const permissions = (channel as { permissionsFor?: (m: unknown) => { has(flag: bigint): boolean } | null } | null)?.permissionsFor?.(member)
+  return permissions?.has(PermissionFlagsBits.ViewChannel) === true
+}
+
 /**
  * `/bridge import-history`: start, check or cancel the import of old Discord messages into
  * Harmony. The work runs in the import scheduler; this only talks to the import routes.
- * A thread counts as its parent channel.
+ * A thread counts as its parent channel. Starting asks Confirm first, covers only channels the
+ * invoker can view, and names the invoker to Harmony.
  */
 async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
   const api = rt.hooks.importApi
-  if (!api) {
-    await command.reply({ content: '❌ Importing history needs the current bridge setup (set up from Harmony → Server Settings → Discord Bridge).', flags: MessageFlags.Ephemeral })
+  if (!api || rt.hooks.importEnabled?.() !== true) {
+    await command.reply({ content: '❌ History import is not available for this bridge. It needs a bridge you run yourself, Harmony 1.9.7 or later, and the instance setting turned on.', flags: MessageFlags.Ephemeral })
     return
   }
   const action = command.options.getString('action', false) ?? 'start'
@@ -1010,29 +1027,107 @@ async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputComma
 
   // The import routes can take longer than Discord's 3 s to answer.
   await command.deferReply({ flags: MessageFlags.Ephemeral })
-  const say = (content: string) => command.editReply({ content })
+  const say = (content: string) => command.editReply({ content, components: [] })
 
-  if (action === 'start') {
-    try {
-      const jobs = await api.startImports(all ? undefined : [pairId])
-      rt.hooks.kickImports?.()
-      await say(jobs.length === 0
-        ? 'Nothing to import: no channel here brings Discord messages to Harmony.'
-        : `✅ Importing history for ${jobs.length} channel(s). Progress shows in Harmony under Server settings → Discord Bridge, or run \`/bridge import-history action:status\`.`)
-    } catch (err) {
-      if (err instanceof BridgeApiError && err.code === 'pair_not_importable') {
-        await say("❌ This channel's pair doesn't bring Discord messages to Harmony.")
-        return
-      }
-      throw err
+  try {
+    if (action === 'start') await startImportHistory(rt, command, api, all, pairId, say)
+    else await showOrCancelImports(rt, command, api, action, all, pairId, say)
+  } catch (err) {
+    if (err instanceof BridgeApiError && err.code === 'import_disabled') {
+      await say(importDisabledText(err))
+      return
     }
+    throw err
+  }
+}
+
+async function startImportHistory(
+  rt: BridgeRuntime,
+  command: ChatInputCommandInteraction,
+  api: NonNullable<BridgeRuntime['hooks']['importApi']>,
+  all: boolean,
+  pairId: string,
+  say: (content: string) => Promise<unknown>,
+) {
+  const guild = command.guild!
+  // Pairs that bring Discord messages to Harmony, in this command's scope.
+  const candidates = (all ? rt.dir.getAllMappings(guild.id).map(m => m.discord) : [pairId])
+    .filter(id => rt.dir.shouldBridgeFromDiscord(id))
+  if (candidates.length === 0) {
+    await say(all
+      ? 'Nothing to import: no channel here brings Discord messages to Harmony.'
+      : "❌ This channel's pair doesn't bring Discord messages to Harmony.")
     return
   }
 
+  // Only channels the invoker can view: starting an import is their approval to copy the channel.
+  const viewable: string[] = []
+  const hidden: string[] = []
+  for (const id of candidates) {
+    const channel = guild.channels.cache.get(id) ?? await guild.channels.fetch(id).catch(() => null)
+    if (memberCanView(channel, command.member)) viewable.push(id)
+    else hidden.push(id)
+  }
+  const hiddenLine = hidden.length > 0
+    ? `Left out, you cannot view ${hidden.length === 1 ? 'it' : 'them'}: ${hidden.map(id => `<#${id}>`).join(', ')}`
+    : null
+  if (viewable.length === 0) {
+    await say(`❌ Nothing to import: you cannot view ${all ? 'any bridged channel' : 'this channel'}.${hiddenLine ? `\n${hiddenLine}` : ''}`)
+    return
+  }
+
+  const n = viewable.length
+  const prompt = joinLinesWithinDiscordLimit([
+    `⚠️ Import the history of ${n} channel${n === 1 ? '' : 's'} into Harmony? ${viewable.slice(0, 20).map(id => `<#${id}>`).join(', ')}${n > 20 ? `, and ${n - 20} more` : ''}`,
+    '• Every message and file in them is copied to Harmony, with its author and date.',
+    '• Messages of people who left this server, of bots, and of members who opted out with `/bridge-privacy` are skipped.',
+    '• There is no undo button: what is imported stays on Harmony until it is removed there.',
+    '• A pinned notice in each channel tells its members.',
+    ...(hiddenLine ? [hiddenLine] : []),
+  ])
+  if (!(await confirmAction(command, prompt, undefined, rt.log))) return
+
+  const requestedBy = { id: command.user.id, username: command.user.username }
+  let ids = viewable
+  const notImportable: string[] = []
+  let jobs: ImportJob[] = []
+  while (ids.length > 0) {
+    try {
+      jobs = await api.startImports(ids, requestedBy)
+      break
+    } catch (err) {
+      // Harmony names one pair it will not import (encrypted, or changed since): the rest still start.
+      const bad = err instanceof BridgeApiError && err.code === 'pair_not_importable' ? err.details.discord_channel_id : null
+      if (typeof bad !== 'string' || !ids.includes(bad)) throw err
+      notImportable.push(bad)
+      ids = ids.filter(id => id !== bad)
+    }
+  }
+  rt.log.info(`/bridge import-history start by ${command.user.id} in guild ${guild.id}: ${jobs.length} job(s) for ${ids.length} channel(s)${hidden.length > 0 ? `, ${hidden.length} hidden from the invoker` : ''}`)
+  rt.hooks.kickImports?.()
+
+  const lines = [jobs.length === 0
+    ? 'Nothing to import: Harmony queued no channel.'
+    : `✅ Importing history for ${jobs.length} channel(s). Progress shows in Harmony under Server settings → Discord Bridge, or run \`/bridge import-history action:status\`.`]
+  if (notImportable.length > 0) lines.push(`Not importable (encrypted on Harmony, or no longer paired this way): ${notImportable.map(id => `<#${id}>`).join(', ')}`)
+  if (hiddenLine) lines.push(hiddenLine)
+  await say(joinLinesWithinDiscordLimit(lines))
+}
+
+async function showOrCancelImports(
+  rt: BridgeRuntime,
+  command: ChatInputCommandInteraction,
+  api: NonNullable<BridgeRuntime['hooks']['importApi']>,
+  action: string,
+  all: boolean,
+  pairId: string,
+  say: (content: string) => Promise<unknown>,
+) {
   const inScope = (await api.listImports()).filter(j => all || j.discord_channel_id === pairId)
   if (action === 'cancel') {
     const active = inScope.filter(j => ACTIVE_IMPORT_STATES.has(j.state))
     for (const j of active) await api.cancelImport(j.id)
+    if (active.length > 0) rt.log.info(`/bridge import-history cancel by ${command.user.id} in guild ${command.guildId}: ${active.length} job(s)`)
     await say(active.length > 0 ? 'Cancelling…' : 'No import is running or queued here.')
     return
   }
@@ -1055,9 +1150,10 @@ async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputComma
     const count = j.state !== 'done' ? `${j.imported_count} messages`
       : j.imported_count > 0 ? `${j.imported_count} new messages` : 'up to date'
     const parts = [cancelling ? 'cancelling' : j.state, pct === null ? '-' : `${pct}%`, count]
+    if (j.authors_skipped) parts.push(`${j.authors_skipped} skipped (author left or opted out)`)
     lines.push(`• ${harmonyChannelName(rt, j.harmony_channel_id)}: ${parts.join(', ')}${j.error ? ` (${importErrorText(j.error)})` : ''}`)
   }
-  await command.editReply({ content: joinLinesWithinDiscordLimit(lines) })
+  await say(joinLinesWithinDiscordLimit(lines))
 }
 
 /** Discord emoji imported per call; Harmony stores each image, so a run is bounded. */

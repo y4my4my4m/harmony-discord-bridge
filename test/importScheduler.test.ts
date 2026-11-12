@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ImportScheduler, ImportSlots } from '../src/runtime/importScheduler.js'
-import type { ImportJob } from '../src/v2/BridgeApi.js'
-import type { ImportResult } from '../src/runtime/historyImport.js'
+import { BridgeApiError, type ImportJob } from '../src/v2/BridgeApi.js'
+import type { ImportOutcome, ImportResult } from '../src/runtime/historyImport.js'
 import type { Problem } from '../src/problems.js'
 import { Logger } from '../src/log.js'
 
@@ -21,12 +21,25 @@ function job(id: string, over: Partial<ImportJob> = {}): ImportJob {
 
 const log = new Logger('error')
 
+/** The import routes a scheduler uses, over a job list. A job missing from the list is a 404. */
+function apiOf(jobs: () => ImportJob[], updateImport: (id: string, patch: Partial<ImportJob>) => Promise<ImportJob> = async () => job('x')) {
+  return {
+    listImports: vi.fn(async () => jobs()),
+    getImport: vi.fn(async (id: string) => {
+      const found = jobs().find(j => j.id === id)
+      if (!found) throw new BridgeApiError('GET /bridge/v2/imports/:id failed (404 import_not_found)', 404, 'import_not_found')
+      return found
+    }),
+    updateImport: vi.fn(updateImport),
+  }
+}
+
 /** A run() that blocks until released, and records its signal. */
 function gatedImporter() {
-  const calls: { job: ImportJob; signal: AbortSignal; release: (r?: ImportResult) => void }[] = []
+  const calls: { job: ImportJob; signal: AbortSignal; release: (r?: ImportResult | ImportOutcome) => void }[] = []
   const importer = {
-    run: vi.fn((j: ImportJob, signal: AbortSignal) => new Promise<ImportResult>(resolve => {
-      const call = { job: j, signal, release: (r: ImportResult = 'done') => resolve(r) }
+    run: vi.fn((j: ImportJob, signal: AbortSignal) => new Promise<ImportResult | ImportOutcome>(resolve => {
+      const call = { job: j, signal, release: (r: ImportResult | ImportOutcome = 'done') => resolve(r) }
       signal.addEventListener('abort', () => resolve('paused'))
       calls.push(call)
     })),
@@ -37,8 +50,9 @@ function gatedImporter() {
 function make(jobs: () => ImportJob[], over: Partial<ConstructorParameters<typeof ImportScheduler>[0]> = {}) {
   const gate = gatedImporter()
   const slots = new ImportSlots(1)
+  const api = apiOf(jobs)
   const scheduler = new ImportScheduler({
-    api: { listImports: vi.fn(async () => jobs()), updateImport: vi.fn(async () => job('x')) },
+    api,
     importer: gate.importer,
     slots,
     pollMs: 3_600_000,
@@ -46,7 +60,7 @@ function make(jobs: () => ImportJob[], over: Partial<ConstructorParameters<typeo
     log,
     ...over,
   })
-  return { scheduler, slots, ...gate }
+  return { scheduler, slots, api, ...gate }
 }
 
 describe('ImportScheduler', () => {
@@ -59,7 +73,7 @@ describe('ImportScheduler', () => {
     ]
     const order: string[] = []
     const a = make(() => jobs)
-    a.scheduler.start()
+    a.scheduler.arm()
     await vi.waitFor(() => expect(a.calls).toHaveLength(1))
     order.push(a.calls[0].job.id)
     jobs.splice(jobs.findIndex(j => j.id === 'r'), 1)
@@ -77,7 +91,7 @@ describe('ImportScheduler', () => {
   it('never runs two jobs at once for one bridge', async () => {
     const jobs = [job('a'), job('b', { created_at: '2026-01-02T00:00:00Z' })]
     const { scheduler, importer, calls } = make(() => jobs)
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     scheduler.kick(); scheduler.kick()
     await new Promise(r => setTimeout(r, 20))
@@ -89,11 +103,11 @@ describe('ImportScheduler', () => {
     const slots = new ImportSlots(1)
     const g1 = gatedImporter(); const g2 = gatedImporter()
     const mk = (id: string, g: ReturnType<typeof gatedImporter>) => new ImportScheduler({
-      api: { listImports: vi.fn(async () => [job(id)]), updateImport: vi.fn(async () => job('x')) }, importer: g.importer, slots,
+      api: apiOf(() => [job(id)]), importer: g.importer, slots,
       pollMs: 3_600_000, intentsOk: () => true, log,
     })
     const s1 = mk('one', g1); const s2 = mk('two', g2)
-    s1.start(); s2.start()
+    s1.arm(); s2.arm()
     await vi.waitFor(() => expect(g1.calls.length + g2.calls.length).toBe(1))
     await new Promise(r => setTimeout(r, 20))
     expect(g1.calls.length + g2.calls.length).toBe(1)
@@ -106,7 +120,7 @@ describe('ImportScheduler', () => {
 
   it('aborts the running job on stop() and waits for it', async () => {
     const { scheduler, calls } = make(() => [job('a')])
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     expect(calls[0].signal.aborted).toBe(false)
     await scheduler.stop()
@@ -118,10 +132,10 @@ describe('ImportScheduler', () => {
     const hold = await slots.acquire()
     const g = gatedImporter()
     const scheduler = new ImportScheduler({
-      api: { listImports: vi.fn(async () => [job('a')]), updateImport: vi.fn(async () => job('x')) }, importer: g.importer, slots,
+      api: apiOf(() => [job('a')]), importer: g.importer, slots,
       pollMs: 3_600_000, intentsOk: () => true, log,
     })
-    scheduler.start()
+    scheduler.arm()
     await new Promise(r => setTimeout(r, 20))
     await scheduler.stop()
     expect(g.importer.run).not.toHaveBeenCalled()
@@ -132,12 +146,12 @@ describe('ImportScheduler', () => {
   it('does not run when the intent is off and raises the problem; clears it afterwards', async () => {
     let intent = false
     const raised: Problem[] = []
-    const cleared: (string | undefined)[] = []
+    const cleared: string[] = []
     const { scheduler, importer, calls } = make(() => [job('a')], {
       intentsOk: () => intent,
       problems: { raise: p => raised.push(p), clear: code => cleared.push(code) },
     })
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(raised.map(p => p.code)).toContain('message_content_needed_for_import'))
     expect(importer.run).not.toHaveBeenCalled()
     intent = true
@@ -147,38 +161,35 @@ describe('ImportScheduler', () => {
     await scheduler.stop()
   })
 
-  it('clears import problems when a job ends and when nothing is queued', async () => {
+  it('clears the intent problem once nothing is pending, and nothing else', async () => {
     let jobs: ImportJob[] = [job('a')]
-    const cleared: (string | undefined)[] = []
+    const cleared: string[] = []
     const { scheduler, calls } = make(() => jobs, { problems: { raise: () => {}, clear: code => cleared.push(code) } })
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     cleared.length = 0
     jobs = []
     calls[0].release('done')
-    await vi.waitFor(() => expect(cleared).toContain(undefined))
-    cleared.length = 0
-    scheduler.kick()
-    await vi.waitFor(() => expect(cleared).toContain(undefined))
+    await vi.waitFor(() => expect(cleared).toContain('message_content_needed_for_import'))
+    expect(new Set(cleared)).toEqual(new Set(['message_content_needed_for_import']))
     await scheduler.stop()
   })
 
-  it('keeps import problems when the job only paused (it will resume)', async () => {
-    const cleared: (string | undefined)[] = []
-    const { scheduler, calls } = make(() => [job('a', { state: 'paused' })], { problems: { raise: () => {}, clear: code => cleared.push(code) } })
-    scheduler.start()
+  it('drops the notices of a channel when a new import of it starts', async () => {
+    const begun: string[] = []
+    const { scheduler, calls } = make(() => [job('a', { discord_channel_id: '4242' })], {
+      problems: { raise: () => {}, clear: () => {}, beginChannel: id => begun.push(id) },
+    })
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
-    cleared.length = 0
-    calls[0].release('paused')
-    await new Promise(r => setTimeout(r, 20))
-    expect(cleared).not.toContain(undefined)
+    expect(begun).toEqual(['4242'])
     await scheduler.stop()
   })
 
   it('moves on to the next queued job after a failed result', async () => {
     const jobs = [job('bad'), job('good', { created_at: '2026-01-02T00:00:00Z' })]
     const { scheduler, calls } = make(() => jobs)
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     expect(calls[0].job.id).toBe('bad')
     jobs.shift() // the server now reports it failed
@@ -198,8 +209,8 @@ describe('ImportScheduler', () => {
       jobs[0] = { ...jobs[0], state: patch.state! }
       return jobs[0]
     })
-    const { scheduler, calls } = make(() => jobs, { api: { listImports: vi.fn(async () => jobs), updateImport } })
-    scheduler.start()
+    const { scheduler, calls } = make(() => jobs, { api: apiOf(() => jobs, updateImport) })
+    scheduler.arm()
     for (let n = 1; n <= 3; n++) {
       await vi.waitFor(() => expect(calls).toHaveLength(n))
       expect(updateImport).not.toHaveBeenCalled()
@@ -214,8 +225,8 @@ describe('ImportScheduler', () => {
   it('resets the stall count when progress was made between pauses', async () => {
     const jobs = [job('a', { state: 'paused', reached_discord_message_id: '9' })]
     const updateImport = vi.fn(async () => job('a'))
-    const { scheduler, calls } = make(() => jobs, { api: { listImports: vi.fn(async () => jobs), updateImport } })
-    scheduler.start()
+    const { scheduler, calls } = make(() => jobs, { api: apiOf(() => jobs, updateImport) })
+    scheduler.arm()
     for (let n = 1; n <= 5; n++) {
       await vi.waitFor(() => expect(calls).toHaveLength(n))
       jobs[0] = job('a', { state: 'paused', reached_discord_message_id: String(9 - Math.floor(n / 2)) })
@@ -231,7 +242,7 @@ describe('ImportScheduler', () => {
   it('lets a queued job run after another job just paused', async () => {
     const jobs = [job('stuck', { state: 'paused' }), job('fresh', { created_at: '2026-01-02T00:00:00Z' })]
     const { scheduler, calls } = make(() => jobs)
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     expect(calls[0].job.id).toBe('stuck')
     calls[0].release('paused')
@@ -245,7 +256,7 @@ describe('ImportScheduler', () => {
   it('does not re-pick immediately a failed job that is still pending (its PATCH failed)', async () => {
     const jobs = [job('a', { state: 'running' })]
     const { scheduler, calls } = make(() => jobs)
-    scheduler.start()
+    scheduler.arm()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     calls[0].release('failed')
     await new Promise(r => setTimeout(r, 30))
@@ -259,10 +270,10 @@ describe('ImportScheduler', () => {
     let jobs = [job('a')]
     const g = gatedImporter()
     const scheduler = new ImportScheduler({
-      api: { listImports: vi.fn(async () => jobs), updateImport: vi.fn(async () => job('x')) }, importer: g.importer, slots,
+      api: apiOf(() => jobs), importer: g.importer, slots,
       pollMs: 3_600_000, intentsOk: () => true, log,
     })
-    scheduler.start()
+    scheduler.arm()
     await new Promise(r => setTimeout(r, 20))
     jobs = [job('a', { state: 'cancelled' })]
     hold()
@@ -274,11 +285,171 @@ describe('ImportScheduler', () => {
   it('survives a failing listImports and polls again', async () => {
     let fail = true
     const { scheduler, calls } = make(() => { if (fail) throw new Error('down'); return [job('a')] })
-    scheduler.start()
+    scheduler.arm()
     await new Promise(r => setTimeout(r, 20))
     fail = false
     scheduler.kick()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
+    await scheduler.stop()
+  })
+})
+
+describe('ImportScheduler arming', () => {
+  const refusal = (status: number, code: string) => new BridgeApiError(`GET /bridge/v2/imports failed (${status} ${code})`, status, code)
+
+  it('sends nothing until it is armed', async () => {
+    const { scheduler, api } = make(() => [job('a')])
+    scheduler.kick()
+    await new Promise(r => setTimeout(r, 20))
+    expect(scheduler.isArmed()).toBe(false)
+    expect(api.listImports).not.toHaveBeenCalled()
+    await scheduler.stop()
+  })
+
+  it.each([[403, 'import_disabled'], [404, 'not_found']])('stops polling when the import routes answer %i, and polls again once re-armed', async (status, code) => {
+    let refuse = true
+    const { scheduler, api, calls } = make(() => { if (refuse) throw refusal(status, code); return [job('a')] })
+    scheduler.arm()
+    await vi.waitFor(() => expect(api.listImports).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(scheduler.isArmed()).toBe(false))
+    scheduler.kick(); scheduler.kick()
+    await new Promise(r => setTimeout(r, 20))
+    expect(api.listImports).toHaveBeenCalledTimes(1)
+
+    refuse = false
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    expect(scheduler.isArmed()).toBe(true)
+    await scheduler.stop()
+  })
+
+  it('keeps polling through an outage', async () => {
+    const { scheduler, api } = make(() => { throw new BridgeApiError('GET /bridge/v2/imports failed (503)', 503) })
+    scheduler.arm()
+    await vi.waitFor(() => expect(api.listImports).toHaveBeenCalledTimes(1))
+    await new Promise(r => setTimeout(r, 5))
+    expect(scheduler.isArmed()).toBe(true)
+    scheduler.kick()
+    await vi.waitFor(() => expect(api.listImports).toHaveBeenCalledTimes(2))
+    await scheduler.stop()
+  })
+
+  it('disarm() aborts the running job and arm() picks it up again', async () => {
+    const { scheduler, calls } = make(() => [job('a', { state: 'running' })])
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    scheduler.disarm()
+    expect(calls[0].signal.aborted).toBe(true)
+    await new Promise(r => setTimeout(r, 10))
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(2))
+    await scheduler.stop()
+  })
+
+  it('disarms when a run ends because import was turned off', async () => {
+    const { scheduler, calls, api } = make(() => [job('a')])
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    const polls = api.listImports.mock.calls.length
+    calls[0].release('disabled')
+    await vi.waitFor(() => expect(scheduler.isArmed()).toBe(false))
+    await new Promise(r => setTimeout(r, 20))
+    expect(api.listImports).toHaveBeenCalledTimes(polls)
+    expect(api.updateImport).not.toHaveBeenCalled()
+    await scheduler.stop()
+  })
+
+  it('reads the one job it is about to run, not the whole list', async () => {
+    const { scheduler, calls, api } = make(() => [job('a')])
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    expect(api.listImports).toHaveBeenCalledTimes(1)
+    expect(api.getImport).toHaveBeenCalledWith('a', expect.anything())
+    await scheduler.stop()
+  })
+})
+
+describe('ImportScheduler waits Harmony asks for', () => {
+  it('leaves a waiting job alone for its Retry-After, counts no stall and PATCHes nothing', async () => {
+    let now = 1_000_000
+    const jobs = [job('busy')]
+    const { scheduler, calls, api } = make(() => jobs, { now: () => now })
+    scheduler.arm()
+    for (let n = 1; n <= 4; n++) {
+      await vi.waitFor(() => expect(calls).toHaveLength(n))
+      calls[n - 1].release({ result: 'waiting', retryAfterMs: 90_000 })
+      await new Promise(r => setTimeout(r, 10))
+      now += 60_000
+      scheduler.kick()
+      await new Promise(r => setTimeout(r, 10))
+      expect(calls).toHaveLength(n)
+      now += 30_000
+      scheduler.kick()
+    }
+    await vi.waitFor(() => expect(calls).toHaveLength(5))
+    expect(api.updateImport).not.toHaveBeenCalled()
+    await scheduler.stop()
+  })
+
+  it('runs another job while one waits', async () => {
+    const now = 1_000_000
+    const jobs = [job('busy'), job('other', { created_at: '2026-01-02T00:00:00Z' })]
+    const { scheduler, calls } = make(() => jobs, { now: () => now })
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    expect(calls[0].job.id).toBe('busy')
+    calls[0].release({ result: 'waiting', retryAfterMs: 60_000 })
+    await new Promise(r => setTimeout(r, 10))
+    scheduler.kick()
+    await vi.waitFor(() => expect(calls).toHaveLength(2))
+    expect(calls[1].job.id).toBe('other')
+    await scheduler.stop()
+  })
+})
+
+describe('ImportScheduler stalled jobs', () => {
+  /** Harmony's transitions: queued or paused go to running; only running fails. */
+  function server(jobs: ImportJob[], busy = false) {
+    return vi.fn(async (_id: string, patch: Partial<ImportJob>) => {
+      const from = jobs[0].state
+      if (patch.state === 'running' && busy) throw new BridgeApiError('PATCH failed (429 import_busy)', 429, 'import_busy', {}, 60_000)
+      const ok = ((from === 'paused' || from === 'queued') && patch.state === 'running') || (from === 'running' && patch.state === 'failed')
+      if (!ok) throw new BridgeApiError('PATCH /bridge/v2/imports/:id failed (409 invalid_transition)', 409, 'invalid_transition')
+      jobs[0] = { ...jobs[0], state: patch.state! }
+      return jobs[0]
+    })
+  }
+
+  it('fails a stalled job that is still queued by way of running', async () => {
+    const jobs = [job('a', { state: 'queued' })]
+    const updateImport = server(jobs)
+    const { scheduler, calls } = make(() => jobs, { api: apiOf(() => jobs, updateImport) })
+    scheduler.arm()
+    for (let n = 1; n <= 3; n++) {
+      await vi.waitFor(() => expect(calls).toHaveLength(n))
+      calls[n - 1].release('paused')
+      await new Promise(r => setTimeout(r, 5))
+      if (n < 3) scheduler.kick()
+    }
+    await vi.waitFor(() => expect(jobs[0].state).toBe('failed'))
+    expect(updateImport.mock.calls).toEqual([['a', { state: 'running' }], ['a', { state: 'failed', error: 'bridge_stalled' }]])
+    await scheduler.stop()
+  })
+
+  it('does not fail a job Harmony will not let run now', async () => {
+    const jobs = [job('a', { state: 'queued' })]
+    const updateImport = server(jobs, true)
+    const { scheduler, calls } = make(() => jobs, { api: apiOf(() => jobs, updateImport) })
+    scheduler.arm()
+    for (let n = 1; n <= 3; n++) {
+      await vi.waitFor(() => expect(calls).toHaveLength(n))
+      calls[n - 1].release('paused')
+      await new Promise(r => setTimeout(r, 5))
+      if (n < 3) scheduler.kick()
+    }
+    await vi.waitFor(() => expect(updateImport).toHaveBeenCalledTimes(1))
+    expect(updateImport.mock.calls).toEqual([['a', { state: 'running' }]])
+    expect(jobs[0].state).toBe('queued')
     await scheduler.stop()
   })
 })

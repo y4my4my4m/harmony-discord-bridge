@@ -55,9 +55,9 @@ async function untilReachable<T>(
   }
 }
 
-/** History import wiring for one process: a slot pool sized by BRIDGE_IMPORT_CONCURRENCY. */
+/** History import wiring of a self-run bridge. One bridge runs one job at a time. */
 function importOptions(settings: ImportSettings = DEFAULT_IMPORT_SETTINGS): V2ImportOptions {
-  return { slots: new ImportSlots(settings.concurrency), settings }
+  return { slots: new ImportSlots(1), settings }
 }
 
 function ensureDataDir(dataDir: string) {
@@ -168,6 +168,7 @@ const safeDirName = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_')
 /**
  * Host mode: every own-token hosted bridge (one Discord client each) and
  * every instance bot bridge (one shared Discord client), reconciled every 60 s.
+ * Neither kind imports history; no importer or scheduler is built for them.
  */
 export async function runHost(opts: {
   harmonyUrl: string
@@ -176,14 +177,11 @@ export async function runHost(opts: {
   dataDir: string
   log: Logger
   version: string
-  import?: ImportSettings
   fetchImpl?: FetchLike
 }): Promise<Launched> {
   const { log } = opts
   let stopped = false
   ensureDataDir(opts.dataDir)
-  // One slot pool for every bridge of this process, own-token and instance alike.
-  const importing = importOptions(opts.import)
 
   const endpoints = await untilReachable(
     log,
@@ -220,7 +218,6 @@ export async function runHost(opts: {
       log,
       version: opts.version,
       authHint: HOSTED_AUTH_HINT,
-      import: importing,
       fetchImpl: opts.fetchImpl,
     }),
   })
@@ -241,7 +238,6 @@ export async function runHost(opts: {
       log,
       version: opts.version,
       authHint: HOSTED_AUTH_HINT,
-      import: importing,
       discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
       fetchImpl: opts.fetchImpl,
     }),

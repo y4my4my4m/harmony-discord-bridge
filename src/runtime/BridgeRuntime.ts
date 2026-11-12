@@ -24,7 +24,7 @@ import {
   type PartialMessage,
   type AnyThreadChannel,
 } from 'discord.js'
-import { CAPABILITY, HarmonyClient, HarmonyHttpError, isAutomodBlocked } from '../HarmonyClient.js'
+import { CAPABILITY, HarmonyClient, HarmonyHttpError, isAuthorOptedOut, isAutomodBlocked, isDiscordMessageTaken } from '../HarmonyClient.js'
 import {
   MessageTranslator,
   collectHarmonyCustomEmoji,
@@ -1584,6 +1584,17 @@ export class BridgeRuntime {
   }
 
   /** Anti-spam drop of a Discord message: counted, logged without content. */
+  /**
+   * True for Harmony's refusal of an opted-out author (403 BRIDGE_AUTHOR_OPTED_OUT). The author
+   * joins the list at once, so nothing more of theirs is sent before the list is read again.
+   */
+  noteOptedOut(error: unknown, discordUserId: string): boolean {
+    if (!isAuthorOptedOut(error)) return false
+    this.optOuts.add(discordUserId)
+    this.log.debug(`Discord user ${discordUserId} is opted out of the bridge; nothing sent`)
+    return true
+  }
+
   noteSpamDrop(reason: 'rate' | 'duplicate', channelId: string) {
     const { rate, duplicate } = this.antiSpam.dropped
     const total = rate + duplicate
@@ -1957,6 +1968,8 @@ export class BridgeRuntime {
     if (isPrivateThread(thread)) return
     // The bridge's own threads mirror Harmony threads; ThreadSync pairs them as it creates them.
     if (thread.ownerId && thread.ownerId === this.discord?.user?.id) return
+    // An opted-out member's thread reaches Harmony with the first message of someone else in it.
+    if (thread.ownerId && this.optOuts.has(thread.ownerId)) return
     const harmonyChannelId = this.dir.getHarmonyChannel(thread.parentId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(thread.parentId)) return
     try {
@@ -2036,6 +2049,8 @@ export class BridgeRuntime {
     const harmonyChannelId = this.dir.getHarmonyChannel(pairId)
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(pairId)) return
+    // Nothing of an opted-out author is sent to Harmony.
+    if (this.optOuts.has(msg.author.id)) return
 
     // Without the Message Content intent Discord delivers empty messages.
     const hasBody = !!msg.content || msg.attachments.size > 0 || (msg.stickers?.size ?? 0) > 0 || (msg.messageSnapshots?.size ?? 0) > 0
@@ -2099,6 +2114,11 @@ export class BridgeRuntime {
         this.noteAutomodBlock(msg.channelId)
         return
       }
+      if (this.noteOptedOut(error, msg.author.id)) return
+      if (isDiscordMessageTaken(error)) {
+        this.log.debug(`Discord message ${msg.id} is already on Harmony, stored by another bot; not relayed`)
+        return
+      }
       if (!this.noteDrop('Discord → Harmony', error)) {
         this.log.error(`Failed to bridge Discord → Harmony (${msg.id}): ${errorText(error)}`)
       }
@@ -2140,6 +2160,8 @@ export class BridgeRuntime {
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
     if (!this.settings().syncReactions) return
+    // A reaction carries its user's name and avatar. Removals stay bridged: they take data away.
+    if (this.optOuts.has(user.id)) return
 
     try {
       const harmonyMessageId = this.discordToHarmonyMessages.get(reaction.message.id)
@@ -2221,6 +2243,7 @@ export class BridgeRuntime {
     const updatePairId = this.discordPairId(newMsg.channelId, newMsg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(updatePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(updatePairId)) return
+    if (this.optOuts.has(newMsg.author.id)) return
 
     try {
       const harmonyMessageId = this.discordToHarmonyMessages.get(newMsg.id)
@@ -2240,6 +2263,7 @@ export class BridgeRuntime {
         this.noteAutomodBlock(newMsg.channelId)
         return
       }
+      if (this.noteOptedOut(error, newMsg.author.id)) return
       if (!this.noteDrop('Discord → Harmony edit', error)) {
         this.log.error(`Failed to bridge edit Discord → Harmony (${newMsg.id}): ${errorText(error)}`)
       }

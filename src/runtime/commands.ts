@@ -23,14 +23,14 @@ import {
 import { describeProblem } from '../problems.js'
 import { DiscordAuthorLimiter } from './antiSpam.js'
 import { memberJoinedAt } from '../utils/discordUserMetadata.js'
-import { isAutomodBlocked, HarmonyHttpError } from '../HarmonyClient.js'
+import { isAuthorOptedOut, isAutomodBlocked, HarmonyHttpError } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
 import { confirmAction } from './confirmPrompt.js'
 import { CONFLICT_HINT, DEFAULT_SYNC_MODE, planSync, syncConfirmLines, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
 import { byDiscordId, desiredEmoji, emojiDiffers, harmonyEmojiSyncItem, type DesiredEmoji } from './emojiSync.js'
 import { desiredSticker, harmonyStickerSyncItem, isStickerSkip, stickerDiffers, type DesiredSticker, type StickerSkip } from './stickerSync.js'
 import { desiredSound, harmonySyncItem, soundDiffers, soundUpdate, type DesiredSound } from './soundSync.js'
-import { BridgeApiError, type ImportJob } from '../v2/BridgeApi.js'
+import { BridgeApiError, type ImportJob, type OptOutState } from '../v2/BridgeApi.js'
 import { importPercent } from './importProgress.js'
 
 // =============================================================================
@@ -194,6 +194,15 @@ export function buildCommands(mode: 'v1' | 'v2', features: CommandFeatures = NO_
             )))
   }
 
+  // Every member, about their own account: no default member permissions.
+  const privacyCommand = new SlashCommandBuilder()
+    .setName('bridge-privacy')
+    .setDescription('Choose whether your messages in this server go to Harmony')
+    .addSubcommand(sub => sub.setName('opt-out').setDescription('Stop your messages here from going to Harmony'))
+    .addSubcommand(sub => sub.setName('opt-in').setDescription('Let your messages here go to Harmony again'))
+    .addSubcommand(sub => sub.setName('status').setDescription('Show whether your messages here go to Harmony'))
+    .addSubcommand(sub => sub.setName('erase').setDescription('Delete your messages from Harmony and opt out (asks first)'))
+
   return [
     addUserOptions(new SlashCommandBuilder()
       .setName('mention')
@@ -202,6 +211,7 @@ export function buildCommands(mode: 'v1' | 'v2', features: CommandFeatures = NO_
       .setName('m')
       .setDescription('Quick mention a Harmony user with a message')),
     bridgeCommand,
+    ...(mode === 'v2' && features.privacy ? [privacyCommand] : []),
   ].map(cmd => cmd.toJSON())
 }
 
@@ -228,6 +238,8 @@ export async function handleInteraction(rt: BridgeRuntime, interaction: Interact
     await handleMention(rt, interaction)
   } else if (interaction.commandName === 'bridge') {
     await handleBridgeCommand(rt, interaction)
+  } else if (interaction.commandName === 'bridge-privacy') {
+    await handlePrivacyCommand(rt, interaction)
   }
 }
 
@@ -284,6 +296,11 @@ async function handleMention(rt: BridgeRuntime, command: ChatInputCommandInterac
       content: '❌ This channel is not bridged to Harmony.',
       flags: MessageFlags.Ephemeral,
     })
+    return
+  }
+
+  if (rt.optOuts.has(command.user.id)) {
+    await command.reply({ content: OPTED_OUT_MENTION_TEXT, flags: MessageFlags.Ephemeral })
     return
   }
 
@@ -385,8 +402,103 @@ async function handleMention(rt: BridgeRuntime, command: ChatInputCommandInterac
       await command.editReply({ content: '❌ Harmony\'s AutoMod blocked this message.' }).catch(() => {})
       return
     }
+    if (isAuthorOptedOut(error)) {
+      rt.noteOptedOut(error, command.user.id)
+      await command.editReply({ content: OPTED_OUT_MENTION_TEXT }).catch(() => {})
+      return
+    }
     rt.log.error(`/mention failed: ${errorText(error)}`)
     await command.editReply({ content: `❌ Failed to send: ${errorText(error)}` }).catch(() => {})
+  }
+}
+
+const OPTED_OUT_MENTION_TEXT = '❌ You are opted out of the Harmony bridge, so this was not sent. `/bridge-privacy status` shows why.'
+
+// =============================================================================
+// /bridge-privacy
+// =============================================================================
+// Every member, for their own Discord account only. Replies are ephemeral.
+
+const MANAGER_RESTORE_TEXT = 'Only a server manager can restore you: in Harmony, Server settings → Discord Bridge.'
+
+/** A member's standing with the bridge, in words. */
+function standingText(s: OptOutState): string {
+  if (!s.opted_out) return 'Your messages in this server go to Harmony. `/bridge-privacy opt-out` stops that.'
+  const since = s.since && !Number.isNaN(Date.parse(s.since)) ? ` since <t:${Math.floor(Date.parse(s.since) / 1000)}:D>` : ''
+  if (s.source === 'manager' || s.source === 'admin') {
+    const who = s.source === 'admin' ? 'A Harmony instance admin' : 'A server manager'
+    return `${who} removed you from the Harmony bridge${since}: your messages in this server do not go to Harmony. ${MANAGER_RESTORE_TEXT}`
+  }
+  return `You are opted out${since}: your messages in this server do not go to Harmony. \`/bridge-privacy opt-in\` lets them through again.`
+}
+
+/**
+ * `/bridge-privacy opt-out | opt-in | status | erase`. Acts on the caller's own Discord id. The
+ * bridge's opt-out list follows the answer at once; the next configuration read confirms it.
+ */
+async function handlePrivacyCommand(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  const guild = command.guild
+  const api = rt.hooks.privacyApi
+  if (!guild || !api || !rt.dir.getBridgeForDiscordGuild(guild.id)) {
+    await command.reply({
+      content: !guild ? '❌ This command can only be used in a server.' : '❌ This server is not bridged to Harmony.',
+      flags: MessageFlags.Ephemeral,
+    })
+    return
+  }
+  const sub = command.options.getSubcommand(true)
+  const userId = command.user.id
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+  const say = (content: string) => command.editReply({ content, components: [] })
+  /** The list follows Harmony's answer, so the live relay acts on it before the next read. */
+  const follow = (s: OptOutState): OptOutState => {
+    if (s.opted_out) rt.optOuts.add(userId)
+    else rt.optOuts.remove(userId)
+    return s
+  }
+
+  try {
+    switch (sub) {
+      case 'opt-out': {
+        const s = follow(await api.putOptOut(userId, command.user.username))
+        rt.log.info(`/bridge-privacy opt-out by ${userId} in guild ${guild.id}`)
+        await say(s.source === 'manager' || s.source === 'admin'
+          ? standingText(s)
+          : '✅ You are opted out: your messages in this server no longer go to Harmony. The ones already there stay; `/bridge-privacy erase` deletes them.')
+        break
+      }
+      case 'opt-in': {
+        // The answer, not the HTTP status, says whether they are in: a manager's removal stands.
+        const s = follow(await api.deleteOptOut(userId))
+        rt.log.info(`/bridge-privacy opt-in by ${userId} in guild ${guild.id}: ${s.opted_out ? `still out (${s.source ?? 'unknown'})` : 'in'}`)
+        await say(s.opted_out
+          ? `❌ ${standingText(s)}`
+          : '✅ You are opted in: your messages in this server go to Harmony again. Messages you sent while opted out are not copied.')
+        break
+      }
+      case 'status':
+        await say(standingText(follow(await api.getOptOut(userId))))
+        break
+      case 'erase': {
+        const prompt = '⚠️ This deletes your bridged and imported messages on Harmony for this server, and opts you out of the bridge. Your Discord messages stay. It cannot be undone. Confirm?'
+        if (!(await confirmAction(command, prompt, undefined, rt.log))) return
+        const { erased, more } = await api.erase(userId)
+        rt.optOuts.add(userId)
+        rt.log.info(`/bridge-privacy erase by ${userId} in guild ${guild.id}: ${erased} message(s)${more ? ', more in the background' : ''}`)
+        await say(`✅ Deleted ${erased} of your messages on Harmony${more ? '; the rest are being deleted in the background' : ''}. You are opted out: your messages in this server no longer go to Harmony.`)
+        break
+      }
+      default:
+        await say(`❌ Unknown subcommand: ${sub}`)
+    }
+  } catch (err) {
+    if (err instanceof BridgeApiError && err.status === 429 && err.code === 'erase_recent') {
+      const seconds = Math.max(1, Math.ceil((err.retryAfterMs ?? 60_000) / 1000))
+      await say(`⏳ Your messages on Harmony were erased a moment ago. Try again in ${seconds} seconds.`)
+      return
+    }
+    rt.log.error(`/bridge-privacy ${sub} failed: ${errorText(err)}`)
+    await say(`❌ \`/bridge-privacy ${sub}\` failed: ${errorText(err) || 'unknown error'}`)
   }
 }
 

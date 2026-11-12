@@ -53,6 +53,22 @@ export function isAutomodBlocked(err: unknown): boolean {
   return err instanceof HarmonyHttpError && err.status === 403 && err.code === 'AUTOMOD_BLOCKED'
 }
 
+/**
+ * A relay of an author who is opted out of the bridge (403 `{code: "BRIDGE_AUTHOR_OPTED_OUT"}`);
+ * final, not retried.
+ */
+export function isAuthorOptedOut(err: unknown): boolean {
+  return err instanceof HarmonyHttpError && err.status === 403 && err.code === 'BRIDGE_AUTHOR_OPTED_OUT'
+}
+
+/**
+ * A relay whose Discord message id another bot already stored in the channel
+ * (409 `{code: "DISCORD_MESSAGE_ID_TAKEN"}`); final, not retried.
+ */
+export function isDiscordMessageTaken(err: unknown): boolean {
+  return err instanceof HarmonyHttpError && err.status === 409 && err.code === 'DISCORD_MESSAGE_ID_TAKEN'
+}
+
 export interface HarmonyClientOptions {
   log?: Logger
   fetchImpl?: FetchLike

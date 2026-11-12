@@ -16,8 +16,9 @@ describe('buildCommands', () => {
     const sub: any = (buildCommands('v2').find(c => c.name === 'bridge')!.options ?? []).find(o => o.name === 'sync-sounds')
     expect(sub).toBeTruthy()
     const mode = sub.options.find((o: any) => o.name === 'mode')
-    expect(mode.choices.map((c: any) => c.value)).toEqual(['mirror', 'merge', 'add'])
+    expect(mode.choices.map((c: any) => c.value)).toEqual(['merge', 'mirror', 'add'])
     expect(sub.options.map((o: any) => o.name)).toContain('dry_run')
+    expect(mode.description).toContain('default: merge')
   })
 
   it('offers /bridge sync-emojis only to v2 with mode choices and dry_run', () => {
@@ -25,7 +26,7 @@ describe('buildCommands', () => {
     const sub: any = (buildCommands('v2').find(c => c.name === 'bridge')!.options ?? []).find(o => o.name === 'sync-emojis')
     expect(sub).toBeTruthy()
     const mode = sub.options.find((o: any) => o.name === 'mode')
-    expect(mode.choices.map((c: any) => c.value)).toEqual(['mirror', 'merge', 'add'])
+    expect(mode.choices.map((c: any) => c.value)).toEqual(['merge', 'mirror', 'add'])
     expect(sub.options.map((o: any) => o.name)).toContain('dry_run')
   })
 
@@ -34,7 +35,7 @@ describe('buildCommands', () => {
     const sub: any = (buildCommands('v2').find(c => c.name === 'bridge')!.options ?? []).find(o => o.name === 'sync-stickers')
     expect(sub).toBeTruthy()
     const mode = sub.options.find((o: any) => o.name === 'mode')
-    expect(mode.choices.map((c: any) => c.value)).toEqual(['mirror', 'merge', 'add'])
+    expect(mode.choices.map((c: any) => c.value)).toEqual(['merge', 'mirror', 'add'])
     expect(sub.options.map((o: any) => o.name)).toContain('dry_run')
   })
 })

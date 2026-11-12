@@ -15,6 +15,8 @@ function setup(opts: {
   discord?: unknown[]
   limit?: number
   harmony?: unknown[] | Error
+  /** Rows answered to the read after Confirm; default: the same rows. */
+  harmonyAfterConfirm?: unknown[]
   confirm?: 'confirm' | 'cancel'
 }) {
   const calls: string[] = []
@@ -39,6 +41,7 @@ function setup(opts: {
     deferReply: vi.fn(async () => {}),
     editReply: vi.fn(async (r: any) => { replies.push(r); return message }),
   }
+  let reads = 0
   const rt: any = {
     mode: 'v2',
     log: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
@@ -47,10 +50,11 @@ function setup(opts: {
     harmony: {
       getStickerSyncState: vi.fn(async () => {
         if (opts.harmony instanceof Error) throw opts.harmony
-        return { limit: opts.limit ?? 15, stickers: opts.harmony ?? [] }
+        reads++
+        return { limit: opts.limit ?? 15, stickers: reads > 1 && opts.harmonyAfterConfirm ? opts.harmonyAfterConfirm : opts.harmony ?? [] }
       }),
       removeServerSticker: vi.fn(async (_s: string, id: string) => { calls.push(`remove:${id}`) }),
-      importDiscordSticker: vi.fn(async (_s: string, d: any, update?: boolean) => {
+      importDiscordSticker: vi.fn(async (_s: string, d: any, update?: boolean): Promise<any> => {
         calls.push(`${update ? 'update' : 'create'}:${d.name}`)
         return { status: update ? 'updated' : 'created' }
       }),
@@ -62,14 +66,23 @@ function setup(opts: {
 const last = (t: ReturnType<typeof setup>) => t.replies.at(-1)!.content as string
 
 describe('runBridgeSyncStickers', () => {
-  it('mirror removes, creates, updates and restores after Confirm', async () => {
+  it('runs merge without a mode: retires nothing and asks nothing', async () => {
+    const t = setup({ discord: [dSticker('1', 'fresh')], harmony: [hRow('h9', 'stale', '9'), hRow('h5', 'mine')] })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.message.awaitMessageComponent).not.toHaveBeenCalled()
+    expect(t.calls).toEqual(['create:fresh'])
+    expect(last(t)).toContain('Sticker sync (merge)')
+  })
+
+  it('mirror removes stickers copied from a deleted Discord sticker, creates, updates and restores after Confirm', async () => {
     const t = setup({
+      mode: 'mirror',
       discord: [dSticker('1', 'fresh'), dSticker('2', 'newname'), dSticker('3', 'back'), dSticker('4', 'same', { description: 'new text' })],
-      harmony: [hRow('h2', 'oldname', '2'), hRow('h3', 'back', '3', true), hRow('h4', 'same', '4', false, 'old text'), hRow('h5', 'extra')],
+      harmony: [hRow('h2', 'oldname', '2'), hRow('h3', 'back', '3', true), hRow('h4', 'same', '4', false, 'old text'), hRow('h9', 'stale', '9'), hRow('h5', 'mine')],
     })
     await runBridgeSyncStickers(t.rt, t.command)
-    expect(t.replies[0].content).toContain('This removes 1 Harmony sticker. Removed stickers leave the sticker list.')
-    expect(t.calls).toEqual(['remove:h5', 'create:fresh', 'update:newname', 'update:same', 'update:back'])
+    expect(t.replies[0].content.split('\n')[0]).toBe('⚠️ This removes 1 Harmony sticker copied from Discord. Removed stickers leave the sticker list. Old messages keep showing them. Confirm?')
+    expect(t.calls).toEqual(['remove:h9', 'create:fresh', 'update:newname', 'update:same', 'update:back'])
     expect(t.rt.stickerLinks.replace).toHaveBeenCalledTimes(1)
     const text = last(t)
     expect(text).toContain('Sticker sync (mirror)')
@@ -77,25 +90,97 @@ describe('runBridgeSyncStickers', () => {
     expect(text).toContain('• Updated: 2')
     expect(text).toContain('• Restored: 1')
     expect(text).toContain('• Removed: 1')
+    expect(text).toContain('• Kept (not copied from Discord): 1')
+  })
+
+  it('mirror never retires a sticker a member uploaded, even with no stickers on Discord', async () => {
+    const t = setup({ mode: 'mirror', discord: [], harmony: [hRow('h1', 'mine'), hRow('h2', 'stand-in')] })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.message.awaitMessageComponent).not.toHaveBeenCalled()
+    expect(t.rt.harmony.removeServerSticker).not.toHaveBeenCalled()
+    expect(last(t)).toContain('Kept: 2 stickers not copied from Discord')
+  })
+
+  it('mirror reports a member sticker holding a Discord name as a clash and replaces nothing', async () => {
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    expect(t.message.awaitMessageComponent).not.toHaveBeenCalled()
+    expect(last(t)).toContain('Name clash: 1 sticker')
   })
 
   it('mirror cancel makes no calls', async () => {
-    const t = setup({ discord: [], harmony: [hRow('h1', 'extra')], confirm: 'cancel' })
+    const t = setup({ mode: 'mirror', discord: [], harmony: [hRow('h1', 'stale', '9')], confirm: 'cancel' })
     await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.replies[0].content.split('\n')[0]).toContain('This Discord server has no stickers. This removes all 1 Harmony sticker copied from Discord.')
     expect(t.calls).toEqual([])
     expect(t.rt.stickerLinks.replace).not.toHaveBeenCalled()
   })
 
-  it('mirror replace removes the holder, then creates', async () => {
-    const t = setup({ discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+  it('mirror replace removes a holder copied from a deleted Discord sticker, then creates', async () => {
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn', '9')] })
     await runBridgeSyncStickers(t.rt, t.command)
     expect(t.calls).toEqual(['remove:h1', 'create:horn'])
-    expect(last(t)).toContain('• Replaced (same name on Harmony): 1')
+    expect(last(t)).toContain('• Replaced (same name, copied from a deleted Discord one): 1')
     expect(last(t)).toContain('• Removed: 0')
   })
 
+  it('counts a sticker the gateway keeps as a member upload as kept, not as a failure', async () => {
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn', '9'), hRow('h2', 'stale', '8')] })
+    t.rt.harmony.removeServerSticker.mockRejectedValue(new HarmonyHttpError('STICKER_NOT_LINKED: a member uploaded it', 403, 'STICKER_NOT_LINKED'))
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.rt.harmony.importDiscordSticker).not.toHaveBeenCalled()
+    expect(last(t).startsWith('✅')).toBe(true)
+    expect(last(t)).toContain('• Kept (not copied from Discord): 2')
+    expect(last(t)).not.toContain('failure')
+  })
+
+  it('applies nothing when the stickers to remove changed during the confirmation', async () => {
+    const t = setup({
+      mode: 'mirror',
+      discord: [],
+      harmony: [hRow('h1', 'stale', '9')],
+      harmonyAfterConfirm: [hRow('h1', 'stale', '9'), hRow('h2', 'other', '8')],
+    })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    expect(last(t)).toContain('changed while this waited')
+  })
+
+  it('puts the removal warning first in a prompt too long for Discord', async () => {
+    const stale = Array.from({ length: 10 }, (_, i) => hRow(`h${i}`, `stale sticker long name ${i}`, `9${i}`))
+    const fresh = Array.from({ length: 60 }, (_, i) => dSticker(`1${String(i).padStart(3, '0')}`, `new sticker with long name ${i}`))
+    const t = setup({ mode: 'mirror', limit: 500, discord: fresh, harmony: stale, confirm: 'cancel' })
+    await runBridgeSyncStickers(t.rt, t.command)
+    const prompt = t.replies[0].content as string
+    expect(prompt.split('\n')[0]).toContain('⚠️ This removes 10 Harmony stickers copied from Discord.')
+    for (let i = 0; i < 10; i++) expect(prompt).toContain(`"stale sticker long name ${i}"`)
+  })
+
+  it('plans one sticker per name when Discord has two of a name, the older one', async () => {
+    const t = setup({ mode: 'merge', discord: [dSticker('20', 'Twin', { description: 'second' }), dSticker('10', 'twin', { description: 'first' })] })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.rt.harmony.importDiscordSticker).toHaveBeenCalledTimes(1)
+    expect(t.rt.harmony.importDiscordSticker.mock.calls[0][1]).toMatchObject({ id: '10', name: 'twin' })
+    expect(last(t)).toContain('1 skipped: another sticker on Discord has the same name')
+  })
+
+  it('counts a sticker Harmony already holds as already there, not as added', async () => {
+    const t = setup({ mode: 'add', discord: [dSticker('1', 'aa')] })
+    t.rt.harmony.importDiscordSticker.mockResolvedValue({ status: 'existing' })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(last(t)).toContain('• Added: 0')
+    expect(last(t)).toContain('• Already there: 1')
+  })
+
+  it('logs who ran the sync, where, and what it did', async () => {
+    const t = setup({ mode: 'merge', discord: [dSticker('1', 'aa')] })
+    await runBridgeSyncStickers(t.rt, t.command)
+    expect(t.rt.log.info).toHaveBeenCalledWith(expect.stringMatching(/sync-stickers \(merge\) by u1 in guild g1: added 1, /))
+  })
+
   it('a failed holder removal blocks the create', async () => {
-    const t = setup({ discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn', '9')] })
     t.rt.harmony.removeServerSticker.mockRejectedValue(new HarmonyHttpError('server error', 500))
     await runBridgeSyncStickers(t.rt, t.command)
     expect(t.rt.harmony.importDiscordSticker).not.toHaveBeenCalled()
@@ -133,7 +218,7 @@ describe('runBridgeSyncStickers', () => {
   })
 
   it('leaves an unavailable linked sticker alone', async () => {
-    const t = setup({ discord: [dSticker('1', 'x', { available: false })], harmony: [hRow('h1', 'other', '1')] })
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'x', { available: false })], harmony: [hRow('h1', 'other', '1')] })
     await runBridgeSyncStickers(t.rt, t.command)
     expect(t.calls).toEqual([])
     expect(last(t)).toBe('✅ Stickers already match.')
@@ -141,6 +226,7 @@ describe('runBridgeSyncStickers', () => {
 
   it('lists Lottie and too-short names as skipped and keeps their Harmony stickers', async () => {
     const t = setup({
+      mode: 'mirror',
       discord: [dSticker('1', 'anim', { format: 3 }), dSticker('2', 'x'), dSticker('3', 'ok')],
       harmony: [hRow('h1', 'anim', '1'), hRow('h2', 'x', '2')],
     })
@@ -164,7 +250,7 @@ describe('runBridgeSyncStickers', () => {
   })
 
   it('a mirror replace whose create is file-refused is a failure naming the removal', async () => {
-    const t = setup({ discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn', '9')] })
     t.rt.harmony.importDiscordSticker.mockRejectedValue(
       new HarmonyHttpError('bad file', 422, 'STICKER_FILE', { reason: 'duration' }),
     )
@@ -173,17 +259,17 @@ describe('runBridgeSyncStickers', () => {
     expect(t.rt.harmony.removeServerSticker).toHaveBeenCalledWith('s1', 'h1')
     expect(text.startsWith('⚠️')).toBe(true)
     expect(text).toContain('1 failure(s)')
-    expect(text).toContain('"horn": the Harmony sticker was removed but the Discord one could not be copied (animation over 5 s)')
+    expect(text).toContain('"horn": the old Harmony sticker was removed but the Discord one could not be copied (animation over 5 s)')
     expect(text).not.toContain("can't be copied (")
   })
 
   it('a mirror replace whose create gets a 409 is a failure naming the removal', async () => {
-    const t = setup({ discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+    const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn', '9')] })
     t.rt.harmony.importDiscordSticker.mockRejectedValue(new HarmonyHttpError('conflict here', 409))
     await runBridgeSyncStickers(t.rt, t.command)
     const text = last(t)
     expect(text.startsWith('⚠️')).toBe(true)
-    expect(text).toContain('"horn": the Harmony sticker was removed but the Discord one could not be copied (')
+    expect(text).toContain('"horn": the old Harmony sticker was removed but the Discord one could not be copied (')
     expect(text).toContain('conflict here')
   })
 
@@ -203,6 +289,7 @@ describe('runBridgeSyncStickers', () => {
 
   it('a limit lowered below the active count creates nothing and removes nothing', async () => {
     const t = setup({
+      mode: 'mirror',
       limit: 1,
       discord: [dSticker('1', 'aa'), dSticker('2', 'bb'), dSticker('3', 'cc')],
       harmony: [hRow('h8', 'aa', '1'), hRow('h9', 'bb', '2')],
@@ -249,7 +336,7 @@ describe('runBridgeSyncStickers', () => {
   it('on a 404 says Harmony needs updating', async () => {
     const t = setup({ harmony: new HarmonyHttpError('nope', 404) })
     await runBridgeSyncStickers(t.rt, t.command)
-    expect(last(t)).toBe('❌ Sticker sync needs a newer Harmony (bridge sticker sync endpoints).')
+    expect(last(t)).toBe('❌ Sticker sync needs Harmony 1.9.7 or later.')
     expect(t.rt.harmony.importDiscordSticker).not.toHaveBeenCalled()
   })
 
@@ -260,9 +347,10 @@ describe('runBridgeSyncStickers', () => {
 
   it('writes nothing on a dry run and lists the plan and the skips', async () => {
     const t = setup({
+      mode: 'mirror',
       dryRun: true,
       discord: [dSticker('1', 'fresh'), dSticker('2', 'anim', { format: 3 })],
-      harmony: [hRow('h1', 'extra')],
+      harmony: [hRow('h1', 'extra', '9')],
     })
     await runBridgeSyncStickers(t.rt, t.command)
     expect(t.calls).toEqual([])

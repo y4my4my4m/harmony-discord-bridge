@@ -60,6 +60,11 @@ describe('HarmonyClient sticker sync', () => {
   }
   const d = { id: 'd1', name: 'wave', description: 'hi', formatType: 2 }
 
+  it('getStickerSyncState refuses a body without the list or the limit', async () => {
+    const { c } = client(() => Response.json({ limit: 5 }))
+    await expect(c.getStickerSyncState('s1')).rejects.toMatchObject({ code: 'LIST_MALFORMED' })
+  })
+
   it('getStickerSyncState GETs the discord sticker list', async () => {
     const { c, fetchImpl } = client(() => Response.json({ limit: 5, stickers: [] }))
     expect(await c.getStickerSyncState('s1')).toEqual({ limit: 5, stickers: [] })

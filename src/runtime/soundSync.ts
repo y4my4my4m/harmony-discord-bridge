@@ -1,4 +1,4 @@
-import type { HarmonyServerSound } from '../HarmonyClient.js'
+import type { DiscordSoundImport, HarmonyServerSound } from '../HarmonyClient.js'
 import type { SyncHarmonyItem } from './expressionSync.js'
 
 export interface DiscordSoundInput {
@@ -10,13 +10,7 @@ export interface DiscordSoundInput {
   available: boolean
 }
 
-export interface DesiredSound {
-  /** Discord sound id. */
-  id: string
-  name: string
-  volume: number
-  emoji: string | null
-  emojiId: string | null
+export interface DesiredSound extends DiscordSoundImport {
   /** The Discord sound uses a custom emoji that has no Harmony counterpart yet. */
   hadUnimportedEmoji: boolean
 }
@@ -39,10 +33,16 @@ export function harmonySyncItem(row: HarmonyServerSound): SyncHarmonyItem & { ro
   return { id: row.id, name: row.name, discordId: row.discord_sound_id, row }
 }
 
+/** An emoji the bridge cannot map is no difference: the Harmony sound keeps the emoji it has. */
 export function soundDiffers(d: DesiredSound, h: { row: HarmonyServerSound }): boolean {
   const r = h.row
-  return d.name !== r.name
-    || Math.round(Number(d.volume) * 100) !== Math.round(Number(r.volume) * 100)
-    || d.emoji !== r.emoji
-    || d.emojiId !== r.emoji_id
+  if (d.name !== r.name || Math.round(Number(d.volume) * 100) !== Math.round(Number(r.volume) * 100)) return true
+  if (d.hadUnimportedEmoji) return false
+  return d.emoji !== r.emoji || d.emojiId !== r.emoji_id
+}
+
+/** The import body of an update: an unmapped custom emoji leaves the row's emoji in place. */
+export function soundUpdate(d: DesiredSound, row: HarmonyServerSound): DiscordSoundImport {
+  const { hadUnimportedEmoji, ...sound } = d
+  return hadUnimportedEmoji ? { ...sound, emoji: row.emoji, emojiId: row.emoji_id } : sound
 }

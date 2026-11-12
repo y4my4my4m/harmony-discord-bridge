@@ -1,4 +1,4 @@
-import type { HarmonyStickerSyncRow } from '../HarmonyClient.js'
+import type { DiscordStickerImport, HarmonyStickerSyncRow } from '../HarmonyClient.js'
 import type { SyncHarmonyItem } from './expressionSync.js'
 
 export interface DiscordStickerInput {
@@ -10,13 +10,7 @@ export interface DiscordStickerInput {
   available: boolean
 }
 
-export interface DesiredSticker {
-  /** Discord sticker id. */
-  id: string
-  name: string
-  description: string
-  formatType: number
-}
+export type DesiredSticker = DiscordStickerImport
 
 export type StickerSkip = { id: string; name: string; reason: 'lottie' | 'name' }
 
@@ -33,7 +27,6 @@ export function isStickerSkip(x: DesiredSticker | StickerSkip): x is StickerSkip
 }
 
 export function desiredSticker(s: DiscordStickerInput): DesiredSticker | StickerSkip {
-  // eslint-disable-next-line no-control-regex
   // Trim again after the cut: Harmony stores btrim(name), so a trailing space would never match.
   const name = cut((s.name ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim(), NAME_MAX).trim()
   if (s.formatType === LOTTIE) return { id: s.id, name, reason: 'lottie' }

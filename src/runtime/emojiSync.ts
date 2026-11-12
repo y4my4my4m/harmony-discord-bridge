@@ -22,8 +22,19 @@ export function desiredEmoji(e: DiscordEmojiInput): DesiredEmoji | null {
   return { id: e.id, name, animated: e.animated }
 }
 
+/**
+ * `imported` and `restorable` are the gateway's (Harmony 1.9.7). Without `imported` a Discord link
+ * stands in for it; without `restorable` a removed emoji stays removed.
+ */
 export function harmonyEmojiSyncItem(r: HarmonyEmojiSyncRow): SyncHarmonyItem {
-  return { id: r.id, name: r.name, discordId: r.discord_emoji_id, removed: r.removed }
+  return {
+    id: r.id,
+    name: r.name,
+    discordId: r.discord_emoji_id,
+    removed: r.removed,
+    removable: r.imported ?? r.discord_emoji_id !== null,
+    restorable: r.restorable === true,
+  }
 }
 
 export function emojiDiffers(d: DesiredEmoji, h: { name: string }): boolean {

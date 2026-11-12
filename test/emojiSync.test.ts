@@ -24,8 +24,20 @@ describe('emojiSync mapping', () => {
   })
 
   it('harmonyEmojiSyncItem maps fields', () => {
-    expect(harmonyEmojiSyncItem({ id: 'h', name: 'n', url: null, discord_emoji_id: 'd', removed: true }))
-      .toEqual({ id: 'h', name: 'n', discordId: 'd', removed: true })
+    expect(harmonyEmojiSyncItem({ id: 'h', name: 'n', url: null, discord_emoji_id: 'd', removed: true, imported: true, restorable: true }))
+      .toEqual({ id: 'h', name: 'n', discordId: 'd', removed: true, removable: true, restorable: true })
+  })
+
+  it('harmonyEmojiSyncItem: a member emoji linked by name is not removable', () => {
+    const item = harmonyEmojiSyncItem({ id: 'h', name: 'n', url: null, discord_emoji_id: 'd', removed: false, imported: false, restorable: false })
+    expect(item.removable).toBe(false)
+  })
+
+  it('harmonyEmojiSyncItem without the gateway flags: a link stands in for imported, nothing is restorable', () => {
+    const linked = harmonyEmojiSyncItem({ id: 'h', name: 'n', url: null, discord_emoji_id: 'd', removed: true })
+    expect(linked.removable).toBe(true)
+    expect(linked.restorable).toBe(false)
+    expect(harmonyEmojiSyncItem({ id: 'h', name: 'n', url: null, discord_emoji_id: null, removed: false }).removable).toBe(false)
   })
 })
 
@@ -39,6 +51,18 @@ describe('HarmonyClient emoji sync', () => {
     })
     return { c, fetchImpl }
   }
+
+  it('getEmojiSyncState refuses a body without the list or the limit', async () => {
+    for (const body of [{ limit: 50, rows: [] }, { emojis: [] }, []]) {
+      const { c } = client(() => Response.json(body))
+      await expect(c.getEmojiSyncState('s1')).rejects.toMatchObject({ code: 'LIST_MALFORMED' })
+    }
+  })
+
+  it('getEmojiSyncState carries the code of a list too large to answer whole', async () => {
+    const { c } = client(() => Response.json({ error: 'more than 10000 emoji rows', code: 'LIST_TOO_LARGE' }, { status: 500 }))
+    await expect(c.getEmojiSyncState('s1')).rejects.toMatchObject({ status: 500, code: 'LIST_TOO_LARGE' })
+  })
 
   it('getEmojiSyncState GETs the discord emoji list', async () => {
     const { c, fetchImpl } = client(() => Response.json({ limit: 50, emojis: [] }))

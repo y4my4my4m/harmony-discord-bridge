@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { desiredSound, harmonySyncItem, soundDiffers, type DiscordSoundInput } from '../src/runtime/soundSync.js'
+import { desiredSound, harmonySyncItem, soundDiffers, soundUpdate, type DiscordSoundInput } from '../src/runtime/soundSync.js'
 import type { HarmonyServerSound } from '../src/HarmonyClient.js'
 import { Logger } from '../src/log.js'
 
@@ -47,6 +47,15 @@ describe('harmonySyncItem / soundDiffers', () => {
     expect(soundDiffers(d, harmonySyncItem(row()))).toBe(true)
     expect(soundDiffers(d, harmonySyncItem(row({ emoji_id: 'h-e1' })))).toBe(false)
   })
+  it('sees no difference in an emoji it cannot map, and keeps the row emoji in an update', () => {
+    const d = desiredSound({ ...base, emojiId: 'e1', emojiName: 'pepe' }, () => null)
+    const kept = row({ emoji_id: 'h-e9' })
+    expect(soundDiffers(d, harmonySyncItem(kept))).toBe(false)
+    expect(soundUpdate(d, kept)).toEqual({ id: 's1', name: 'airhorn', volume: 0.5, emoji: null, emojiId: 'h-e9' })
+    expect(soundUpdate(d, row({ emoji: '🔊' }))).toMatchObject({ emoji: '🔊', emojiId: null })
+    const mapped = desiredSound({ ...base, emojiId: 'e1' }, () => 'h-e1')
+    expect(soundUpdate(mapped, kept)).toMatchObject({ emojiId: 'h-e1' })
+  })
   it('detects a unicode emoji change', () => {
     const d = desiredSound({ ...base, emojiName: '🔊' }, () => null)
     expect(soundDiffers(d, harmonySyncItem(row()))).toBe(true)
@@ -74,6 +83,10 @@ describe('HarmonyClient sounds', () => {
     const client = await mk(fetchImpl)
     expect(await client.getServerSounds('srv')).toEqual([row()])
     expect((fetchImpl.mock.calls[0] as any)[0]).toContain('/servers/srv/sounds')
+  })
+  it('getServerSounds refuses a body that is not a list', async () => {
+    const client = await mk(vi.fn(async () => Response.json({ sounds: [row()] })))
+    await expect(client.getServerSounds('srv')).rejects.toMatchObject({ code: 'LIST_MALFORMED' })
   })
   it('deleteServerSound accepts 204 and throws HarmonyHttpError otherwise', async () => {
     const { HarmonyHttpError } = await import('../src/HarmonyClient.js')

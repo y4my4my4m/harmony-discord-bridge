@@ -3,8 +3,6 @@ import { EventEmitter } from 'events'
 import { Backoff, fetchWithRetry, type FetchLike, type RetryOptions } from './http.js'
 import { Logger, errorText } from './log.js'
 import type { PresenceDelta } from './runtime/presenceDeltas.js'
-import type { DesiredSound } from './runtime/soundSync.js'
-import type { DesiredSticker } from './runtime/stickerSync.js'
 
 interface HarmonyMessage {
   id: string
@@ -73,6 +71,10 @@ export interface HarmonyEmojiSyncRow {
   url: string | null
   discord_emoji_id: string | null
   removed: boolean
+  /** The bridge imported the row and may remove it. False for a member's emoji, also one linked by name. */
+  imported?: boolean
+  /** The bridge removed the row and may restore it. False once a person removed it. */
+  restorable?: boolean
 }
 
 export interface HarmonyStickerSyncRow {
@@ -82,6 +84,27 @@ export interface HarmonyStickerSyncRow {
   url: string
   discord_sticker_id: string | null
   removed: boolean
+}
+
+/** Body of POST /servers/:id/sounds/discord. */
+export interface DiscordSoundImport {
+  /** Discord sound id. */
+  id: string
+  name: string
+  /** 0 to 1. */
+  volume: number
+  emoji: string | null
+  emojiId: string | null
+}
+
+/** Body of POST /servers/:id/stickers/discord. */
+export interface DiscordStickerImport {
+  /** Discord sticker id. */
+  id: string
+  name: string
+  description: string
+  /** Discord format_type: 1 PNG, 2 APNG, 3 Lottie, 4 GIF. */
+  formatType: number
 }
 
 export interface HarmonyServerSound {
@@ -727,8 +750,13 @@ export class HarmonyClient extends EventEmitter {
     }, 'Failed to import emoji')
   }
 
+  /** Every active emoji plus removed ones with a Discord link. The gateway never answers a partial list. */
   async getEmojiSyncState(serverId: string): Promise<{ limit: number; emojis: HarmonyEmojiSyncRow[] }> {
-    return this.getJson(`/servers/${serverId}/emojis/discord`, 'Failed to fetch server emojis')
+    const body = await this.getJson<{ limit?: unknown; emojis?: unknown }>(`/servers/${serverId}/emojis/discord`, 'Failed to fetch server emojis')
+    if (typeof body?.limit !== 'number' || !Array.isArray(body.emojis)) {
+      throw new HarmonyHttpError('Harmony answered an emoji list the bridge cannot read', 502, 'LIST_MALFORMED')
+    }
+    return { limit: body.limit, emojis: body.emojis as HarmonyEmojiSyncRow[] }
   }
 
   async removeServerEmoji(serverId: string, emojiId: string): Promise<void> {
@@ -738,14 +766,19 @@ export class HarmonyClient extends EventEmitter {
     )
   }
 
+  /** Active stickers plus retired ones with a Discord link. The gateway never answers a partial list. */
   async getStickerSyncState(serverId: string): Promise<{ limit: number; stickers: HarmonyStickerSyncRow[] }> {
-    return this.getJson(`/servers/${serverId}/stickers/discord`, 'Failed to fetch server stickers')
+    const body = await this.getJson<{ limit?: unknown; stickers?: unknown }>(`/servers/${serverId}/stickers/discord`, 'Failed to fetch server stickers')
+    if (typeof body?.limit !== 'number' || !Array.isArray(body.stickers)) {
+      throw new HarmonyHttpError('Harmony answered a sticker list the bridge cannot read', 502, 'LIST_MALFORMED')
+    }
+    return { limit: body.limit, stickers: body.stickers as HarmonyStickerSyncRow[] }
   }
 
   /** Imports (or with `update`, refreshes) a Discord sticker as a server sticker. */
   async importDiscordSticker(
     serverId: string,
-    s: DesiredSticker,
+    s: DiscordStickerImport,
     update = false,
   ): Promise<HarmonyStickerSyncRow & { status: 'created' | 'existing' | 'updated' }> {
     return this.sendJson('POST', `/servers/${serverId}/stickers/discord`, {
@@ -765,13 +798,15 @@ export class HarmonyClient extends EventEmitter {
   }
 
   async getServerSounds(serverId: string): Promise<HarmonyServerSound[]> {
-    return this.getJson<HarmonyServerSound[]>(`/servers/${serverId}/sounds`, 'Failed to fetch server sounds')
+    const body = await this.getJson<unknown>(`/servers/${serverId}/sounds`, 'Failed to fetch server sounds')
+    if (!Array.isArray(body)) throw new HarmonyHttpError('Harmony answered a sound list the bridge cannot read', 502, 'LIST_MALFORMED')
+    return body as HarmonyServerSound[]
   }
 
   /** Imports (or with `update`, refreshes) a Discord soundboard sound as a server sound. */
   async importDiscordSound(
     serverId: string,
-    sound: DesiredSound,
+    sound: DiscordSoundImport,
     update: boolean,
   ): Promise<HarmonyServerSound & { status: 'created' | 'existing' | 'updated' }> {
     return this.sendJson('POST', `/servers/${serverId}/sounds/discord`, {

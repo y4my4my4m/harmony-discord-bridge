@@ -144,6 +144,50 @@ describe('Discord stickers synced to Harmony', () => {
     expect(rt.stickerLinks.harmonyFor('s', 'st-1')).toBeNull()
   })
 
+  it('a refused edit keeps a retired link: later edits of messages that hold the sticker stay native', async () => {
+    const { rt, h } = await setup()
+    rt.stickerLinks.replace('s', [row({ removed: true })])
+    rt.discordToHarmonyMessages.set('dm-1', 'hm-1')
+    h.editMessage.mockRejectedValueOnce(refused())
+    await rt.onDiscordMessageUpdate(discordMessage({ content: 'edited' }))
+    expect(h.editMessage).toHaveBeenCalledTimes(2)
+    expect(hasSticker(h.editMessage.mock.calls[1][1])).toBe(false)
+    expect(rt.stickerLinks.harmonyFor('s', 'st-1')).toMatchObject({ id: 'hs-1', removed: true })
+
+    await rt.onDiscordMessageUpdate(discordMessage({ content: 'edited again' }))
+    expect(hasSticker(h.editMessage.mock.calls[2][1])).toBe(true)
+  })
+
+  it('with two stickers, drops the link of the one Harmony refused and resends both as images', async () => {
+    const { rt, h } = await setup()
+    rt.stickerLinks.replace('s', [
+      row({ id: 'hs-a', discord_sticker_id: 'st-a', removed: true }),
+      row({ id: 'hs-b', discord_sticker_id: 'st-b' }),
+    ])
+    h.sendMessage.mockRejectedValueOnce(refused())
+    await rt.onDiscordMessage(discordMessage({
+      stickers: new Collection([
+        ['st-a', { id: 'st-a', name: 'first', format: 1 }],
+        ['st-b', { id: 'st-b', name: 'second', format: 1 }],
+      ]),
+    }))
+    expect(h.sendMessage).toHaveBeenCalledTimes(2)
+    expect((h.sendMessage.mock.calls[0][1] as any[]).find(p => p.type === 'sticker').id).toBe('hs-b')
+    expect(hasSticker(h.sendMessage.mock.calls[1][1])).toBe(false)
+    expect((h.sendMessage.mock.calls[1][1] as any[]).map(p => p.fileName)).toEqual(['first.png', 'second.png'])
+    expect(rt.stickerLinks.harmonyFor('s', 'st-a')).not.toBeNull()
+    expect(rt.stickerLinks.harmonyFor('s', 'st-b')).toBeNull()
+    expect(rt.discordToHarmonyMessages.get('dm-1')).toBe('hm-new')
+  })
+
+  it('translates a message once when Harmony accepts it', async () => {
+    const { rt, h } = await setup()
+    const translate = vi.spyOn(rt.translator, 'discordToHarmonyParts')
+    await rt.onDiscordMessage(discordMessage())
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+    expect(translate).toHaveBeenCalledTimes(1)
+  })
+
   it('other send errors are not retried', async () => {
     const { rt, h } = await setup()
     h.sendMessage.mockRejectedValue(new HarmonyHttpError('boom', 500))

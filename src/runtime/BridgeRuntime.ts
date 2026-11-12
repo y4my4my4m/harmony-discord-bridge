@@ -1707,12 +1707,15 @@ export class BridgeRuntime {
     }
   }
 
-  /** Translation context for Discord → Harmony. */
-  private discordToHarmonyContext(serverId?: string, forNewMessage = false): DiscordToHarmonyContext {
+  /**
+   * Translation context for Discord → Harmony. `nativeStickers` false renders every sticker as
+   * its image.
+   */
+  private discordToHarmonyContext(serverId?: string, forNewMessage = false, nativeStickers = true): DiscordToHarmonyContext {
     return {
       harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
       // The message's own server only; retired rows answer only for an edit, which keeps its sticker part.
-      harmonyStickerFor: serverId
+      harmonyStickerFor: serverId && nativeStickers
         ? discordStickerId => {
           const link = this.stickerLinks.harmonyFor(serverId, discordStickerId)
           return forNewMessage && link?.removed ? null : link
@@ -2018,8 +2021,10 @@ export class BridgeRuntime {
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
       const stickerServerId = await this.emojiServerFor(msg.guildId)
-      const buildParts = () => this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(stickerServerId, true), { content: cleanedContent })
-      if (buildParts().length === 0) {
+      const buildParts = (native: boolean) =>
+        this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(stickerServerId, true, native), { content: cleanedContent })
+      const firstParts = buildParts(true)
+      if (firstParts.length === 0) {
         this.log.debug(`Discord message ${msg.id} has nothing to bridge`)
         return
       }
@@ -2040,7 +2045,7 @@ export class BridgeRuntime {
         return
       }
 
-      const result = await this.withStickerFallback(stickerServerId, msg, buildParts, parts =>
+      const result = await this.withStickerFallback(stickerServerId, firstParts, buildParts, parts =>
         this.harmony.sendMessage(harmonyChannelId, parts, metadata, replyTo, harmonyThreadId))
 
       // The gateway returns the message at top level (BotRestAPI.formatMessage).
@@ -2189,12 +2194,10 @@ export class BridgeRuntime {
       }
 
       const stickerServerId = await this.emojiServerFor(newMsg.guildId)
-      await this.withStickerFallback(
-        stickerServerId,
-        newMsg,
-        () => this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(stickerServerId)),
-        parts => this.harmony.editMessage(harmonyMessageId, parts),
-      )
+      const buildParts = (native: boolean) =>
+        this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(stickerServerId, false, native))
+      await this.withStickerFallback(stickerServerId, buildParts(true), buildParts, parts =>
+        this.harmony.editMessage(harmonyMessageId, parts))
       this.log.info(`Discord → Harmony edit: ${newMsg.id} → ${harmonyMessageId}`)
     } catch (error) {
       if (isAutomodBlocked(error)) {
@@ -2737,29 +2740,26 @@ export class BridgeRuntime {
   }
 
   /**
-   * Builds and writes a Discord message's Harmony parts. When Harmony refuses the native sticker
-   * part (422 STICKER_REFUSED), the link is dropped and the message is written once more, now with
-   * the sticker as an image. Any other error propagates unchanged.
+   * Writes a Discord message's Harmony parts. When Harmony refuses the native sticker part
+   * (422 STICKER_REFUSED), the message is built again with every sticker as an image and written
+   * once more. The refused sticker is the one the built part names; its live link is forgotten,
+   * a retired link is kept for edits of the messages that hold it. Any other error propagates.
    */
   private async withStickerFallback<T>(
     serverId: string | undefined,
-    msg: any,
-    build: () => any[],
+    parts: any[],
+    build: (nativeStickers: boolean) => any[],
     write: (parts: any[]) => Promise<T>,
   ): Promise<T> {
-    const parts = build()
     try {
       return await write(parts)
     } catch (error) {
       if (!(error instanceof HarmonyHttpError) || error.status !== 422 || error.code !== 'STICKER_REFUSED') throw error
-      if (!serverId || !parts.some(p => p?.type === 'sticker')) throw error
-      const stickers: any[] = typeof msg.stickers?.values === 'function' ? Array.from(msg.stickers.values()) : []
-      // The sticker the translator made native: the first one a link answers for.
-      const native = stickers.find(s => this.stickerLinks.harmonyFor(serverId, s.id))
-      if (!native) throw error
-      this.stickerLinks.drop(serverId, native.id)
+      const native = parts.find(p => p?.type === 'sticker')
+      if (!serverId || !native) throw error
+      this.stickerLinks.dropLive(serverId, String(native.id))
       this.log.warn(`Harmony refused synced sticker ${native.id}; sending the image instead`)
-      return write(build())
+      return write(build(false))
     }
   }
 

@@ -22,12 +22,19 @@ describe('ServerStickerLinks', () => {
     expect(links.harmonyFor('s', '222')?.id).toBe('h2')
   })
 
-  it('drop removes one link', async () => {
+  it('dropLive forgets the live link to one Harmony sticker', async () => {
     const links = new ServerStickerLinks(async () => [row('h1', '111'), row('h2', '222')])
     await links.ensure('s')
-    links.drop('s', '111')
+    links.dropLive('s', 'h1')
     expect(links.harmonyFor('s', '111')).toBeNull()
     expect(links.harmonyFor('s', '222')?.id).toBe('h2')
+  })
+
+  it('dropLive keeps a retired link', async () => {
+    const links = new ServerStickerLinks(async () => [row('h1', '111', true)])
+    await links.ensure('s')
+    links.dropLive('s', 'h1')
+    expect(links.harmonyFor('s', '111')?.id).toBe('h1')
   })
 
   it('a failed load keeps the old links', async () => {

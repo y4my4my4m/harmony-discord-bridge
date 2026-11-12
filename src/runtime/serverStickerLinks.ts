@@ -61,7 +61,15 @@ export class ServerStickerLinks {
     return this.servers.get(serverId)?.byDiscord.get(discordStickerId) ?? null
   }
 
-  drop(serverId: string, discordStickerId: string): void {
-    this.servers.get(serverId)?.byDiscord.delete(discordStickerId)
+  /**
+   * Forgets the live link to a Harmony sticker that Harmony refused. A retired link stays: an
+   * edit of a message that holds the sticker reproduces its part from it.
+   */
+  dropLive(serverId: string, harmonyStickerId: string): void {
+    const links = this.servers.get(serverId)?.byDiscord
+    if (!links) return
+    for (const [discordId, link] of links) {
+      if (link.id === harmonyStickerId && !link.removed) links.delete(discordId)
+    }
   }
 }

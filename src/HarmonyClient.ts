@@ -4,6 +4,7 @@ import { Backoff, fetchWithRetry, type FetchLike, type RetryOptions } from './ht
 import { Logger, errorText } from './log.js'
 import type { PresenceDelta } from './runtime/presenceDeltas.js'
 import type { DesiredSound } from './runtime/soundSync.js'
+import type { DesiredSticker } from './runtime/stickerSync.js'
 
 interface HarmonyMessage {
   id: string
@@ -71,6 +72,15 @@ export interface HarmonyEmojiSyncRow {
   name: string
   url: string | null
   discord_emoji_id: string | null
+  removed: boolean
+}
+
+export interface HarmonyStickerSyncRow {
+  id: string
+  name: string
+  description: string
+  url: string
+  discord_sticker_id: string | null
   removed: boolean
 }
 
@@ -725,6 +735,32 @@ export class HarmonyClient extends EventEmitter {
     await this.expectOk(
       await this.request(`/servers/${serverId}/emojis/${emojiId}`, { method: 'DELETE' }),
       'Failed to delete emoji',
+    )
+  }
+
+  async getStickerSyncState(serverId: string): Promise<{ limit: number; stickers: HarmonyStickerSyncRow[] }> {
+    return this.getJson(`/servers/${serverId}/stickers/discord`, 'Failed to fetch server stickers')
+  }
+
+  /** Imports (or with `update`, refreshes) a Discord sticker as a server sticker. */
+  async importDiscordSticker(
+    serverId: string,
+    s: DesiredSticker,
+    update = false,
+  ): Promise<HarmonyStickerSyncRow & { status: 'created' | 'existing' | 'updated' }> {
+    return this.sendJson('POST', `/servers/${serverId}/stickers/discord`, {
+      discord_sticker_id: s.id,
+      name: s.name,
+      description: s.description,
+      format_type: s.formatType,
+      ...(update ? { update: true } : {}),
+    }, 'Failed to import sticker')
+  }
+
+  async removeServerSticker(serverId: string, stickerId: string): Promise<void> {
+    await this.expectOk(
+      await this.request(`/servers/${serverId}/stickers/${stickerId}`, { method: 'DELETE' }),
+      'Failed to delete sticker',
     )
   }
 

@@ -62,6 +62,7 @@ import { isPublicHttpsUrl } from '../utils/fetchCapped.js'
 import { loadInstanceIcon } from '../utils/instanceIcon.js'
 import { ReactionLedger } from '../utils/reactionLedger.js'
 import { ServerEmojiLinks } from './serverEmojiLinks.js'
+import { ServerStickerLinks } from './serverStickerLinks.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -348,6 +349,7 @@ export class BridgeRuntime {
   private readonly reactionLedger = new ReactionLedger()
   /** Harmony server emoji imported from Discord; one emoji on both sides. */
   readonly emojiLinks = new ServerEmojiLinks(serverId => this.harmony.getServerEmojis(serverId))
+  readonly stickerLinks = new ServerStickerLinks(id => this.harmony.getStickerSyncState(id).then(s => s.stickers))
 
   private droppedMessages = 0
   /** Discord messages Harmony's AutoMod refused since start. */
@@ -1695,9 +1697,16 @@ export class BridgeRuntime {
   }
 
   /** Translation context for Discord → Harmony. */
-  private discordToHarmonyContext(serverId?: string): DiscordToHarmonyContext {
+  private discordToHarmonyContext(serverId?: string, forNewMessage = false): DiscordToHarmonyContext {
     return {
       harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
+      // The message's own server only; retired rows answer only for an edit, which keeps its sticker part.
+      harmonyStickerFor: serverId
+        ? discordStickerId => {
+          const link = this.stickerLinks.harmonyFor(serverId, discordStickerId)
+          return forNewMessage && link?.removed ? null : link
+        }
+        : undefined,
       harmonyRoleFor: id => this.permissionSyncStore.getHarmonyRoleId(id),
       harmonyDefaultRoleId: this.permissionSyncStore.getDefaultHarmonyRoleId(),
       harmonyChannelFor: id => {
@@ -1937,8 +1946,9 @@ export class BridgeRuntime {
       }
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
-      const contentParts = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: cleanedContent })
-      if (contentParts.length === 0) {
+      const stickerServerId = await this.emojiServerFor(msg.guildId)
+      const buildParts = () => this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(stickerServerId, true), { content: cleanedContent })
+      if (buildParts().length === 0) {
         this.log.debug(`Discord message ${msg.id} has nothing to bridge`)
         return
       }
@@ -1959,7 +1969,8 @@ export class BridgeRuntime {
         return
       }
 
-      const result = await this.harmony.sendMessage(harmonyChannelId, contentParts, metadata, replyTo, harmonyThreadId)
+      const result = await this.withStickerFallback(stickerServerId, msg, buildParts, parts =>
+        this.harmony.sendMessage(harmonyChannelId, parts, metadata, replyTo, harmonyThreadId))
 
       // The gateway returns the message at top level (BotRestAPI.formatMessage).
       const harmonyMessageId = result?.id ?? result?.message?.id
@@ -2106,8 +2117,13 @@ export class BridgeRuntime {
         return
       }
 
-      const contentParts = this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(await this.emojiServerFor(newMsg.guildId)))
-      await this.harmony.editMessage(harmonyMessageId, contentParts)
+      const stickerServerId = await this.emojiServerFor(newMsg.guildId)
+      await this.withStickerFallback(
+        stickerServerId,
+        newMsg,
+        () => this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(stickerServerId)),
+        parts => this.harmony.editMessage(harmonyMessageId, parts),
+      )
       this.log.info(`Discord → Harmony edit: ${newMsg.id} → ${harmonyMessageId}`)
     } catch (error) {
       if (isAutomodBlocked(error)) {
@@ -2636,13 +2652,43 @@ export class BridgeRuntime {
   /** Harmony server of a bridged guild, with its emoji links loaded. */
   private async emojiServerFor(guildId: string | null | undefined): Promise<string | undefined> {
     const serverId = guildId ? this.dir.getBridgeForDiscordGuild(guildId)?.harmonyServerId : undefined
-    if (serverId) await this.emojiLinks.ensure(serverId)
+    if (serverId) await Promise.all([this.emojiLinks.ensure(serverId), this.stickerLinks.ensure(serverId)])
     return serverId
   }
 
   private async refreshEmojiLinks(): Promise<void> {
     for (const bridge of this.dir.getBridges()) {
-      if (bridge.harmonyServerId) await this.emojiLinks.ensure(bridge.harmonyServerId)
+      if (bridge.harmonyServerId) {
+        await this.emojiLinks.ensure(bridge.harmonyServerId)
+        await this.stickerLinks.ensure(bridge.harmonyServerId)
+      }
+    }
+  }
+
+  /**
+   * Builds and writes a Discord message's Harmony parts. When Harmony refuses the native sticker
+   * part (422 STICKER_REFUSED), the link is dropped and the message is written once more, now with
+   * the sticker as an image. Any other error propagates unchanged.
+   */
+  private async withStickerFallback<T>(
+    serverId: string | undefined,
+    msg: any,
+    build: () => any[],
+    write: (parts: any[]) => Promise<T>,
+  ): Promise<T> {
+    const parts = build()
+    try {
+      return await write(parts)
+    } catch (error) {
+      if (!(error instanceof HarmonyHttpError) || error.status !== 422 || error.code !== 'STICKER_REFUSED') throw error
+      if (!serverId || !parts.some(p => p?.type === 'sticker')) throw error
+      const stickers: any[] = typeof msg.stickers?.values === 'function' ? Array.from(msg.stickers.values()) : []
+      // The sticker the translator made native: the first one a link answers for.
+      const native = stickers.find(s => this.stickerLinks.harmonyFor(serverId, s.id))
+      if (!native) throw error
+      this.stickerLinks.drop(serverId, native.id)
+      this.log.warn(`Harmony refused synced sticker ${native.id}; sending the image instead`)
+      return write(build())
     }
   }
 

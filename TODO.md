@@ -51,7 +51,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Bridge Discord slash commands other than `/m`
 - [ ] Expression/server sync follow-ups (reuse `expressionSync.ts` modes, dry run, confirm):
   - [x] `/bridge sync-emojis` (`import-emojis` is now `mode:add`, with the old import as fallback on an older Harmony)
-  - [ ] Stickers sync (Harmony cap 15, alt text required, png/apng/webp/gif; Lottie not importable)
+  - [x] `/bridge sync-stickers` (Lottie, names under 2 characters and refused files are skipped and listed)
   - [ ] Server profile sync (name, icon, banner, description)
   - [ ] Channel details sync (topic, slowmode, NSFW on linked channels)
   - [ ] Scheduled events, if Harmony gains them

@@ -28,6 +28,7 @@ import { errorText } from '../log.js'
 import { confirmAction } from './confirmPrompt.js'
 import { CONFLICT_HINT, planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
 import { byDiscordId, desiredEmoji, emojiDiffers, harmonyEmojiSyncItem, type DesiredEmoji } from './emojiSync.js'
+import { desiredSticker, harmonyStickerSyncItem, isStickerSkip, stickerDiffers, type DesiredSticker, type StickerSkip } from './stickerSync.js'
 import { desiredSound, harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
 
 // =============================================================================
@@ -126,6 +127,17 @@ export function buildCommands(mode: 'v1' | 'v2') {
       sub
         .setName('sync-emojis')
         .setDescription('Make Harmony\'s emoji match this Discord server')
+        .addStringOption(opt =>
+          opt.setName('mode')
+            .setDescription('How to reconcile (default: mirror)')
+            .setRequired(false)
+            .addChoices(...SYNC_MODE_CHOICES))
+        .addBooleanOption(opt =>
+          opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
+    bridgeCommand.addSubcommand(sub =>
+      sub
+        .setName('sync-stickers')
+        .setDescription('Make Harmony\'s stickers match this Discord server')
         .addStringOption(opt =>
           opt.setName('mode')
             .setDescription('How to reconcile (default: mirror)')
@@ -416,6 +428,9 @@ async function handleBridgeCommand(rt: BridgeRuntime, command: ChatInputCommandI
         break
       case 'sync-sounds':
         await runBridgeSyncSounds(rt, command)
+        break
+      case 'sync-stickers':
+        await runBridgeSyncStickers(rt, command)
         break
       default:
         await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
@@ -1370,6 +1385,251 @@ export async function runBridgeSyncEmojis(
   if (plan.conflict.length > 0) {
     const names = plan.conflict.map(c => c.discord.name)
     lines.push('', `⚠️ ${names.length} name clash(es), left as they are:`, ...names.slice(0, 20).map(n => `  • :${n}:`))
+    if (names.length > 20) lines.push(`  • …and ${names.length - 20} more`)
+    lines.push(CONFLICT_HINT)
+  }
+  if (failures.length > 0) {
+    lines.push('', `⚠️ ${failures.length} failure(s):`, ...failures.slice(0, 15).map(f => `  • ${f}`))
+    if (failures.length > 15) lines.push(`  • …and ${failures.length - 15} more`)
+  }
+  await command.editReply({ content: joinLinesWithinDiscordLimit(lines), components: [] })
+}
+
+const STICKER_FILE_REASONS: Record<string, string> = {
+  lottie: 'Lottie sticker',
+  type: 'unsupported image',
+  size: 'over 512 KB',
+  dimensions: 'over 320 × 320',
+  duration: 'animation over 5 s',
+}
+
+/**
+ * `/bridge sync-stickers`: makes Harmony's stickers match the guild's, like `sync-emojis`.
+ * Mirror also retires Harmony stickers that are not on Discord (asks Confirm first).
+ * Lottie stickers, too-short names and files Harmony refuses are reported as skipped, not failed.
+ */
+export async function runBridgeSyncStickers(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  const mode = (command.options.getString('mode', false) ?? 'mirror') as SyncMode
+  const dryRun = command.options.getBoolean('dry_run', false) ?? false
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({ content: notBridgedText(rt) })
+    return
+  }
+  const serverId = bridge.harmonyServerId
+
+  let state
+  try {
+    state = await rt.harmony.getStickerSyncState(serverId)
+  } catch (err) {
+    if (err instanceof HarmonyHttpError && err.status === 404) {
+      await command.editReply({ content: '❌ Sticker sync needs a newer Harmony (bridge sticker sync endpoints).' })
+      return
+    }
+    throw err
+  }
+  if (state.limit === 0) {
+    await command.editReply({ content: '❌ Server stickers are turned off on this Harmony instance (max stickers per server is 0).' })
+    return
+  }
+
+  let fetched
+  try {
+    fetched = [...(await guild.stickers.fetch()).values()]
+  } catch (err) {
+    await command.editReply({ content: `❌ Could not read the Discord stickers: ${errorText(err)}` })
+    return
+  }
+  const presentIds = fetched.filter(s => s.available === false).map(s => s.id)
+  const discord: DesiredSticker[] = []
+  const skips: StickerSkip[] = []
+  for (const s of fetched) {
+    if (s.available === false) continue
+    const d = desiredSticker({ id: s.id, name: s.name, description: s.description, formatType: Number(s.format), available: true })
+    if (isStickerSkip(d)) {
+      skips.push(d)
+      presentIds.push(d.id)
+    } else {
+      discord.push(d)
+    }
+  }
+  discord.sort(byDiscordId)
+
+  const rawPlan = planSync({
+    mode,
+    discord,
+    presentIds,
+    harmony: state.stickers.map(harmonyStickerSyncItem),
+    differs: stickerDiffers,
+    limit: state.limit,
+  })
+  const clashing = new Set(rawPlan.conflict.map(c => c.discord.id))
+  const plan = {
+    ...rawPlan,
+    update: rawPlan.update.filter(u => !clashing.has(u.discord.id)),
+    restore: rawPlan.restore.filter(u => !clashing.has(u.discord.id)),
+  }
+  const limitHint = '  An instance admin can raise "max stickers per server", then run this again.'
+  const reportOpts = { label: (n: string) => `"${n}"`, noun: 'sticker', nounPlural: 'stickers', limitHint, removeVerb: { dry: 'Would remove', real: 'Remove' } }
+
+  const fileSkips: Array<{ name: string; reason: string }> = []
+  const skipLines = (): string[] => {
+    const q = (x: { id: string; name: string }) => `"${x.name || x.id}"`
+    const out: string[] = []
+    const lottie = skips.filter(x => x.reason === 'lottie')
+    const short = skips.filter(x => x.reason === 'name')
+    if (lottie.length > 0) out.push(`• Skipped ${lottie.length}: Lottie stickers can't be copied (${lottie.map(q).join(', ')})`)
+    if (short.length > 0) out.push(`• Skipped ${short.length}: name too short (${short.map(q).join(', ')})`)
+    if (fileSkips.length > 0) out.push(`• Skipped ${fileSkips.length}: can't be copied (${fileSkips.map(x => `"${x.name}": ${x.reason}`).join(', ')})`)
+    return out
+  }
+
+  if (dryRun) {
+    await command.editReply({
+      content: joinLinesWithinDiscordLimit([
+        `🧪 **Dry run** (${mode}) for **${guild.name}**`,
+        ...syncReportLines(plan, { ...reportOpts, dryRun: true }),
+        ...skipLines(),
+      ]),
+    })
+    return
+  }
+
+  const removals = [...plan.delete, ...plan.replace.flatMap(r => r.harmony)]
+  const creations = [...plan.add, ...plan.replace.map(r => r.discord)]
+  if (removals.length + creations.length + plan.update.length + plan.restore.length === 0) {
+    const left = plan.conflict.length + plan.outdated + plan.overLimit.length + skips.length > 0
+    await command.editReply({
+      content: left
+        ? joinLinesWithinDiscordLimit([
+          `${plan.conflict.length > 0 ? '⚠️' : '✅'} Nothing to apply (${mode}) for **${guild.name}**`,
+          ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
+          ...skipLines(),
+        ])
+        : '✅ Stickers already match.',
+    })
+    return
+  }
+
+  if (removals.length > 0) {
+    const n = removals.length
+    const prompt = joinLinesWithinDiscordLimit([
+      ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
+      `⚠️ This removes ${n} Harmony sticker${n === 1 ? '' : 's'}. Removed stickers leave the sticker list. Old messages keep showing them. Confirm?`,
+    ])
+    if (!(await confirmAction(command, prompt, undefined, rt.log))) return
+  }
+
+  const failures: string[] = []
+  const fail = (d: { name: string }, err: unknown, afterRemoval = false) => {
+    let fileReason: string | null = null
+    if (err instanceof HarmonyHttpError && err.status === 422 && err.code === 'STICKER_FILE') {
+      const reason = String(err.details.reason ?? '')
+      fileReason = STICKER_FILE_REASONS[reason] ?? (reason || errorText(err))
+      if (!afterRemoval) {
+        fileSkips.push({ name: d.name, reason: fileReason })
+        return
+      }
+    }
+    let text: string
+    if (fileReason !== null) {
+      text = fileReason
+    } else if (err instanceof HarmonyHttpError && err.code === 'STICKER_LIMIT') {
+      text = `the Harmony sticker list is full (${state.limit} per server)`
+    } else if (err instanceof HarmonyHttpError && err.code === 'STICKER_NAME_TAKEN') {
+      text = 'name already used by another Harmony sticker'
+    } else {
+      text = errorText(err)
+    }
+    failures.push(afterRemoval
+      ? `"${d.name}": the Harmony sticker was removed but the Discord one could not be copied (${text})`
+      : `"${d.name}": ${text}`)
+  }
+  const counts = { removed: 0, created: 0, updated: 0, restored: 0, replaced: 0 }
+
+  const tryRemove = async (h: { id: string }): Promise<unknown> => {
+    try {
+      await rt.harmony.removeServerSticker(serverId, h.id)
+    } catch (err) {
+      if (!(err instanceof HarmonyHttpError && err.status === 404)) return err
+    }
+    return null
+  }
+  for (const h of plan.delete) {
+    const err = await tryRemove(h)
+    if (err) fail(h, err)
+    else counts.removed++
+  }
+  const blocked = new Set<string>()
+  for (const r of plan.replace) {
+    let removeError: unknown = null
+    for (const h of r.harmony) {
+      const err = await tryRemove(h)
+      if (err) removeError ??= err
+    }
+    if (removeError) {
+      blocked.add(r.discord.id)
+      failures.push(`"${r.discord.name}": not replaced, removing the Harmony sticker failed: ${errorText(removeError)}`)
+    }
+  }
+  const replacing = new Set(plan.replace.map(r => r.discord.id))
+  for (const d of creations) {
+    if (blocked.has(d.id)) continue
+    try {
+      await rt.harmony.importDiscordSticker(serverId, d, false)
+      if (replacing.has(d.id)) counts.replaced++
+      else counts.created++
+    } catch (err) {
+      fail(d, err, replacing.has(d.id))
+    }
+  }
+  for (const { discord: d } of plan.update) {
+    try {
+      await rt.harmony.importDiscordSticker(serverId, d, true)
+      counts.updated++
+    } catch (err) {
+      fail(d, err)
+    }
+  }
+  for (const { discord: d } of plan.restore) {
+    try {
+      await rt.harmony.importDiscordSticker(serverId, d, true)
+      counts.restored++
+    } catch (err) {
+      fail(d, err)
+    }
+  }
+
+  try {
+    rt.stickerLinks.replace(serverId, (await rt.harmony.getStickerSyncState(serverId)).stickers)
+  } catch (err) {
+    rt.log.warn(`Could not refresh sticker links after sync: ${errorText(err)}`)
+  }
+
+  const lines = [
+    failures.length > 0
+      ? `⚠️ Sticker sync finished with ${failures.length} failure(s) (${mode}) for **${guild.name}**`
+      : `✅ Sticker sync (${mode}) for **${guild.name}**`,
+    `• Added: ${counts.created}`,
+    `• Updated: ${counts.updated}`,
+    `• Restored: ${counts.restored}`,
+    ...(plan.replace.length > 0 ? [`• Replaced (same name on Harmony): ${counts.replaced}`] : []),
+    `• Removed: ${counts.removed}`,
+    ...(plan.outdated > 0 ? [`• Not updated (add mode): ${plan.outdated}; use merge or mirror to update`] : []),
+    ...skipLines(),
+  ]
+  if (plan.overLimit.length > 0) {
+    const names = plan.overLimit.map(d => d.name)
+    lines.push('', `⚠️ ${names.length} skipped: limit reached (${plan.limit} per server)`, ...names.slice(0, 20).map(n => `  • "${n}"`))
+    if (names.length > 20) lines.push(`  • …and ${names.length - 20} more`)
+    lines.push(limitHint)
+  }
+  if (plan.conflict.length > 0) {
+    const names = plan.conflict.map(c => c.discord.name)
+    lines.push('', `⚠️ ${names.length} name clash(es), left as they are:`, ...names.slice(0, 20).map(n => `  • "${n}"`))
     if (names.length > 20) lines.push(`  • …and ${names.length - 20} more`)
     lines.push(CONFLICT_HINT)
   }

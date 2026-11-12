@@ -9,7 +9,12 @@ import {
 } from '../runtime/BridgeRuntime.js'
 import type { NewPair, PairWriter } from '../runtime/PairDirectory.js'
 import type { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
-import { detectProblems, type DiscordGuildView, type Problem } from '../problems.js'
+import { detectProblems, dedupeProblems, problemKey, type DiscordGuildView, type Problem, type ProblemCode } from '../problems.js'
+import { HistoryImporter } from '../runtime/historyImport.js'
+import { discordImportAccess } from '../runtime/importDiscord.js'
+import { ImportScheduler, type ImportSlots } from '../runtime/importScheduler.js'
+import type { ImportSettings } from '../env.js'
+import type { Client as DiscordJsClient } from 'discord.js'
 import { Backoff, type FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
 import type { HealthReport } from '../health.js'
@@ -25,6 +30,17 @@ export interface RuntimeLike {
   discordIdentity(): ReturnType<BridgeRuntime['discordIdentity']>
   isDiscordConnected(): boolean
   isHarmonyConnected(): boolean
+  /** History import support; a runtime without these (test fakes) never imports. */
+  discordClientForImport?(): DiscordJsClient | null
+  translateForImport?: BridgeRuntime['translateForImport']
+  threadStarterForImport?: BridgeRuntime['threadStarterForImport']
+}
+
+/** History import wiring; omitted → this bridge never imports. */
+export interface V2ImportOptions {
+  /** One per process, shared by every bridge. */
+  slots: ImportSlots
+  settings: Pick<ImportSettings, 'pollMs' | 'pageDelayMs'>
 }
 
 export interface V2BridgeOptions {
@@ -54,6 +70,7 @@ export interface V2BridgeOptions {
   /** Status sends after a state change wait this long to batch bursts. */
   statusDebounceMs?: number
   createRuntime?: (opts: BridgeRuntimeOptions) => RuntimeLike
+  import?: V2ImportOptions
 }
 
 class ApiPairWriter implements PairWriter {
@@ -120,6 +137,9 @@ export class V2Bridge {
   private readonly unreachableBackoff = new Backoff(5_000, 5 * 60_000)
   private readonly authBackoff = new Backoff(60_000, 15 * 60_000)
   private lastConfigErrorLogged = ''
+  private scheduler: ImportScheduler | null = null
+  /** Problems raised by the running import; shown in status until its job ends. */
+  private readonly importProblems = new Map<string, Problem>()
 
   constructor(private readonly opts: V2BridgeOptions) {
     this.log = opts.label ? opts.log.child(opts.label) : opts.log
@@ -139,7 +159,58 @@ export class V2Bridge {
     this.configTimer = this.heartbeatTimer = this.bootstrapTimer = this.statusTimer = this.configSoonTimer = null
     const runtime = this.runtime
     this.runtime = null
+    const scheduler = this.scheduler
+    this.scheduler = null
+    await scheduler?.stop()
+    this.importProblems.clear()
     await runtime?.stop()
+  }
+
+  /** Polls for import jobs now; no-op when imports are not wired. */
+  kickImports(): void {
+    this.scheduler?.kick()
+  }
+
+  private startImports(runtime: RuntimeLike) {
+    const opts = this.opts.import
+    const { discordClientForImport, translateForImport, threadStarterForImport } = runtime
+    if (!opts || !discordClientForImport || !translateForImport || !threadStarterForImport) return
+    const access = discordImportAccess(() => runtime.discordClientForImport!())
+    const raise = (problem: Problem) => {
+      const key = problemKey(problem)
+      if (this.importProblems.has(key)) return
+      this.importProblems.set(key, problem)
+      this.statusSoon()
+    }
+    const clear = (code?: ProblemCode) => {
+      let changed = false
+      for (const [key, p] of this.importProblems) {
+        if (code && p.code !== code) continue
+        this.importProblems.delete(key)
+        changed = true
+      }
+      if (changed) this.statusSoon()
+    }
+    const importer = new HistoryImporter({
+      api: this.api,
+      ...access,
+      translate: msg => runtime.translateForImport!(msg),
+      threadStarter: thread => runtime.threadStarterForImport!(thread),
+      reportProblem: raise,
+      pageDelayMs: opts.settings.pageDelayMs,
+      log: this.log,
+    })
+    this.scheduler = new ImportScheduler({
+      api: this.api,
+      importer,
+      slots: opts.slots,
+      pollMs: opts.settings.pollMs,
+      intentsOk: () => runtime.discordIdentity().intents.message_content,
+      ready: () => runtime.isDiscordConnected(),
+      problems: { raise, clear },
+      log: this.log,
+    })
+    this.scheduler.start()
   }
 
   private noteConfigError(err: unknown): 'auth' | 'unreachable' {
@@ -208,6 +279,8 @@ export class V2Bridge {
         afterPairsWritten: () => this.refreshConfig('pairs written'),
         harmonyAuthHint: this.opts.authHint,
         discordTokenHint: this.opts.discordTokenHint,
+        kickImports: () => this.kickImports(),
+        importApi: this.opts.import ? this.api : undefined,
       },
     }
     const runtime = (this.opts.createRuntime ?? ((o) => new BridgeRuntime(o)))(runtimeOptions)
@@ -230,6 +303,7 @@ export class V2Bridge {
     } catch (err) {
       this.log.error(`Bridge runtime failed to start: ${errorText(err)}`)
     }
+    if (!this.stopped) this.startImports(runtime)
     this.statusSoon()
   }
 
@@ -301,7 +375,7 @@ export class V2Bridge {
     const config = this.directory?.config() ?? null
     const guilds = runtime?.guildViews() ?? null
     if (guilds) this.lastGuildViews = guilds
-    return detectProblems({
+    const detected = detectProblems({
       connection: [...(runtime?.connectionProblems() ?? []), ...this.configProblems()],
       guilds,
       scopedToSelection: this.opts.sharedDiscord !== undefined,
@@ -315,6 +389,7 @@ export class V2Bridge {
         harmony_channels: config.harmony_channels.map(c => ({ id: String(c.id), encrypted: c.encrypted === true })),
       },
     })
+    return dedupeProblems([...detected, ...this.importProblems.values()])
   }
 
   async sendStatus(): Promise<void> {

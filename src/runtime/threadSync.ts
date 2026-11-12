@@ -23,6 +23,16 @@ export interface ThreadAnchor {
 type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId' | 'type'>
 
 /**
+ * Whether threads can exist in a Discord channel. Voice and stage channels have a text chat
+ * but no thread manager.
+ */
+export function supportsThreads(channel: { type?: number; threads?: unknown } | null | undefined): boolean {
+  if (!channel) return false
+  if (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice) return false
+  return channel.threads !== undefined && channel.threads !== null
+}
+
+/**
  * Whether a Discord channel is a private thread. Harmony has no private threads (every thread
  * is visible to the whole channel), so these never cross the bridge in either direction.
  */
@@ -118,6 +128,10 @@ export class ThreadSync {
     create = true,
     author: ThreadAuthor | null = null,
   ): Promise<AnyThreadChannel | null> {
+    if (!supportsThreads(parent)) {
+      this.deps.log.debug(`Harmony thread ${harmonyThreadId}: Discord channel ${parent?.id} has no threads; not bridged`)
+      return null
+    }
     const id = this.toDiscord.get(harmonyThreadId) ?? await this.once(`h:${harmonyThreadId}:${create}`, async () => {
       const info = await this.deps.harmony.getThread(harmonyThreadId)
       if (!info) return null

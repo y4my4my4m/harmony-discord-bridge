@@ -171,6 +171,10 @@ All settings are environment variables (`-e NAME=value`).
 | `HEALTH_PORT` | no | Port of the `/health` status endpoint, default `8080`. `off` disables it. |
 | `MAX_UPLOAD_MB` | no | Harmony files up to this many megabytes per message are uploaded to Discord; bigger ones are sent as a link. Default `8`. Discord's own limit for the server applies on top. `0` sends every file as a link. |
 | `HARMONY_MEDIA_ORIGIN` | no | For a bridge on the same machine as Harmony: where to download Harmony files from instead of the public address, e.g. `http://127.0.0.1:8000` (Supabase's Kong). Saves the round trip through the internet or Cloudflare. |
+| `BRIDGE_IMPORT_POLL_MS` | no | How often the bridge looks for history import jobs, in milliseconds. Default `10000`, minimum `1000`. |
+| `BRIDGE_IMPORT_PAGE_DELAY_MS` | no | Pause between pages of Discord history while importing, to stay gentle on Discord's rate limits. Default `1000`, `0` for none. |
+| `BRIDGE_IMPORT_CONCURRENCY` | no | How many imports run at once in this process. Default `1`. |
+| `BRIDGE_IMPORT_TEST_AUTHORS` | no | Testing only. Comma-separated bot or webhook ids whose messages the history import treats as a person's, so a test server seeded through a webhook can be imported. Leave unset in production. |
 
 Which channels are paired and what is synced (member list, presence,
 reactions, edits, deletions) is set in Harmony's Discord Bridge page; the
@@ -263,7 +267,45 @@ and is counted in the log the same way.
 - `/bridge sync-sounds [mode] [dry_run]`: make the Harmony soundboard match the Discord one (needs a Harmony with the bridge soundboard endpoints). Modes: `mirror` (default; makes Harmony match Discord exactly: adds, updates, replaces same-name sounds and deletes every Harmony sound not on Discord; the only mode that deletes), `merge` (adds new sounds and updates linked ones), `add` (only adds new sounds). Merge and add never delete: a Harmony sound with a Discord sound's name that isn't linked to it is left as is and listed as a name clash, with how to fix it. `dry_run` lists the changes. A real run that deletes or replaces anything asks Confirm/Cancel first (60 s, only you can press). Run `/bridge import-emojis` first to keep custom emoji on sounds. Harmony allows 48 sounds per server; a rerun finishes whatever failed.
 - `/bridge sync-stickers [mode] [dry_run]`: make Harmony's stickers match the Discord server's (needs a Harmony with the bridge sticker sync endpoints). Modes work like `sync-emojis`: `mirror` (default; adds, updates, restores, replaces same-name stickers and removes every Harmony sticker not on Discord; the only mode that removes), `merge` (adds, updates and restores linked stickers) and `add` (only adds). Merge and add never remove: a Harmony sticker with the same name that isn't linked is listed as a name clash. Removing retires a sticker on Harmony: it leaves the sticker list and old messages keep showing it. `dry_run` lists the changes; a real run that removes or replaces anything asks Confirm/Cancel first. A dry run can't tell which images Harmony will refuse (too large, over 320 × 320, animation over 5 s); those show up as skipped when the sync is applied. Lottie stickers, names under 2 characters and files Harmony refuses (over 512 KB, over 320 × 320, animation over 5 s, unsupported image) are skipped and listed. Stickers beyond "max stickers per server" are skipped and listed; if that is 0, server stickers are off and nothing happens.
 
+- `/bridge import-history`: import a channel's old Discord messages into Harmony (bridge 2.6.0 or later; see below). `action:` is `start` (default), `status` or `cancel`; `scope:` is `channel` (default; inside a thread, its parent channel) or `all` bridged channels.
+
 `/bridge` needs the Discord **Administrator** permission.
+
+## Importing old messages
+
+Messages written before a channel was bridged can be copied into Harmony. Start
+it either way:
+
+- in Harmony, under Server settings → Discord Bridge, for one channel or all
+  paired channels (progress is shown there), or
+- in Discord, with `/bridge import-history` in the channel (or `scope:all`);
+  `action:status` shows the state, percent and number of messages, and
+  `action:cancel` stops it.
+
+The channel's pair must bring Discord messages to Harmony (direction "both" or
+"Discord → Harmony") and the Harmony channel must not be encrypted. The bot
+needs the **Message Content** intent and permission to read the channel's
+history on Discord.
+
+Voice and stage channels import their text chat too (they have no threads).
+
+What is imported: normal messages and replies, with their original time,
+author, edit time, embeds, stickers, mentions, custom emoji and attachments;
+pinned state (up to Harmony's 50 pins per channel; further pins are skipped and
+counted); and public threads with their messages. Replies are linked to their original afterwards.
+Authors who have left the server are imported as plain Discord users.
+
+What is skipped: private threads (they are never imported, and never relayed
+live either: Harmony has no private threads yet, so everyone in the channel
+could read them; the Manage Threads permission is not needed and does not
+change this), reactions (they are not imported), messages from bots
+(including webhooks), system messages (joins, boosts, pin notices and so on),
+and messages already in Harmony. An import can be re-run or resumed after a
+restart without duplicates.
+
+A bridge runs one import at a time; `BRIDGE_IMPORT_CONCURRENCY` sets how many
+imports run at once across the whole bridge process (default 1). The other
+`BRIDGE_IMPORT_*` settings above tune the pace.
 
 ## Troubleshooting
 

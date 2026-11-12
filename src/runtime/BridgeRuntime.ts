@@ -66,6 +66,7 @@ import { ServerStickerLinks } from './serverStickerLinks.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
+import type { BridgeApi, ImportMessage } from '../v2/BridgeApi.js'
 import type { DiscordGuildView, PrivilegedIntent, Problem } from '../problems.js'
 import { collectGuildViews } from '../v2/selfCheck.js'
 import type { PairDirectory, PairWriter } from './PairDirectory.js'
@@ -148,6 +149,10 @@ export interface RuntimeHooks {
   harmonyAuthHint?: string
   /** Log line explaining a Discord token rejection. */
   discordTokenHint?: string
+  /** Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler runs. */
+  kickImports?: () => void
+  /** History import routes for `/bridge import-history`. Absent when the bridge cannot import. */
+  importApi?: Pick<BridgeApi, 'listImports' | 'startImports' | 'cancelImport'>
 }
 
 export interface BridgeRuntimeOptions {
@@ -394,6 +399,12 @@ export class BridgeRuntime {
       Math.max(PRESENCE_MIN_INTERVAL_MS, opts.presenceFlushMs ?? PRESENCE_MIN_INTERVAL_MS),
     )
     this.media = new OutboundMedia(this.harmonyBaseUrl.href, opts.media ?? mediaOptionsFromEnv(process.env, this.log), opts.fetchImpl)
+    this.importTestAuthors = new Set(
+      (process.env.BRIDGE_IMPORT_TEST_AUTHORS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+    )
+    if (this.importTestAuthors.size > 0) {
+      this.log.warn(`BRIDGE_IMPORT_TEST_AUTHORS is set: history import treats ${this.importTestAuthors.size} bot/webhook author(s) as people. Testing only.`)
+    }
     this.appEmojiDir = opts.appEmojiDir ?? null
 
     this.shared = opts.sharedDiscord ?? null
@@ -1873,8 +1884,18 @@ export class BridgeRuntime {
     return ch?.isThread?.() && ch.parentId ? ch.parentId : channelId
   }
 
+  /** The connected Discord client, or null while not ready. History import reads through it. */
+  discordClientForImport(): DiscordClient | null {
+    return this.discordState === 'ready' ? this.discord : null
+  }
+
+  /** The discord_user of the member who started a Discord thread (history import); null for the bridge's own. */
+  threadStarterForImport(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
+    return this.discordThreadStarter(thread)
+  }
+
   /** The discord_user of the member who started a Discord thread; null for the bridge's own. */
-  private async discordThreadStarter(thread: Pick<AnyThreadChannel, 'id' | 'ownerId'>): Promise<Record<string, unknown> | null> {
+  private async discordThreadStarter(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
     const ownerId = thread.ownerId
     if (!ownerId || ownerId === this.discord?.user?.id) return null
     const guild = (thread as Partial<AnyThreadChannel>).guild
@@ -1897,6 +1918,61 @@ export class BridgeRuntime {
       if (!this.noteDrop('Discord thread → Harmony', error)) {
         this.log.error(`Failed to bridge Discord thread ${thread.id}: ${errorText(error)}`)
       }
+    }
+  }
+
+  /** Authors found to have left their guild, by `guild:author` -> expiry (ms). Used only by history import. */
+  private readonly absentMembers = new Map<string, number>()
+
+  /**
+   * BRIDGE_IMPORT_TEST_AUTHORS: bot or webhook ids whose messages history import treats as a
+   * person's, so a test server seeded through a webhook can be imported. Testing only; live
+   * relay ignores it. Empty by default.
+   */
+  private readonly importTestAuthors: Set<string>
+
+  /**
+   * Guild member of a message's author: carries the server nickname. Null once they have left.
+   * `rememberAbsent` (history import) skips the REST lookup for an hour after a miss, so a departed
+   * author's hundreds of messages do not each cost a 404 on the shared REST queue.
+   */
+  private async guildMemberFor(msg: DiscordMessage, rememberAbsent = false) {
+    let guildMember = msg.member
+    if (!guildMember && msg.guild) {
+      guildMember = msg.guild.members.cache.get(msg.author.id) ?? null
+      if (!guildMember) {
+        const key = `${msg.guild.id}:${msg.author.id}`
+        if (rememberAbsent && (this.absentMembers.get(key) ?? 0) > Date.now()) return null
+        guildMember = await msg.guild.members.fetch(msg.author.id).catch(() => null)
+        if (rememberAbsent && !guildMember) {
+          if (this.absentMembers.size >= 5000) this.absentMembers.clear()
+          this.absentMembers.set(key, Date.now() + 3_600_000)
+        }
+      }
+    }
+    return guildMember
+  }
+
+  /**
+   * A Discord message as a history-import row: the same parts and `discord_user` as live relay,
+   * without relay's reply resolution (the server links replies by Discord id), thread lookup or
+   * anti-spam. Null for bots, message types other than Default/Reply, and empty translations.
+   */
+  async translateForImport(msg: DiscordMessage): Promise<Omit<ImportMessage, 'thread_id' | 'pinned'> | null> {
+    if (msg.author.bot && !this.importTestAuthors.has(msg.author.id)) return null
+    if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) return null
+
+    const guildMember = await this.guildMemberFor(msg, true)
+    const content = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: msg.content ?? '' })
+    if (content.length === 0) return null
+
+    return {
+      discord_message_id: msg.id,
+      created_at: msg.createdAt.toISOString(),
+      edited_at: msg.editedAt?.toISOString() ?? null,
+      content,
+      discord_user: buildDiscordUserMetadata(msg.author, guildMember, this.discordMemberDetails.get(msg.author.id)).discord_user as Record<string, unknown>,
+      reply_to_discord_message_id: msg.reference?.messageId ?? null,
     }
   }
 
@@ -1938,12 +2014,7 @@ export class BridgeRuntime {
     try {
       const { replyTo, cleanedContent } = await this.resolveDiscordReplyToHarmony(msg, harmonyChannelId)
 
-      // Guild member carries the server nickname.
-      let guildMember = msg.member
-      if (!guildMember && msg.guild) {
-        guildMember = msg.guild.members.cache.get(msg.author.id)
-          ?? await msg.guild.members.fetch(msg.author.id).catch(() => null)
-      }
+      const guildMember = await this.guildMemberFor(msg)
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
       const stickerServerId = await this.emojiServerFor(msg.guildId)

@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv'
 import type { Server } from 'http'
-import { planLaunch } from './env.js'
+import { parseImportSettings, planLaunch } from './env.js'
 import { Logger, errorText, parseLogLevel } from './log.js'
 import { findLegacyConfigPath, packageVersion, resolveDataDir } from './paths.js'
 import { startHealthServer, type Launched } from './health.js'
@@ -47,6 +47,8 @@ process.on('unhandledRejection', (reason) => {
 async function main() {
   const plan = planLaunch(process.env, findLegacyConfigPath())
   if (plan.kind === 'error') fatal(plan.message)
+  const importSettings = parseImportSettings(process.env)
+  if (!importSettings.ok) fatal(importSettings.message)
 
   log.info(`Harmony Discord bridge ${version} (${plan.kind === 'self' ? 'self-hosted' : plan.kind === 'host' ? 'host mode' : 'legacy v1 config'})`)
 
@@ -72,6 +74,7 @@ async function main() {
         log,
         version,
         ignoredLegacyConfig: plan.ignoredLegacyConfig,
+        import: importSettings.settings,
       })
     } else {
       launched = await runHost({
@@ -81,6 +84,7 @@ async function main() {
         dataDir: resolveDataDir(),
         log,
         version,
+        import: importSettings.settings,
       })
     }
   } catch (err) {

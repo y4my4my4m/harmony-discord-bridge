@@ -412,8 +412,9 @@ Other messages:
   - `opt-out`: their messages, edits and reactions in this server are no longer
     sent to Harmony, and a history import skips them. Opting out also removes
     them from the Harmony server's Discord member list, and their presence is
-    no longer sent. Deleting a message on Discord still deletes its Harmony
-    copy. Messages already on Harmony stay.
+    no longer sent. When another member mentions them, the mention reaches
+    Harmony as plain text. Deleting a message on Discord still deletes its
+    Harmony copy. Messages already on Harmony stay.
   - `erase`: deletes their bridged and imported messages on Harmony for this
     server and opts them out. It asks first and cannot be undone. Their
     Discord messages are not touched.

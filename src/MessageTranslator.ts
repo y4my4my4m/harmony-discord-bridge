@@ -255,6 +255,11 @@ export interface DiscordToHarmonyContext {
   /** Discord sticker id → the Harmony server sticker synced from it. */
   harmonyStickerFor?: (discordStickerId: string) => { id: string; url: string; name: string; description: string } | null
   /**
+   * Whether a Discord user is opted out of the bridge. A mention of one is written as the text
+   * the author's message shows, with no id or username.
+   */
+  isOptedOut?: (discordUserId: string) => boolean
+  /**
    * History import: nothing in the result names a Harmony member or role. A plain `@name` stays
    * text with no member lookup, and @everyone, @here and role pings are written as text.
    */
@@ -625,7 +630,9 @@ export class MessageTranslator {
         const id = match[4]
         const member = msg.guild?.members?.cache?.get(id)
         const user = msg.mentions?.users?.get(id) ?? member?.user
-        if (user) {
+        if (user && ctx.isOptedOut?.(id)) {
+          parts.push({ type: 'text', text: `@${member?.displayName || user.globalName || user.username}`, literal: true })
+        } else if (user) {
           parts.push({
             type: 'mention',
             userId: id,

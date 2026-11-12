@@ -178,6 +178,47 @@ describe('live relay of opted-out Discord users', () => {
   })
 })
 
+describe('a mention of an opted-out member in the message of another member', () => {
+  const mentioning = () => discordMessage({
+    author: { id: '222', bot: false, username: 'alice', discriminator: '0', globalName: null, displayAvatarURL: () => 'https://cdn.example/a.png' },
+    content: 'thanks <@111> for the help',
+    mentions: {
+      users: new Collection([['111', { id: '111', username: 'bobby99', globalName: 'Bob' }]]),
+      roles: new Collection(), channels: new Collection(), repliedUser: null,
+    },
+  })
+
+  it('reaches Harmony as the text the message shows, without their id or username', async () => {
+    const { rt, h } = setup()
+    rt.optOuts.add('111')
+    await rt.onDiscordMessage(mentioning())
+    const parts = h.sendMessage.mock.calls[0][1] as any[]
+    expect(parts.some(p => p.type === 'mention')).toBe(false)
+    expect(parts.map(p => p.text).join('')).toBe('thanks @Bob for the help')
+    expect(JSON.stringify(parts)).not.toContain('111')
+    expect(JSON.stringify(parts)).not.toContain('bobby99')
+  })
+
+  it('is a mention part for a member who is not opted out', async () => {
+    const { rt, h } = setup()
+    await rt.onDiscordMessage(mentioning())
+    const parts = h.sendMessage.mock.calls[0][1] as any[]
+    expect(parts.find(p => p.type === 'mention')).toMatchObject({ userId: '111', username: 'bobby99' })
+  })
+
+  it('is text in an edit and in a history import row too', async () => {
+    const { rt, h } = setup()
+    rt.optOuts.add('111')
+    rt.discordToHarmonyMessages.set('dm-1', 'hm-1')
+    await rt.onDiscordMessageUpdate(mentioning())
+    expect(JSON.stringify(h.editMessage.mock.calls[0][1])).not.toContain('bobby99')
+
+    const row = await rt.translateForImport({ ...mentioning(), type: 0, createdAt: new Date(0), editedAt: null }, { id: '222', displayName: 'Alice', displayAvatarURL: () => 'https://cdn.example/m.png' })
+    expect(JSON.stringify(row.content)).not.toContain('111')
+    expect(JSON.stringify(row.content)).toContain('@Bob')
+  })
+})
+
 describe('/mention by an opted-out Discord user', () => {
   function mention(rt: any) {
     const interaction: any = {

@@ -1786,6 +1786,7 @@ export class BridgeRuntime {
   private discordToHarmonyContext(serverId?: string, forNewMessage = false, nativeStickers = true): DiscordToHarmonyContext {
     return {
       harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
+      isOptedOut: discordUserId => this.optOuts.has(discordUserId),
       // The message's own server only; retired rows answer only for an edit, which keeps its sticker part.
       harmonyStickerFor: serverId && nativeStickers
         ? discordStickerId => {

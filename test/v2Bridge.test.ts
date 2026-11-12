@@ -430,12 +430,28 @@ describe('V2Bridge history import', () => {
     await b.start()
     await vi.advanceTimersByTimeAsync(50)
     expect(g.calls).toEqual(['GET /imports'])
-    b.kickImports()
-    await vi.advanceTimersByTimeAsync(50)
+    // Three poll intervals pass without a request.
+    await vi.advanceTimersByTimeAsync(3 * 3_600_000)
     expect(g.calls).toEqual(['GET /imports'])
 
     g.control.refuse = null
     runtimes[0].harmony.emit('ready', {})
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports', 'GET /imports'])
+    await b.stop()
+  })
+
+  it('polls again after a refusal when the Discord command queued a job', async () => {
+    const g = importGateway(false)
+    g.control.refuse = { status: 403, body: { code: 'import_disabled', reason: 'instance_off' } }
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes)
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports'])
+
+    g.control.refuse = null
+    runtimes[0].opts.hooks!.kickImports!()
     await vi.advanceTimersByTimeAsync(50)
     expect(g.calls).toEqual(['GET /imports', 'GET /imports'])
     await b.stop()

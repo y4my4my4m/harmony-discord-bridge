@@ -37,13 +37,13 @@ export interface RuntimeLike {
   translateForImport?: BridgeRuntime['translateForImport']
   threadStarterForImport?: BridgeRuntime['threadStarterForImport']
   forgetStickerLink?: BridgeRuntime['forgetStickerLink']
-  /** Opted-out Discord users; the orchestrator keeps it in step with Harmony. */
+  /** Opted-out Discord users, kept in step with Harmony's list. */
   optOuts?: OptOutList
 }
 
 /**
- * History import wiring. Only a self-run bridge is given it: a hosted bridge and the instance
- * bot never import, and Harmony refuses them (`history_import.reason: 'bridge_mode'`).
+ * History import wiring, for a self-run bridge. A hosted bridge and the instance bot never
+ * import, and Harmony refuses them (`history_import.reason: 'bridge_mode'`).
  */
 export interface V2ImportOptions {
   slots: ImportSlots
@@ -174,8 +174,12 @@ export class V2Bridge {
     await runtime?.stop()
   }
 
-  /** Polls for import jobs now; no-op while import is off for this bridge. */
+  /**
+   * Polls for import jobs now. A scheduler that disarmed itself on a refusal is armed again
+   * first. No-op while the configuration has import off.
+   */
   kickImports(): void {
+    this.syncImports()
     this.scheduler?.kick()
   }
 

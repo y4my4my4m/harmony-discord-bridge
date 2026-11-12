@@ -72,10 +72,12 @@ const text = (reply: { mock: { calls: any[][] } }) => reply.mock.calls[0][0].con
 const edited = (t: { editReply: { mock: { calls: any[][] } } }) => t.editReply.mock.calls[0][0].content as string
 
 describe('/bridge import-history', () => {
-  it('is registered for v2 only', () => {
-    const subs = (m: 'v1' | 'v2') => buildCommands(m).find(c => c.name === 'bridge')!.options!.map((o: any) => o.name)
+  it('is registered for v2 only, and only where import is available', () => {
+    const features = { soundSync: false, emojiSync: false, stickerSync: false, historyImport: true, privacy: false }
+    const subs = (m: 'v1' | 'v2', f = features) => buildCommands(m, f).find(c => c.name === 'bridge')!.options!.map((o: any) => o.name)
     expect(subs('v2')).toContain('import-history')
     expect(subs('v1')).not.toContain('import-history')
+    expect(subs('v2', { ...features, historyImport: false })).not.toContain('import-history')
   })
 
   it('refuses non-admins', async () => {

@@ -36,6 +36,18 @@ export class HarmonyHttpError extends Error {
   }
 }
 
+/**
+ * Feature names a gateway lists in READY and GET /users/@me (Harmony 1.9.7). A gateway that
+ * omits a name, or the list, answers 404 on that feature's routes.
+ */
+export const CAPABILITY = {
+  soundSync: 'bridge_sound_sync',
+  emojiSync: 'bridge_emoji_sync',
+  stickerSync: 'bridge_sticker_sync',
+  historyImport: 'bridge_history_import',
+  privacy: 'bridge_privacy',
+} as const
+
 /** A relay Harmony's AutoMod refused (403 `{code: "AUTOMOD_BLOCKED"}`); final, not retried. */
 export function isAutomodBlocked(err: unknown): boolean {
   return err instanceof HarmonyHttpError && err.status === 403 && err.code === 'AUTOMOD_BLOCKED'
@@ -147,6 +159,8 @@ export class HarmonyClient extends EventEmitter {
   private readonly authBackoff: Backoff
   private ready = false
   private authRejected = false
+  /** Null until READY or GET /users/@me answered. */
+  private capabilities: ReadonlySet<string> | null = null
   lastClose: { code: number; reason: string } | null = null
 
   constructor(
@@ -174,6 +188,26 @@ export class HarmonyClient extends EventEmitter {
   /** The gateway or REST rejected the token since the last READY. */
   isAuthRejected(): boolean {
     return this.authRejected
+  }
+
+  /** Whether the gateway lists the feature. False while the list is unknown. */
+  hasCapability(name: string): boolean {
+    return this.capabilities?.has(name) ?? false
+  }
+
+  capabilitiesKnown(): boolean {
+    return this.capabilities !== null
+  }
+
+  /** A missing list is a gateway that predates capabilities: it has none. */
+  private setCapabilities(raw: unknown): void {
+    this.capabilities = new Set(Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : [])
+  }
+
+  /** Reads the capabilities from GET /users/@me, for use before READY. */
+  async loadCapabilities(): Promise<void> {
+    const body = await this.getJson<{ capabilities?: unknown }>('/users/@me', 'Failed to fetch the bot user')
+    this.setCapabilities(body?.capabilities)
   }
 
   async connect() {
@@ -277,6 +311,7 @@ export class HarmonyClient extends EventEmitter {
         this.reconnectBackoff.reset()
       }
       this.authBackoff.reset()
+      this.setCapabilities(payload.d.capabilities)
       this.log.info(`Harmony bot ready: ${payload.d.bot?.username}`)
       this.emit('ready', payload.d)
       this.emit('connectionState', true)

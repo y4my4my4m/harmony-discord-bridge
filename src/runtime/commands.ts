@@ -49,12 +49,25 @@ function addUserOptions(builder: SlashCommandBuilder) {
   return builder
 }
 
+/** Commands that exist only where the gateway lists the capability (Harmony 1.9.7). */
+export interface CommandFeatures {
+  soundSync: boolean
+  emojiSync: boolean
+  stickerSync: boolean
+  /** The capability, a bridge that may import, and the instance setting on. */
+  historyImport: boolean
+  privacy: boolean
+}
+
+export const NO_FEATURES: CommandFeatures = { soundSync: false, emojiSync: false, stickerSync: false, historyImport: false, privacy: false }
+
 /**
  * `/mention`, `/m`, `/bridge`. `/bridge` is visible to Administrators only
  * and the handler checks the permission again. v1 keeps its original
  * `link` options; v2 links by Harmony channel autocomplete and direction.
+ * A subcommand of a gateway feature is offered only with that feature.
  */
-export function buildCommands(mode: 'v1' | 'v2') {
+export function buildCommands(mode: 'v1' | 'v2', features: CommandFeatures = NO_FEATURES) {
   const bridgeCommand = new SlashCommandBuilder()
     .setName('bridge')
     .setDescription('Manage the Harmony bridge for this server')
@@ -125,7 +138,7 @@ export function buildCommands(mode: 'v1' | 'v2') {
         .setDescription('Copy this server\'s custom emojis into the Harmony server (rerun adds only new ones)')
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('List what would be imported without changes').setRequired(false)))
-    bridgeCommand.addSubcommand(sub =>
+    if (features.emojiSync) bridgeCommand.addSubcommand(sub =>
       sub
         .setName('sync-emojis')
         .setDescription('Copy this server\'s emoji to Harmony and keep them up to date')
@@ -136,7 +149,7 @@ export function buildCommands(mode: 'v1' | 'v2') {
             .addChoices(...SYNC_MODE_CHOICES))
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
-    bridgeCommand.addSubcommand(sub =>
+    if (features.stickerSync) bridgeCommand.addSubcommand(sub =>
       sub
         .setName('sync-stickers')
         .setDescription('Copy this server\'s stickers to Harmony and keep them up to date')
@@ -147,7 +160,7 @@ export function buildCommands(mode: 'v1' | 'v2') {
             .addChoices(...SYNC_MODE_CHOICES))
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
-    bridgeCommand.addSubcommand(sub =>
+    if (features.soundSync) bridgeCommand.addSubcommand(sub =>
       sub
         .setName('sync-sounds')
         .setDescription('Copy this server\'s soundboard to Harmony and keep it up to date')
@@ -158,7 +171,7 @@ export function buildCommands(mode: 'v1' | 'v2') {
             .addChoices(...SYNC_MODE_CHOICES))
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
-    bridgeCommand.addSubcommand(sub =>
+    if (features.historyImport) bridgeCommand.addSubcommand(sub =>
       sub
         .setName('import-history')
         .setDescription('Import old Discord messages into Harmony (start, check or cancel)')
@@ -192,13 +205,12 @@ export function buildCommands(mode: 'v1' | 'v2') {
   ].map(cmd => cmd.toJSON())
 }
 
-export async function registerSlashCommands(rt: BridgeRuntime, client: DiscordClient, guildId: string) {
+export async function registerSlashCommands(rt: BridgeRuntime, client: DiscordClient, guildId: string, features: CommandFeatures = NO_FEATURES) {
   const applicationId = client.application?.id ?? client.user?.id
   if (!applicationId) throw new Error('Discord client has no application id yet')
-  await client.rest.put(Routes.applicationGuildCommands(applicationId, guildId), {
-    body: buildCommands(rt.mode),
-  })
-  rt.log.info(`Slash commands registered in guild ${guildId}: /mention, /m, /bridge`)
+  const commands = buildCommands(rt.mode, features)
+  await client.rest.put(Routes.applicationGuildCommands(applicationId, guildId), { body: commands })
+  rt.log.info(`Slash commands registered in guild ${guildId}: ${commands.map(c => `/${c.name}`).join(', ')}`)
 }
 
 // =============================================================================

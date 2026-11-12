@@ -24,7 +24,7 @@ import {
   type PartialMessage,
   type AnyThreadChannel,
 } from 'discord.js'
-import { HarmonyClient, HarmonyHttpError, isAutomodBlocked } from '../HarmonyClient.js'
+import { CAPABILITY, HarmonyClient, HarmonyHttpError, isAutomodBlocked } from '../HarmonyClient.js'
 import {
   MessageTranslator,
   collectHarmonyCustomEmoji,
@@ -83,7 +83,7 @@ import {
   samePresence,
   type MappedPresence,
 } from './presenceDeltas.js'
-import { handleInteraction, registerSlashCommands } from './commands.js'
+import { handleInteraction, registerSlashCommands, type CommandFeatures } from './commands.js'
 import { DiscordAuthorLimiter } from './antiSpam.js'
 import { AppEmojiStore, loadEmojiImage, type AppEmoji, type AppEmojiIO } from './appEmojis.js'
 import {
@@ -151,8 +151,12 @@ export interface RuntimeHooks {
   discordTokenHint?: string
   /** Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler runs. */
   kickImports?: () => void
-  /** History import routes for `/bridge import-history`. Absent when the bridge cannot import. */
+  /** History import routes for `/bridge import-history`. Absent on a bridge that may not import. */
   importApi?: Pick<BridgeApi, 'listImports' | 'startImports' | 'cancelImport'>
+  /** `history_import.enabled` of the current configuration. */
+  importEnabled?: () => boolean
+  /** Privacy routes for `/bridge-privacy`. Absent on a v1 bridge. */
+  privacyApi?: Pick<BridgeApi, 'getOptOut' | 'putOptOut' | 'deleteOptOut' | 'erase'>
 }
 
 export interface BridgeRuntimeOptions {
@@ -304,7 +308,8 @@ export class BridgeRuntime {
   private discordStartupDone = false
   /** What the member list was last fetched with on this client: 'members', 'presence', or null. */
   private memberListKey: string | null = null
-  private readonly registeredCommandGuilds = new Set<string>()
+  /** Guild id → the feature set its slash commands were last registered with. */
+  private readonly registeredCommands = new Map<string, string>()
   private stopped = false
 
   readonly discordToHarmonyMessages = new BoundedMap<string, string>(MESSAGE_MAPPING_CAP)
@@ -602,7 +607,7 @@ export class BridgeRuntime {
     this.discord = client
     this.discordStartupDone = false
     this.memberListKey = null
-    this.registeredCommandGuilds.clear()
+    this.registeredCommands.clear()
   }
 
   /** The client is going away; state bound to it is dropped. */
@@ -843,14 +848,48 @@ export class BridgeRuntime {
     return Array.from(client.guilds.cache.keys()).slice(0, 25)
   }
 
+  /** The gateway features this bridge offers commands for. All false on a v1 bridge. */
+  commandFeatures(): CommandFeatures {
+    const has = (name: string) => this.mode === 'v2' && this.harmony.hasCapability(name)
+    return {
+      soundSync: has(CAPABILITY.soundSync),
+      emojiSync: has(CAPABILITY.emojiSync),
+      stickerSync: has(CAPABILITY.stickerSync),
+      historyImport: has(CAPABILITY.historyImport) && !!this.hooks.importApi && this.hooks.importEnabled?.() === true,
+      privacy: has(CAPABILITY.privacy) && !!this.hooks.privacyApi,
+    }
+  }
+
+  /** GET /users/@me in flight, for a Discord client that is ready before Harmony's READY. */
+  private capabilityLoad: Promise<void> | null = null
+
+  /**
+   * Registers a guild's commands, again when the feature set changed since. While the gateway's
+   * capabilities are unknown the base set is registered at once; the read, or READY, adds the rest.
+   */
   private async registerCommandsFor(client: DiscordClient, guildId: string) {
-    if (this.registeredCommandGuilds.has(guildId)) return
+    if (this.mode === 'v2' && !this.harmony.capabilitiesKnown() && !this.capabilityLoad) {
+      this.capabilityLoad = this.harmony.loadCapabilities()
+        .then(() => this.refreshCommands())
+        .catch(err => this.log.debug(`Gateway capabilities not read: ${errorText(err)}`))
+        .finally(() => { this.capabilityLoad = null })
+    }
+    const features = this.commandFeatures()
+    const key = JSON.stringify(features)
+    if (this.registeredCommands.get(guildId) === key) return
     try {
-      await registerSlashCommands(this, client, guildId)
-      this.registeredCommandGuilds.add(guildId)
+      await registerSlashCommands(this, client, guildId, features)
+      this.registeredCommands.set(guildId, key)
     } catch (err) {
       this.log.error(`Slash command registration failed for guild ${guildId}: ${errorText(err)}`)
     }
+  }
+
+  /** Registers commands again wherever the feature set changed: gateway capabilities, the import switch. */
+  async refreshCommands(): Promise<void> {
+    const client = this.discord
+    if (!client || !this.discordReady || this.stopped) return
+    for (const guildId of this.commandGuildIds(client)) await this.registerCommandsFor(client, guildId)
   }
 
   /**
@@ -907,6 +946,7 @@ export class BridgeRuntime {
       ?? (change.pairsChanged === false ? [] : this.dir.getAllMappings().map(m => m.harmony))
     await this.restoreMappingsFor(added, 50)
     this.registerBridgeDataWithGateway()
+    await this.refreshCommands()
   }
 
   private async restoreMappingsFor(harmonyChannelIds: string[], limit: number) {
@@ -2316,6 +2356,8 @@ export class BridgeRuntime {
 
     this.registerBridgeDataWithGateway({ immediate: true })
     this.notify('harmony:ready')
+    // A gateway upgrade between connections changes the capabilities.
+    await this.refreshCommands()
   }
 
   /**
@@ -2723,10 +2765,20 @@ export class BridgeRuntime {
    * image; `discord:name:id` maps back to the Discord emoji; unicode passes
    * through. A bare name without an emoji row matches a guild emoji by name.
    */
-  /** Harmony server of a bridged guild, with its emoji links loaded. */
+  /** Sticker links are read only from a gateway with the sticker routes, by the server's own bridge. */
+  private stickerLinksAvailable(): boolean {
+    return this.mode === 'v2' && this.harmony.hasCapability(CAPABILITY.stickerSync)
+  }
+
+  /** Harmony server of a bridged guild, with its emoji and sticker links loaded. */
   private async emojiServerFor(guildId: string | null | undefined): Promise<string | undefined> {
     const serverId = guildId ? this.dir.getBridgeForDiscordGuild(guildId)?.harmonyServerId : undefined
-    if (serverId) await Promise.all([this.emojiLinks.ensure(serverId), this.stickerLinks.ensure(serverId)])
+    if (serverId) {
+      await Promise.all([
+        this.emojiLinks.ensure(serverId),
+        ...(this.stickerLinksAvailable() ? [this.stickerLinks.ensure(serverId)] : []),
+      ])
+    }
     return serverId
   }
 
@@ -2734,7 +2786,7 @@ export class BridgeRuntime {
     for (const bridge of this.dir.getBridges()) {
       if (bridge.harmonyServerId) {
         await this.emojiLinks.ensure(bridge.harmonyServerId)
-        await this.stickerLinks.ensure(bridge.harmonyServerId)
+        if (this.stickerLinksAvailable()) await this.stickerLinks.ensure(bridge.harmonyServerId)
       }
     }
   }

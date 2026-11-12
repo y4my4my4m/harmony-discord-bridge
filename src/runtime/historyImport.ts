@@ -275,15 +275,15 @@ export class HistoryImporter {
       await this.checkAbort(run)
       const { threads, next, skippedPrivate: privateOnPage } = await this.discordCall(run, () => this.deps.listThreads(channelId, at))
       skippedPrivate += privateOnPage ?? 0
-      const todo = threads.filter(t => !done.has(t.id))
+      const remaining = threads.filter(t => !done.has(t.id))
       // A lower bound until the last page is listed.
-      const total = threadsDone + todo.length
+      const total = threadsDone + remaining.length
       if (job.threads_total !== total && (!next || total > (job.threads_total ?? 0))) {
         await this.patch(run, { threads_total: total })
         job.threads_total = total
       }
 
-      for (const [i, thread] of todo.entries()) {
+      for (const [i, thread] of remaining.entries()) {
         try {
           await this.importThread(run, thread)
         } catch (error) {
@@ -293,7 +293,7 @@ export class HistoryImporter {
         }
         threadsDone++
         done.add(thread.id)
-        const progress: ThreadProgress = i === todo.length - 1 && next ? { at: next, done: [] } : { at, done: [...done] }
+        const progress: ThreadProgress = i === remaining.length - 1 && next ? { at: next, done: [] } : { at, done: [...done] }
         await this.patch(run, {
           threads_done: threadsDone,
           thread_cursor: { ...progress },

@@ -362,7 +362,7 @@ export class BridgeRuntime {
   /** Harmony server emoji imported from Discord; one emoji on both sides. */
   readonly emojiLinks = new ServerEmojiLinks(serverId => this.harmony.getServerEmojis(serverId))
   readonly stickerLinks = new ServerStickerLinks(id => this.harmony.getStickerSyncState(id).then(s => s.stickers))
-  /** Discord users opted out of this bridge; read from Harmony by the orchestrator. */
+  /** Discord users opted out of this bridge. Nothing of theirs is sent to Harmony. */
   readonly optOuts = new OptOutList()
 
   private droppedMessages = 0
@@ -1994,11 +1994,10 @@ export class BridgeRuntime {
   /**
    * A Discord message as a history-import row: the parts and `discord_user` of live relay,
    * without relay's reply resolution (the server links replies by Discord id), thread lookup or
-   * anti-spam. `member` is the author's current guild membership, which the importer resolved;
-   * a message without one is never passed in. Differences from live relay: no part names a
-   * Harmony member or role (context `quiet`), a retired sticker link is not used, and a
-   * forward's reference is not a reply. Null for bots, webhooks, message types other than
-   * Default/Reply, and empty translations.
+   * anti-spam. `member` is the author's current guild membership. Differences from live relay:
+   * no part names a Harmony member or role (context `quiet`), a retired sticker link is not
+   * used, and a forward's reference is not a reply. Null for bots, webhooks, message types
+   * other than Default/Reply, and empty translations.
    */
   async translateForImport(
     msg: DiscordMessage,

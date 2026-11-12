@@ -64,7 +64,7 @@ async function main() {
     if (plan.kind === 'v1') {
       launched = await runV1(plan.configPath, log)
     } else if (plan.kind === 'self') {
-      // BRIDGE_IMPORT_* is read by the one mode that imports.
+      // Only self-run mode imports: a bad BRIDGE_IMPORT_* value is fatal here and nowhere else.
       const importSettings = parseImportSettings(process.env)
       if (!importSettings.ok) fatal(importSettings.message)
       launched = await runSelf({

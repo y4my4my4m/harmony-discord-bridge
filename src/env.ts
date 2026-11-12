@@ -127,7 +127,7 @@ export function planLaunch(env: NodeJS.ProcessEnv, legacyConfigPath: string | nu
   return { kind: 'error', message: NOT_CONFIGURED }
 }
 
-/** History import tuning (BRIDGE_IMPORT_*), read by a self-run bridge. */
+/** History import tuning (BRIDGE_IMPORT_*). Self-run mode only. */
 export interface ImportSettings {
   /** How often the bridge asks Harmony for import jobs while import is enabled. */
   pollMs: number

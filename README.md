@@ -410,8 +410,10 @@ Other messages:
 - **Members decide about their own messages** (Harmony 1.9.7+). Every member
   of the Discord server can run `/bridge-privacy`; only they see the answer.
   - `opt-out`: their messages, edits and reactions in this server are no longer
-    sent to Harmony, and a history import skips them. Deleting a message on
-    Discord still deletes its Harmony copy. Messages already on Harmony stay.
+    sent to Harmony, and a history import skips them. Opting out also removes
+    them from the Harmony server's Discord member list, and their presence is
+    no longer sent. Deleting a message on Discord still deletes its Harmony
+    copy. Messages already on Harmony stay.
   - `erase`: deletes their bridged and imported messages on Harmony for this
     server and opts them out. It asks first and cannot be undone. Their
     Discord messages are not touched.

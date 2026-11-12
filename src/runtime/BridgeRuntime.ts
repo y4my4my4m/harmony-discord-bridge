@@ -84,6 +84,7 @@ import {
   mapDiscordPresence,
   samePresence,
   type MappedPresence,
+  type PresenceDelta,
 } from './presenceDeltas.js'
 import { handleInteraction, registerSlashCommands, type CommandFeatures } from './commands.js'
 import { DiscordAuthorLimiter } from './antiSpam.js'
@@ -363,7 +364,7 @@ export class BridgeRuntime {
   readonly emojiLinks = new ServerEmojiLinks(serverId => this.harmony.getServerEmojis(serverId))
   readonly stickerLinks = new ServerStickerLinks(id => this.harmony.getStickerSyncState(id).then(s => s.stickers))
   /** Discord users opted out of this bridge. Nothing of theirs is sent to Harmony. */
-  readonly optOuts = new OptOutList()
+  readonly optOuts = new OptOutList(() => this.onOptOutsChanged())
 
   private droppedMessages = 0
   /** Discord messages Harmony's AutoMod refused since start. */
@@ -404,7 +405,7 @@ export class BridgeRuntime {
     this.permissionSyncStore = new PermissionSyncStore(opts.permissionStorePath)
     this.permissionSync = new PermissionSync(this.harmony, this.dir, this.permissionSyncStore, this.log)
     this.presenceDeltas = new PresenceDeltaQueue(
-      updates => this.harmony.sendPresenceUpdates(updates),
+      updates => this.sendPresence(updates),
       Math.max(PRESENCE_MIN_INTERVAL_MS, opts.presenceFlushMs ?? PRESENCE_MIN_INTERVAL_MS),
     )
     this.media = new OutboundMedia(this.harmonyBaseUrl.href, opts.media ?? mediaOptionsFromEnv(process.env, this.log), opts.fetchImpl)
@@ -1032,6 +1033,24 @@ export class BridgeRuntime {
     this.presenceDeltas.push({ id: userId, ...next })
   }
 
+  /**
+   * BRIDGE_PRESENCE_UPDATE (op 7): the one place presence is sent. Entries of opted-out members
+   * are dropped here, also a delta queued before its member opted out.
+   */
+  private sendPresence(updates: PresenceDelta[]): boolean {
+    const allowed = updates.filter(u => !this.optOuts.has(u.id))
+    return allowed.length === 0 ? true : this.harmony.sendPresenceUpdates(allowed)
+  }
+
+  /**
+   * The opt-out list changed. The gateway has no frame that removes one member: op 6 replaces
+   * the whole registration, now without the members who opted out and with those who opted in.
+   */
+  private onOptOutsChanged() {
+    if (this.stopped || !this.settings().syncMemberList) return
+    this.registerBridgeDataWithGateway()
+  }
+
   private cacheMember(member: GuildMember) {
     const guildId = member.guild.id
     const { harmonyRoleIds, roles } = this.mapMemberRoles(member)
@@ -1195,10 +1214,15 @@ export class BridgeRuntime {
     this.sendRegistration()
   }
 
+  /**
+   * REGISTER_BRIDGE_DATA (op 6): the one frame that carries the member list. Joins, leaves and
+   * profile changes all resend it whole. Opted-out members are not in it.
+   */
   private sendRegistration() {
     const syncMembers = this.settings().syncMemberList
+    const listed = !syncMembers ? [] : Array.from(this.discordMemberDetails.values()).filter(m => !this.optOuts.has(m.id))
     const channels = this.dir.getBridges().flatMap(bridge => {
-      const members = !syncMembers ? [] : Array.from(this.discordMemberDetails.values())
+      const members = listed
         .filter(m => m.guildId === bridge.discordGuildId)
         .map(m => ({
           id: m.id,
@@ -1223,8 +1247,7 @@ export class BridgeRuntime {
       }))
     })
 
-    const totalMembers = syncMembers ? this.discordMemberDetails.size : 0
-    const summary = `Registering bridge data: ${channels.length} channel(s), ${totalMembers} Discord member(s)`
+    const summary = `Registering bridge data: ${channels.length} channel(s), ${listed.length} Discord member(s)`
     if (summary !== this.lastRegistrationSummary) {
       this.lastRegistrationSummary = summary
       this.log.info(summary)

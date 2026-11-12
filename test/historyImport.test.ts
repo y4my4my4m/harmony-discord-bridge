@@ -70,7 +70,7 @@ function setup(opts: {
     updateImport: vi.fn(async (_id: string, patch: any) => { patches.push(patch); return job() }),
     postImportMessages: vi.fn(async (_id: string, messages: ImportMessage[]) => {
       posts.push(messages)
-      return { inserted: messages.map(m => ({ discord_message_id: m.discord_message_id, id: `hm-${m.discord_message_id}` })), skipped: [] as string[] }
+      return { inserted: messages.map(m => ({ discord_message_id: m.discord_message_id, id: `hm-${m.discord_message_id}` })), skipped: [] as string[], rejected: [] }
     }),
     importThread: vi.fn(async (_id: string, _body: any) => 'thread-1'),
     linkImportReplies: vi.fn(async () => 0),
@@ -186,7 +186,7 @@ describe('HistoryImporter messages phase', () => {
     api.postImportMessages.mockImplementationOnce(async (_id: string, messages: ImportMessage[]) => {
       posts.push(messages)
       ac.abort()
-      return { inserted: [], skipped: [] }
+      return { inserted: [], skipped: [], rejected: [] }
     })
     expect(await importer.run(j, ac.signal)).toBe('paused')
     expect(posts).toHaveLength(1)

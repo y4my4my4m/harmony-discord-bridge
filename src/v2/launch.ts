@@ -5,7 +5,9 @@ import { CredentialsError, obtainCredentials, type StoredCredentials } from './c
 import { EndpointError, endpointsFor, probeEndpoints, type HarmonyEndpoints } from './endpoints.js'
 import { HostRunner } from './HostRunner.js'
 import { InstanceHost } from './InstanceHost.js'
-import { V2Bridge } from './V2Bridge.js'
+import { V2Bridge, type V2ImportOptions } from './V2Bridge.js'
+import { DEFAULT_IMPORT_SETTINGS, type ImportSettings } from '../env.js'
+import { ImportSlots } from '../runtime/importScheduler.js'
 import { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
 import { Backoff, sleep, type FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -53,6 +55,11 @@ async function untilReachable<T>(
   }
 }
 
+/** History import wiring of a self-run bridge. One bridge runs one job at a time. */
+function importOptions(settings: ImportSettings = DEFAULT_IMPORT_SETTINGS): V2ImportOptions {
+  return { slots: new ImportSlots(1), settings }
+}
+
 function ensureDataDir(dataDir: string) {
   try {
     mkdirSync(dataDir, { recursive: true })
@@ -75,6 +82,7 @@ export async function runSelf(opts: {
   log: Logger
   version: string
   ignoredLegacyConfig: string | null
+  import?: ImportSettings
   fetchImpl?: FetchLike
 }): Promise<Launched> {
   const { log } = opts
@@ -138,6 +146,7 @@ export async function runSelf(opts: {
     log,
     version: opts.version,
     authHint: SELF_AUTH_HINT,
+    import: importOptions(opts.import),
     fetchImpl: opts.fetchImpl,
   })
   await bridge.start()
@@ -159,6 +168,7 @@ const safeDirName = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_')
 /**
  * Host mode: every own-token hosted bridge (one Discord client each) and
  * every instance bot bridge (one shared Discord client), reconciled every 60 s.
+ * Neither kind imports history; no importer or scheduler is built for them.
  */
 export async function runHost(opts: {
   harmonyUrl: string

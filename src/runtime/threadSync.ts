@@ -20,7 +20,25 @@ export interface ThreadAnchor {
   remove(): Promise<unknown>
 }
 
-type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId'>
+type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId' | 'type'>
+
+/**
+ * Whether threads can exist in a Discord channel. Voice and stage channels have a text chat
+ * but no thread manager.
+ */
+export function supportsThreads(channel: { type?: number; threads?: unknown } | null | undefined): boolean {
+  if (!channel) return false
+  if (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice) return false
+  return channel.threads !== undefined && channel.threads !== null
+}
+
+/**
+ * Whether a Discord channel is a private thread. Harmony has no private threads (every thread
+ * is visible to the whole channel), so these never cross the bridge in either direction.
+ */
+export function isPrivateThread(channel: { type?: number } | null | undefined): boolean {
+  return channel?.type === ChannelType.PrivateThread
+}
 
 export interface ThreadSyncDeps {
   harmony: Pick<HarmonyClient, 'createThread' | 'lookupThreadByDiscordId' | 'getThread' | 'pairThread'>
@@ -74,6 +92,7 @@ export class ThreadSync {
 
   /** The Harmony thread for a Discord thread whose parent is paired with `harmonyChannelId`. */
   async harmonyThreadFor(thread: DiscordThreadLike, harmonyChannelId: string): Promise<string | null> {
+    if (isPrivateThread(thread)) return null
     const cached = this.toHarmony.get(thread.id)
     if (cached) return cached
     return this.once(`d:${thread.id}`, async () => {
@@ -109,6 +128,10 @@ export class ThreadSync {
     create = true,
     author: ThreadAuthor | null = null,
   ): Promise<AnyThreadChannel | null> {
+    if (!supportsThreads(parent)) {
+      this.deps.log.debug(`Harmony thread ${harmonyThreadId}: Discord channel ${parent?.id} has no threads; not bridged`)
+      return null
+    }
     const id = this.toDiscord.get(harmonyThreadId) ?? await this.once(`h:${harmonyThreadId}:${create}`, async () => {
       const info = await this.deps.harmony.getThread(harmonyThreadId)
       if (!info) return null
@@ -134,6 +157,10 @@ export class ThreadSync {
     const thread = await parent.threads.fetch(id).catch(() => null)
     if (!thread) {
       this.deps.log.warn(`Discord thread ${id} of Harmony thread ${harmonyThreadId} is gone`)
+      return null
+    }
+    if (isPrivateThread(thread)) {
+      this.deps.log.debug(`Discord thread ${id} of Harmony thread ${harmonyThreadId} is private; not bridged`)
       return null
     }
     if (thread.archived && !thread.locked) await thread.setArchived(false).catch(() => {})

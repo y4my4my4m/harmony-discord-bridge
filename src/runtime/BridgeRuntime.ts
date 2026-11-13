@@ -24,7 +24,7 @@ import {
   type PartialMessage,
   type AnyThreadChannel,
 } from 'discord.js'
-import { HarmonyClient, HarmonyHttpError, isAutomodBlocked } from '../HarmonyClient.js'
+import { CAPABILITY, HarmonyClient, HarmonyHttpError, isAuthorOptedOut, isAutomodBlocked, isDiscordMessageTaken } from '../HarmonyClient.js'
 import {
   MessageTranslator,
   collectHarmonyCustomEmoji,
@@ -37,7 +37,7 @@ import {
 import { PermissionSync } from '../PermissionSync.js'
 import { PermissionSyncStore } from '../PermissionSyncStore.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
-import { ThreadSync, type ThreadAnchor, type ThreadAuthor } from './threadSync.js'
+import { ThreadSync, isPrivateThread, type ThreadAnchor, type ThreadAuthor } from './threadSync.js'
 import {
   buildDiscordJumpLink,
   formatHarmonyReplyForDiscord,
@@ -62,9 +62,13 @@ import { isPublicHttpsUrl } from '../utils/fetchCapped.js'
 import { loadInstanceIcon } from '../utils/instanceIcon.js'
 import { ReactionLedger } from '../utils/reactionLedger.js'
 import { ServerEmojiLinks } from './serverEmojiLinks.js'
+import { ServerStickerLinks } from './serverStickerLinks.js'
+import { OptOutList } from './optOuts.js'
+import { isImportableMessage } from './historyImport.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
+import type { BridgeApi, ImportMessage } from '../v2/BridgeApi.js'
 import type { DiscordGuildView, PrivilegedIntent, Problem } from '../problems.js'
 import { collectGuildViews } from '../v2/selfCheck.js'
 import type { PairDirectory, PairWriter } from './PairDirectory.js'
@@ -80,8 +84,9 @@ import {
   mapDiscordPresence,
   samePresence,
   type MappedPresence,
+  type PresenceDelta,
 } from './presenceDeltas.js'
-import { handleInteraction, registerSlashCommands } from './commands.js'
+import { handleInteraction, registerSlashCommands, type CommandFeatures } from './commands.js'
 import { DiscordAuthorLimiter } from './antiSpam.js'
 import { AppEmojiStore, loadEmojiImage, type AppEmoji, type AppEmojiIO } from './appEmojis.js'
 import {
@@ -147,6 +152,14 @@ export interface RuntimeHooks {
   harmonyAuthHint?: string
   /** Log line explaining a Discord token rejection. */
   discordTokenHint?: string
+  /** Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler runs. */
+  kickImports?: () => void
+  /** History import routes for `/bridge import-history`. Absent on a bridge that may not import. */
+  importApi?: Pick<BridgeApi, 'listImports' | 'startImports' | 'cancelImport'>
+  /** `history_import.enabled` of the current configuration. */
+  importEnabled?: () => boolean
+  /** Privacy routes for `/bridge-privacy`. Absent on a v1 bridge. */
+  privacyApi?: Pick<BridgeApi, 'getOptOut' | 'putOptOut' | 'deleteOptOut' | 'erase'>
 }
 
 export interface BridgeRuntimeOptions {
@@ -298,7 +311,8 @@ export class BridgeRuntime {
   private discordStartupDone = false
   /** What the member list was last fetched with on this client: 'members', 'presence', or null. */
   private memberListKey: string | null = null
-  private readonly registeredCommandGuilds = new Set<string>()
+  /** Guild id → the feature set its slash commands were last registered with. */
+  private readonly registeredCommands = new Map<string, string>()
   private stopped = false
 
   readonly discordToHarmonyMessages = new BoundedMap<string, string>(MESSAGE_MAPPING_CAP)
@@ -348,6 +362,9 @@ export class BridgeRuntime {
   private readonly reactionLedger = new ReactionLedger()
   /** Harmony server emoji imported from Discord; one emoji on both sides. */
   readonly emojiLinks = new ServerEmojiLinks(serverId => this.harmony.getServerEmojis(serverId))
+  readonly stickerLinks = new ServerStickerLinks(id => this.harmony.getStickerSyncState(id).then(s => s.stickers))
+  /** Discord users opted out of this bridge. Nothing of theirs is sent to Harmony. */
+  readonly optOuts = new OptOutList(() => this.onOptOutsChanged())
 
   private droppedMessages = 0
   /** Discord messages Harmony's AutoMod refused since start. */
@@ -388,7 +405,7 @@ export class BridgeRuntime {
     this.permissionSyncStore = new PermissionSyncStore(opts.permissionStorePath)
     this.permissionSync = new PermissionSync(this.harmony, this.dir, this.permissionSyncStore, this.log)
     this.presenceDeltas = new PresenceDeltaQueue(
-      updates => this.harmony.sendPresenceUpdates(updates),
+      updates => this.sendPresence(updates),
       Math.max(PRESENCE_MIN_INTERVAL_MS, opts.presenceFlushMs ?? PRESENCE_MIN_INTERVAL_MS),
     )
     this.media = new OutboundMedia(this.harmonyBaseUrl.href, opts.media ?? mediaOptionsFromEnv(process.env, this.log), opts.fetchImpl)
@@ -589,7 +606,7 @@ export class BridgeRuntime {
     this.discord = client
     this.discordStartupDone = false
     this.memberListKey = null
-    this.registeredCommandGuilds.clear()
+    this.registeredCommands.clear()
   }
 
   /** The client is going away; state bound to it is dropped. */
@@ -830,14 +847,48 @@ export class BridgeRuntime {
     return Array.from(client.guilds.cache.keys()).slice(0, 25)
   }
 
+  /** The gateway features this bridge offers commands for. All false on a v1 bridge. */
+  commandFeatures(): CommandFeatures {
+    const has = (name: string) => this.mode === 'v2' && this.harmony.hasCapability(name)
+    return {
+      soundSync: has(CAPABILITY.soundSync),
+      emojiSync: has(CAPABILITY.emojiSync),
+      stickerSync: has(CAPABILITY.stickerSync),
+      historyImport: has(CAPABILITY.historyImport) && !!this.hooks.importApi && this.hooks.importEnabled?.() === true,
+      privacy: has(CAPABILITY.privacy) && !!this.hooks.privacyApi,
+    }
+  }
+
+  /** GET /users/@me in flight, for a Discord client that is ready before Harmony's READY. */
+  private capabilityLoad: Promise<void> | null = null
+
+  /**
+   * Registers a guild's commands, again when the feature set changed since. While the gateway's
+   * capabilities are unknown the base set is registered at once; the read, or READY, adds the rest.
+   */
   private async registerCommandsFor(client: DiscordClient, guildId: string) {
-    if (this.registeredCommandGuilds.has(guildId)) return
+    if (this.mode === 'v2' && !this.harmony.capabilitiesKnown() && !this.capabilityLoad) {
+      this.capabilityLoad = this.harmony.loadCapabilities()
+        .then(() => this.refreshCommands())
+        .catch(err => this.log.debug(`Gateway capabilities not read: ${errorText(err)}`))
+        .finally(() => { this.capabilityLoad = null })
+    }
+    const features = this.commandFeatures()
+    const key = JSON.stringify(features)
+    if (this.registeredCommands.get(guildId) === key) return
     try {
-      await registerSlashCommands(this, client, guildId)
-      this.registeredCommandGuilds.add(guildId)
+      await registerSlashCommands(this, client, guildId, features)
+      this.registeredCommands.set(guildId, key)
     } catch (err) {
       this.log.error(`Slash command registration failed for guild ${guildId}: ${errorText(err)}`)
     }
+  }
+
+  /** Registers commands again wherever the feature set changed: gateway capabilities, the import switch. */
+  async refreshCommands(): Promise<void> {
+    const client = this.discord
+    if (!client || !this.discordReady || this.stopped) return
+    for (const guildId of this.commandGuildIds(client)) await this.registerCommandsFor(client, guildId)
   }
 
   /**
@@ -894,6 +945,7 @@ export class BridgeRuntime {
       ?? (change.pairsChanged === false ? [] : this.dir.getAllMappings().map(m => m.harmony))
     await this.restoreMappingsFor(added, 50)
     this.registerBridgeDataWithGateway()
+    await this.refreshCommands()
   }
 
   private async restoreMappingsFor(harmonyChannelIds: string[], limit: number) {
@@ -979,6 +1031,24 @@ export class BridgeRuntime {
     if (samePresence(cached, next)) return
     this.discordMemberDetails.set(userId, { ...cached, ...next })
     this.presenceDeltas.push({ id: userId, ...next })
+  }
+
+  /**
+   * BRIDGE_PRESENCE_UPDATE (op 7): the one place presence is sent. Entries of opted-out members
+   * are dropped here, also a delta queued before its member opted out.
+   */
+  private sendPresence(updates: PresenceDelta[]): boolean {
+    const allowed = updates.filter(u => !this.optOuts.has(u.id))
+    return allowed.length === 0 ? true : this.harmony.sendPresenceUpdates(allowed)
+  }
+
+  /**
+   * The opt-out list changed. The gateway has no frame that removes one member: op 6 replaces
+   * the whole registration, now without the members who opted out and with those who opted in.
+   */
+  private onOptOutsChanged() {
+    if (this.stopped || !this.settings().syncMemberList) return
+    this.registerBridgeDataWithGateway()
   }
 
   private cacheMember(member: GuildMember) {
@@ -1144,10 +1214,15 @@ export class BridgeRuntime {
     this.sendRegistration()
   }
 
+  /**
+   * REGISTER_BRIDGE_DATA (op 6): the one frame that carries the member list. Joins, leaves and
+   * profile changes all resend it whole. Opted-out members are not in it.
+   */
   private sendRegistration() {
     const syncMembers = this.settings().syncMemberList
+    const listed = !syncMembers ? [] : Array.from(this.discordMemberDetails.values()).filter(m => !this.optOuts.has(m.id))
     const channels = this.dir.getBridges().flatMap(bridge => {
-      const members = !syncMembers ? [] : Array.from(this.discordMemberDetails.values())
+      const members = listed
         .filter(m => m.guildId === bridge.discordGuildId)
         .map(m => ({
           id: m.id,
@@ -1172,8 +1247,7 @@ export class BridgeRuntime {
       }))
     })
 
-    const totalMembers = syncMembers ? this.discordMemberDetails.size : 0
-    const summary = `Registering bridge data: ${channels.length} channel(s), ${totalMembers} Discord member(s)`
+    const summary = `Registering bridge data: ${channels.length} channel(s), ${listed.length} Discord member(s)`
     if (summary !== this.lastRegistrationSummary) {
       this.lastRegistrationSummary = summary
       this.log.info(summary)
@@ -1533,6 +1607,17 @@ export class BridgeRuntime {
   }
 
   /** Anti-spam drop of a Discord message: counted, logged without content. */
+  /**
+   * True for Harmony's refusal of an opted-out author (403 BRIDGE_AUTHOR_OPTED_OUT). The author
+   * joins the list at once, so nothing more of theirs is sent before the list is read again.
+   */
+  noteOptedOut(error: unknown, discordUserId: string): boolean {
+    if (!isAuthorOptedOut(error)) return false
+    this.optOuts.add(discordUserId)
+    this.log.debug(`Discord user ${discordUserId} is opted out of the bridge; nothing sent`)
+    return true
+  }
+
   noteSpamDrop(reason: 'rate' | 'duplicate', channelId: string) {
     const { rate, duplicate } = this.antiSpam.dropped
     const total = rate + duplicate
@@ -1694,10 +1779,21 @@ export class BridgeRuntime {
     }
   }
 
-  /** Translation context for Discord → Harmony. */
-  private discordToHarmonyContext(serverId?: string): DiscordToHarmonyContext {
+  /**
+   * Translation context for Discord → Harmony. `nativeStickers` false renders every sticker as
+   * its image.
+   */
+  private discordToHarmonyContext(serverId?: string, forNewMessage = false, nativeStickers = true): DiscordToHarmonyContext {
     return {
       harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
+      isOptedOut: discordUserId => this.optOuts.has(discordUserId),
+      // The message's own server only; retired rows answer only for an edit, which keeps its sticker part.
+      harmonyStickerFor: serverId && nativeStickers
+        ? discordStickerId => {
+          const link = this.stickerLinks.harmonyFor(serverId, discordStickerId)
+          return forNewMessage && link?.removed ? null : link
+        }
+        : undefined,
       harmonyRoleFor: id => this.permissionSyncStore.getHarmonyRoleId(id),
       harmonyDefaultRoleId: this.permissionSyncStore.getDefaultHarmonyRoleId(),
       harmonyChannelFor: id => {
@@ -1864,10 +1960,26 @@ export class BridgeRuntime {
     return ch?.isThread?.() && ch.parentId ? ch.parentId : channelId
   }
 
-  /** The discord_user of the member who started a Discord thread; null for the bridge's own. */
-  private async discordThreadStarter(thread: Pick<AnyThreadChannel, 'id' | 'ownerId'>): Promise<Record<string, unknown> | null> {
+  /** The connected Discord client, or null while not ready. History import reads through it. */
+  discordClientForImport(): DiscordClient | null {
+    return this.discordState === 'ready' ? this.discord : null
+  }
+
+  /**
+   * The discord_user of the member who started a Discord thread (history import). Null for the
+   * bridge's own threads, a starter who left the guild, and one who opted out.
+   */
+  threadStarterForImport(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
+    return this.discordThreadStarter(thread)
+  }
+
+  /**
+   * The discord_user of the member who started a Discord thread. Null for the bridge's own
+   * threads, a starter who is not a guild member, and one who opted out.
+   */
+  private async discordThreadStarter(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
     const ownerId = thread.ownerId
-    if (!ownerId || ownerId === this.discord?.user?.id) return null
+    if (!ownerId || ownerId === this.discord?.user?.id || this.optOuts.has(ownerId)) return null
     const guild = (thread as Partial<AnyThreadChannel>).guild
     const member = guild ? await guild.members.fetch(ownerId).catch(() => null) : null
     if (!member?.user) return null
@@ -1877,8 +1989,11 @@ export class BridgeRuntime {
   /** A new Discord thread under a paired channel gets its Harmony thread at once. */
   private async onDiscordThreadCreate(thread: AnyThreadChannel) {
     if (!thread.parentId) return
+    if (isPrivateThread(thread)) return
     // The bridge's own threads mirror Harmony threads; ThreadSync pairs them as it creates them.
     if (thread.ownerId && thread.ownerId === this.discord?.user?.id) return
+    // An opted-out member's thread reaches Harmony with the first message of someone else in it.
+    if (thread.ownerId && this.optOuts.has(thread.ownerId)) return
     const harmonyChannelId = this.dir.getHarmonyChannel(thread.parentId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(thread.parentId)) return
     try {
@@ -1888,6 +2003,52 @@ export class BridgeRuntime {
         this.log.error(`Failed to bridge Discord thread ${thread.id}: ${errorText(error)}`)
       }
     }
+  }
+
+  /** Guild member of a message's author: carries the server nickname. Null once they have left. */
+  private async guildMemberFor(msg: DiscordMessage) {
+    let guildMember = msg.member
+    if (!guildMember && msg.guild) {
+      guildMember = msg.guild.members.cache.get(msg.author.id) ?? null
+      if (!guildMember) guildMember = await msg.guild.members.fetch(msg.author.id).catch(() => null)
+    }
+    return guildMember
+  }
+
+  /**
+   * A Discord message as a history-import row: the parts and `discord_user` of live relay,
+   * without relay's reply resolution (the server links replies by Discord id), thread lookup or
+   * anti-spam. `member` is the author's current guild membership. Differences from live relay:
+   * no part names a Harmony member or role (context `quiet`), a retired sticker link is not
+   * used, and a forward's reference is not a reply. Null for bots, webhooks, message types
+   * other than Default/Reply, and empty translations.
+   */
+  async translateForImport(
+    msg: DiscordMessage,
+    member: GuildMember,
+    opts: { nativeStickers?: boolean } = {},
+  ): Promise<Omit<ImportMessage, 'thread_id' | 'pinned'> | null> {
+    if (!isImportableMessage(msg)) return null
+
+    const serverId = await this.emojiServerFor(msg.guildId)
+    const ctx = { ...this.discordToHarmonyContext(serverId, true, opts.nativeStickers !== false), quiet: true }
+    const content = this.translator.discordToHarmonyParts(msg, ctx, { content: msg.content ?? '' })
+    if (content.length === 0) return null
+
+    const isForward = msg.reference?.type === REFERENCE_FORWARD
+    return {
+      discord_message_id: msg.id,
+      created_at: msg.createdAt.toISOString(),
+      edited_at: msg.editedAt?.toISOString() ?? null,
+      content,
+      discord_user: buildDiscordUserMetadata(msg.author, member, this.discordMemberDetails.get(msg.author.id)).discord_user as Record<string, unknown>,
+      reply_to_discord_message_id: isForward ? null : msg.reference?.messageId ?? null,
+    }
+  }
+
+  /** History import: Harmony refused this sticker's native part, so its live link is forgotten. */
+  forgetStickerLink(harmonyStickerId: string): void {
+    for (const serverId of this.dir.getHarmonyServerIds()) this.stickerLinks.dropLive(serverId, harmonyStickerId)
   }
 
   private async onDiscordMessage(msg: DiscordMessage) {
@@ -1906,10 +2067,13 @@ export class BridgeRuntime {
     // itself is bridged (onDiscordThreadCreate, harmonyThreadFor), not these notices.
     if (msg.type === MessageType.ThreadCreated || msg.type === MessageType.ThreadStarterMessage) return
 
+    if (isPrivateThread(msg.channel)) return
     const pairId = this.discordPairId(msg.channelId, msg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(pairId)
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(pairId)) return
+    // Nothing of an opted-out author is sent to Harmony.
+    if (this.optOuts.has(msg.author.id)) return
 
     // Without the Message Content intent Discord delivers empty messages.
     const hasBody = !!msg.content || msg.attachments.size > 0 || (msg.stickers?.size ?? 0) > 0 || (msg.messageSnapshots?.size ?? 0) > 0
@@ -1927,16 +2091,14 @@ export class BridgeRuntime {
     try {
       const { replyTo, cleanedContent } = await this.resolveDiscordReplyToHarmony(msg, harmonyChannelId)
 
-      // Guild member carries the server nickname.
-      let guildMember = msg.member
-      if (!guildMember && msg.guild) {
-        guildMember = msg.guild.members.cache.get(msg.author.id)
-          ?? await msg.guild.members.fetch(msg.author.id).catch(() => null)
-      }
+      const guildMember = await this.guildMemberFor(msg)
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
-      const contentParts = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: cleanedContent })
-      if (contentParts.length === 0) {
+      const stickerServerId = await this.emojiServerFor(msg.guildId)
+      const buildParts = (native: boolean) =>
+        this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(stickerServerId, true, native), { content: cleanedContent })
+      const firstParts = buildParts(true)
+      if (firstParts.length === 0) {
         this.log.debug(`Discord message ${msg.id} has nothing to bridge`)
         return
       }
@@ -1957,7 +2119,8 @@ export class BridgeRuntime {
         return
       }
 
-      const result = await this.harmony.sendMessage(harmonyChannelId, contentParts, metadata, replyTo, harmonyThreadId)
+      const result = await this.withStickerFallback(stickerServerId, firstParts, buildParts, parts =>
+        this.harmony.sendMessage(harmonyChannelId, parts, metadata, replyTo, harmonyThreadId))
 
       // The gateway returns the message at top level (BotRestAPI.formatMessage).
       const harmonyMessageId = result?.id ?? result?.message?.id
@@ -1972,6 +2135,11 @@ export class BridgeRuntime {
     } catch (error) {
       if (isAutomodBlocked(error)) {
         this.noteAutomodBlock(msg.channelId)
+        return
+      }
+      if (this.noteOptedOut(error, msg.author.id)) return
+      if (isDiscordMessageTaken(error)) {
+        this.log.debug(`Discord message ${msg.id} is already on Harmony, stored by another bot; not relayed`)
         return
       }
       if (!this.noteDrop('Discord → Harmony', error)) {
@@ -2010,10 +2178,13 @@ export class BridgeRuntime {
       }
     }
 
+    if (isPrivateThread(reaction.message.channel)) return
     const harmonyChannelId = this.dir.getHarmonyChannel(this.discordPairId(reaction.message.channelId, reaction.message.channel))
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
     if (!this.settings().syncReactions) return
+    // A reaction carries its user's name and avatar. Removals stay bridged: they take data away.
+    if (this.optOuts.has(user.id)) return
 
     try {
       const harmonyMessageId = this.discordToHarmonyMessages.get(reaction.message.id)
@@ -2058,6 +2229,7 @@ export class BridgeRuntime {
       }
     }
 
+    if (isPrivateThread(reaction.message.channel)) return
     const harmonyChannelId = this.dir.getHarmonyChannel(this.discordPairId(reaction.message.channelId, reaction.message.channel))
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
@@ -2090,9 +2262,11 @@ export class BridgeRuntime {
     if (!this.settings().syncEdits) return
     if (!newMsg.author || newMsg.author.bot) return
 
+    if (isPrivateThread(newMsg.channel)) return
     const updatePairId = this.discordPairId(newMsg.channelId, newMsg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(updatePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(updatePairId)) return
+    if (this.optOuts.has(newMsg.author.id)) return
 
     try {
       const harmonyMessageId = this.discordToHarmonyMessages.get(newMsg.id)
@@ -2101,14 +2275,18 @@ export class BridgeRuntime {
         return
       }
 
-      const contentParts = this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(await this.emojiServerFor(newMsg.guildId)))
-      await this.harmony.editMessage(harmonyMessageId, contentParts)
+      const stickerServerId = await this.emojiServerFor(newMsg.guildId)
+      const buildParts = (native: boolean) =>
+        this.translator.discordToHarmonyParts(newMsg, this.discordToHarmonyContext(stickerServerId, false, native))
+      await this.withStickerFallback(stickerServerId, buildParts(true), buildParts, parts =>
+        this.harmony.editMessage(harmonyMessageId, parts))
       this.log.info(`Discord → Harmony edit: ${newMsg.id} → ${harmonyMessageId}`)
     } catch (error) {
       if (isAutomodBlocked(error)) {
         this.noteAutomodBlock(newMsg.channelId)
         return
       }
+      if (this.noteOptedOut(error, newMsg.author.id)) return
       if (!this.noteDrop('Discord → Harmony edit', error)) {
         this.log.error(`Failed to bridge edit Discord → Harmony (${newMsg.id}): ${errorText(error)}`)
       }
@@ -2143,6 +2321,7 @@ export class BridgeRuntime {
     if (msg.author?.bot || msg.webhookId) return false
     if (this.harmonyOriginCopies.has(msg.id)) return false
 
+    if (isPrivateThread(msg.channel)) return false
     const deletePairId = this.discordPairId(msg.channelId, msg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(deletePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(deletePairId)) return false
@@ -2220,6 +2399,8 @@ export class BridgeRuntime {
 
     this.registerBridgeDataWithGateway({ immediate: true })
     this.notify('harmony:ready')
+    // A gateway upgrade between connections changes the capabilities.
+    await this.refreshCommands()
   }
 
   /**
@@ -2627,16 +2808,53 @@ export class BridgeRuntime {
    * image; `discord:name:id` maps back to the Discord emoji; unicode passes
    * through. A bare name without an emoji row matches a guild emoji by name.
    */
-  /** Harmony server of a bridged guild, with its emoji links loaded. */
+  /** Sticker links are read only from a gateway with the sticker routes, by the server's own bridge. */
+  private stickerLinksAvailable(): boolean {
+    return this.mode === 'v2' && this.harmony.hasCapability(CAPABILITY.stickerSync)
+  }
+
+  /** Harmony server of a bridged guild, with its emoji and sticker links loaded. */
   private async emojiServerFor(guildId: string | null | undefined): Promise<string | undefined> {
     const serverId = guildId ? this.dir.getBridgeForDiscordGuild(guildId)?.harmonyServerId : undefined
-    if (serverId) await this.emojiLinks.ensure(serverId)
+    if (serverId) {
+      await Promise.all([
+        this.emojiLinks.ensure(serverId),
+        ...(this.stickerLinksAvailable() ? [this.stickerLinks.ensure(serverId)] : []),
+      ])
+    }
     return serverId
   }
 
   private async refreshEmojiLinks(): Promise<void> {
     for (const bridge of this.dir.getBridges()) {
-      if (bridge.harmonyServerId) await this.emojiLinks.ensure(bridge.harmonyServerId)
+      if (bridge.harmonyServerId) {
+        await this.emojiLinks.ensure(bridge.harmonyServerId)
+        if (this.stickerLinksAvailable()) await this.stickerLinks.ensure(bridge.harmonyServerId)
+      }
+    }
+  }
+
+  /**
+   * Writes a Discord message's Harmony parts. When Harmony refuses the native sticker part
+   * (422 STICKER_REFUSED), the message is built again with every sticker as an image and written
+   * once more. The refused sticker is the one the built part names; its live link is forgotten,
+   * a retired link is kept for edits of the messages that hold it. Any other error propagates.
+   */
+  private async withStickerFallback<T>(
+    serverId: string | undefined,
+    parts: any[],
+    build: (nativeStickers: boolean) => any[],
+    write: (parts: any[]) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await write(parts)
+    } catch (error) {
+      if (!(error instanceof HarmonyHttpError) || error.status !== 422 || error.code !== 'STICKER_REFUSED') throw error
+      const native = parts.find(p => p?.type === 'sticker')
+      if (!serverId || !native) throw error
+      this.stickerLinks.dropLive(serverId, String(native.id))
+      this.log.warn(`Harmony refused synced sticker ${native.id}; sending the image instead`)
+      return write(build(false))
     }
   }
 

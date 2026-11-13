@@ -47,7 +47,7 @@ export class Logger {
 export function errorText(err: unknown): string {
   if (err instanceof Error) {
     const code = (err as { code?: unknown }).code
-    return code !== undefined && !err.message.includes(String(code))
+    return code !== undefined && code !== null && !err.message.includes(String(code))
       ? `${err.message} (${String(code)})`
       : err.message
   }

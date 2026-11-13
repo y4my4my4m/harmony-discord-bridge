@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv'
 import type { Server } from 'http'
-import { planLaunch } from './env.js'
+import { parseImportSettings, planLaunch } from './env.js'
 import { Logger, errorText, parseLogLevel } from './log.js'
 import { findLegacyConfigPath, packageVersion, resolveDataDir } from './paths.js'
 import { startHealthServer, type Launched } from './health.js'
@@ -64,6 +64,9 @@ async function main() {
     if (plan.kind === 'v1') {
       launched = await runV1(plan.configPath, log)
     } else if (plan.kind === 'self') {
+      // Only self-run mode imports: a bad BRIDGE_IMPORT_* value is fatal here and nowhere else.
+      const importSettings = parseImportSettings(process.env)
+      if (!importSettings.ok) fatal(importSettings.message)
       launched = await runSelf({
         harmonyUrl: plan.harmonyUrl,
         setupCode: plan.setupCode,
@@ -72,6 +75,7 @@ async function main() {
         log,
         version,
         ignoredLegacyConfig: plan.ignoredLegacyConfig,
+        import: importSettings.settings,
       })
     } else {
       launched = await runHost({

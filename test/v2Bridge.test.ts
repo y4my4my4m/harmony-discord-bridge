@@ -6,6 +6,8 @@ import type { BridgeV2Config } from '../src/v2/BridgeApi.js'
 import type { BridgeRuntimeOptions } from '../src/runtime/BridgeRuntime.js'
 import type { DiscordGuildView } from '../src/problems.js'
 import { silentLogger } from '../src/log.js'
+import { ImportSlots } from '../src/runtime/importScheduler.js'
+import { OptOutList } from '../src/runtime/optOuts.js'
 
 function config(overrides: Partial<BridgeV2Config> = {}): BridgeV2Config {
   return {
@@ -84,11 +86,11 @@ function bridge(fetchImpl: any, runtimes: FakeRuntime[], extra: Partial<Construc
     authHint: 'auth hint',
     fetchImpl,
     statusDebounceMs: 10,
-    createRuntime: (opts) => {
+    createRuntime: extra.createRuntime ?? ((opts) => {
       const r = new FakeRuntime(opts)
       runtimes.push(r)
       return r
-    },
+    }),
   })
 }
 
@@ -279,5 +281,264 @@ describe('V2Directory', () => {
     const noGuild = new V2Directory(config({ discord_guild_id: null }))
     expect(noGuild.getBridges()).toEqual([])
     expect(noGuild.getHarmonyServerIds()).toEqual(['s-1'])
+  })
+})
+
+describe('V2Bridge history import', () => {
+  const queuedJob = { id: 'j1', state: 'queued', phase: 'messages', created_at: '2026-01-01T00:00:00Z', cancel_requested: false, requested_via: 'discord', discord_channel_id: 'd1' }
+  const ON = { history_import: { enabled: true, reason: null } }
+
+  function importGateway(intent: boolean, over: Partial<BridgeV2Config> = ON) {
+    const g = gateway()
+    g.state.config = config(over)
+    const imports: any[] = [queuedJob]
+    const calls: string[] = []
+    const control = { refuse: null as null | { status: number; body: unknown } }
+    const inner = g.fetchImpl.getMockImplementation()!
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url)
+      const method = init?.method ?? 'GET'
+      if (u.includes('/bridge/v2/imports')) {
+        calls.push(`${method} ${u.slice(u.indexOf('/imports'))}`)
+        if (control.refuse) return Response.json(control.refuse.body, { status: control.refuse.status })
+        if (method === 'GET' && u.endsWith('/imports')) return Response.json({ imports })
+        if (method === 'GET') {
+          const found = imports.find(j => u.endsWith(`/imports/${j.id}`))
+          return found ? Response.json({ import: found }) : Response.json({ code: 'import_not_found' }, { status: 404 })
+        }
+        if (method === 'PATCH') return Response.json({ import: { ...queuedJob, state: 'running' } })
+      }
+      return inner(url, init)
+    })
+    class ImportRuntime extends FakeRuntime {
+      discordIdentity() {
+        return { ...super.discordIdentity(), intents: { message_content: intent, members: true, presence: false } }
+      }
+      discordClientForImport() { return null }
+      translateForImport = vi.fn(async () => null)
+      threadStarterForImport = vi.fn(async () => null)
+    }
+    return { ...g, imports, calls, control, fetchImpl, ImportRuntime }
+  }
+
+  function importBridge(g: ReturnType<typeof importGateway>, runtimes: FakeRuntime[], extra: Partial<ConstructorParameters<typeof V2Bridge>[0]> = {}) {
+    return bridge(g.fetchImpl, runtimes, {
+      import: { slots: new ImportSlots(1), settings: { pollMs: 3_600_000, pageDelayMs: 0 } },
+      createRuntime: (opts) => { const r = new g.ImportRuntime(opts); runtimes.push(r); return r },
+      ...extra,
+    })
+  }
+
+  it('reports message_content_needed_for_import while a job is queued and the intent is off', async () => {
+    const g = importGateway(false)
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes)
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(b.currentProblems().map(p => p.code)).toContain('message_content_needed_for_import')
+    expect(g.state.statuses.at(-1).problems.map((p: any) => p.code)).toContain('message_content_needed_for_import')
+
+    // The job goes away: the next poll drops the problem.
+    g.imports.length = 0
+    runtimes[0].opts.hooks!.kickImports!()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(b.currentProblems().map(p => p.code)).not.toContain('message_content_needed_for_import')
+    await b.stop()
+  })
+
+  it('starts the job when the configuration enables import, and stops without waiting on it', async () => {
+    const g = importGateway(true)
+    const b = importBridge(g, [])
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toContain('PATCH /imports/j1')
+    // The unconnected client has the importer in a retry wait; stop() does not sit it out.
+    let stopped = false
+    void b.stop().then(() => { stopped = true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(stopped).toBe(true)
+  })
+
+  it.each([
+    ['no history_import in the configuration (an older gateway)', {}],
+    ['history_import off on the instance', { history_import: { enabled: false, reason: 'instance_off' as const } }],
+    ['a bridge mode that never imports', { history_import: { enabled: false, reason: 'bridge_mode' as const } }],
+  ])('sends no import request with %s', async (_name, over) => {
+    const g = importGateway(true, over)
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes)
+    await b.start()
+    runtimes[0].opts.hooks!.kickImports!()
+    b.kickImports()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(g.calls).toEqual([])
+    expect(runtimes[0].opts.hooks!.importEnabled!()).toBe(false)
+    await b.stop()
+  })
+
+  it('never imports on the instance bot, whatever the configuration says', async () => {
+    const g = importGateway(true)
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes, { sharedDiscord: {} as any })
+    await b.start()
+    b.kickImports()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(g.calls).toEqual([])
+    expect(runtimes[0].opts.hooks!.importApi).toBeUndefined()
+    expect(runtimes[0].opts.hooks!.importEnabled!()).toBe(false)
+    await b.stop()
+  })
+
+  it('offers no import routes to the runtime of a bridge built without import', async () => {
+    const plain = gateway()
+    plain.state.config = config(ON)
+    const runtimes: FakeRuntime[] = []
+    const none = bridge(plain.fetchImpl, runtimes)
+    await none.start()
+    none.kickImports()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(plain.fetchImpl.mock.calls.some(c => String(c[0]).includes('/imports'))).toBe(false)
+    expect(runtimes[0].opts.hooks!.importApi).toBeUndefined()
+    await none.stop()
+  })
+
+  it('starts polling when a configuration read turns import on, and stops when it turns off', async () => {
+    const g = importGateway(false, {})
+    const b = importBridge(g, [])
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual([])
+
+    g.state.config = config(ON)
+    await b.refreshConfig('test')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports'])
+
+    g.state.config = config({ history_import: { enabled: false, reason: 'instance_off' } })
+    await b.refreshConfig('test')
+    b.kickImports()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports'])
+    await b.stop()
+  })
+
+  it('stops polling on a refusal and polls again on Harmony READY', async () => {
+    const g = importGateway(false)
+    g.control.refuse = { status: 403, body: { code: 'import_disabled', reason: 'instance_off' } }
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes)
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports'])
+    // Three poll intervals pass without a request.
+    await vi.advanceTimersByTimeAsync(3 * 3_600_000)
+    expect(g.calls).toEqual(['GET /imports'])
+
+    g.control.refuse = null
+    runtimes[0].harmony.emit('ready', {})
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports', 'GET /imports'])
+    await b.stop()
+  })
+
+  it('polls again after a refusal when the Discord command queued a job', async () => {
+    const g = importGateway(false)
+    g.control.refuse = { status: 403, body: { code: 'import_disabled', reason: 'instance_off' } }
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes)
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports'])
+
+    g.control.refuse = null
+    runtimes[0].opts.hooks!.kickImports!()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toEqual(['GET /imports', 'GET /imports'])
+    await b.stop()
+  })
+})
+
+describe('V2Bridge opt-out list', () => {
+  function privacyGateway(version: string | null) {
+    const g = gateway()
+    g.state.config = config(version === null ? {} : { privacy_version: version })
+    const list = { ids: ['111'], reads: 0, fail: false, version }
+    const inner = g.fetchImpl.getMockImplementation()!
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (String(url).endsWith('/bridge/v2/privacy/optouts')) {
+        list.reads++
+        if (list.fail) return new Response('down', { status: 503 })
+        return Response.json({ version: list.version, remote_user_ids: list.ids })
+      }
+      return inner(url, init)
+    })
+    class PrivacyRuntime extends FakeRuntime {
+      optOuts = new OptOutList()
+      startedWith: string[] | null = null
+      async start() { this.startedWith = ['111', '222'].filter(id => this.optOuts.has(id)); await super.start() }
+    }
+    const runtimes: PrivacyRuntime[] = []
+    const b = bridge(fetchImpl, runtimes, {
+      createRuntime: (opts) => { const r = new PrivacyRuntime(opts); runtimes.push(r); return r },
+    })
+    return { ...g, list, b, runtimes }
+  }
+
+  it('reads the list before the runtime starts relaying', async () => {
+    const g = privacyGateway('v1')
+    await g.b.start()
+    expect(g.runtimes[0].startedWith).toEqual(['111'])
+    expect(g.runtimes[0].optOuts.version()).toBe('v1')
+    await g.b.stop()
+  })
+
+  it('reads it again only when privacy_version changes', async () => {
+    const g = privacyGateway('v1')
+    await g.b.start()
+    await g.b.refreshConfig('test')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBe(1)
+
+    g.list.ids = ['111', '222']
+    g.list.version = 'v2'
+    g.state.config = config({ privacy_version: 'v2' })
+    await g.b.refreshConfig('test')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBe(2)
+    expect(g.runtimes[0].optOuts.has('222')).toBe(true)
+    await g.b.stop()
+  })
+
+  it('tries again at the next configuration read after a failed read', async () => {
+    const g = privacyGateway('v1')
+    g.list.fail = true
+    await g.b.start()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(g.runtimes[0].optOuts.has('111')).toBe(false)
+    const reads = g.list.reads
+
+    g.list.fail = false
+    g.state.config = config({ privacy_version: 'v1', pairs: [] })
+    await g.b.refreshConfig('test')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBeGreaterThan(reads)
+    expect(g.runtimes[0].optOuts.has('111')).toBe(true)
+    await g.b.stop()
+  })
+
+  it('asks nothing of a gateway without the privacy routes', async () => {
+    const g = privacyGateway(null)
+    await g.b.start()
+    g.runtimes[0].harmony.emit('ready', {})
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBe(0)
+    await g.b.stop()
+  })
+
+  it('gives every v2 runtime the privacy routes, the instance bot included', async () => {
+    const g = privacyGateway('v1')
+    await g.b.start()
+    expect(g.runtimes[0].opts.hooks!.privacyApi).toBeDefined()
+    await g.b.stop()
   })
 })

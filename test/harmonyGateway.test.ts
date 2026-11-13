@@ -98,3 +98,51 @@ describe('HarmonyClient gateway', () => {
     expect(limited[0]).toMatchObject({ code: 4008 })
   })
 })
+
+describe('HarmonyClient capabilities', () => {
+  const ready = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ op: 0, t: 'READY', d: { bot: { id: 'b', username: 'bridge' }, session_id: 's', heartbeat_interval: 30000, ...extra } })
+
+  it('reads the feature list of READY', async () => {
+    const gw = await gateway(ws => ws.send(ready({ capabilities: ['bridge_emoji_sync', 'bridge_privacy'] })))
+    client = new HarmonyClient('good', gw.url, 'http://127.0.0.1:1', { log: silentLogger })
+    expect(client.capabilitiesKnown()).toBe(false)
+    expect(client.hasCapability('bridge_emoji_sync')).toBe(false)
+    await client.connect()
+    await sleep(200)
+    expect(client.capabilitiesKnown()).toBe(true)
+    expect(client.hasCapability('bridge_emoji_sync')).toBe(true)
+    expect(client.hasCapability('bridge_privacy')).toBe(true)
+    expect(client.hasCapability('bridge_history_import')).toBe(false)
+  })
+
+  it('reads a READY without the list as a gateway with none', async () => {
+    const gw = await gateway(ws => ws.send(ready()))
+    client = new HarmonyClient('good', gw.url, 'http://127.0.0.1:1', { log: silentLogger })
+    await client.connect()
+    await sleep(200)
+    expect(client.capabilitiesKnown()).toBe(true)
+    expect(client.hasCapability('bridge_sound_sync')).toBe(false)
+  })
+
+  it('reads the list from GET /users/@me before READY', async () => {
+    const seen: string[] = []
+    const fetchImpl = async (url: string | URL) => {
+      seen.push(String(url))
+      return Response.json({ id: 'b', username: 'bridge', capabilities: ['bridge_sticker_sync'] })
+    }
+    client = new HarmonyClient('good', 'ws://127.0.0.1:1/gateway', 'http://api.test', { log: silentLogger, fetchImpl })
+    await client.loadCapabilities()
+    expect(seen).toEqual(['http://api.test/api/v1/users/@me'])
+    expect(client.hasCapability('bridge_sticker_sync')).toBe(true)
+    expect(client.hasCapability('bridge_emoji_sync')).toBe(false)
+  })
+
+  it('leaves the list unknown when GET /users/@me fails', async () => {
+    client = new HarmonyClient('good', 'ws://127.0.0.1:1/gateway', 'http://api.test', {
+      log: silentLogger, fetchImpl: async () => new Response('down', { status: 503 }), retry: { attempts: 1 },
+    })
+    await expect(client.loadCapabilities()).rejects.toBeTruthy()
+    expect(client.capabilitiesKnown()).toBe(false)
+  })
+})

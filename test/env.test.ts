@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { planLaunch } from '../src/env.js'
+import { parseImportSettings, planLaunch } from '../src/env.js'
 
 describe('planLaunch', () => {
   it('explains what to set when nothing is configured', () => {
@@ -54,5 +54,29 @@ describe('planLaunch', () => {
     expect(planLaunch({ BRIDGE_MODE: 'cluster' }, null)).toMatchObject({ kind: 'error' })
     expect(planLaunch({ HARMONY_URL: 'ftp://x', DISCORD_TOKEN: 't' }, null)).toMatchObject({ kind: 'error' })
     expect(planLaunch({ HARMONY_URL: 'https://x', DISCORD_TOKEN: 't', HEALTH_PORT: 'abc' }, null)).toMatchObject({ kind: 'error' })
+  })
+})
+
+describe('parseImportSettings', () => {
+  it('defaults to a 10 s poll and a 1 s page delay', () => {
+    expect(parseImportSettings({})).toEqual({ ok: true, settings: { pollMs: 10000, pageDelayMs: 1000 } })
+  })
+
+  it('reads the BRIDGE_IMPORT_* variables', () => {
+    expect(parseImportSettings({ BRIDGE_IMPORT_POLL_MS: '5000', BRIDGE_IMPORT_PAGE_DELAY_MS: '0' }))
+      .toEqual({ ok: true, settings: { pollMs: 5000, pageDelayMs: 0 } })
+  })
+
+  it('rejects values that are not whole numbers in range', () => {
+    for (const env of [
+      { BRIDGE_IMPORT_POLL_MS: 'fast' },
+      { BRIDGE_IMPORT_POLL_MS: '10' },
+      { BRIDGE_IMPORT_PAGE_DELAY_MS: '-1' },
+      { BRIDGE_IMPORT_PAGE_DELAY_MS: '1.5' },
+    ]) {
+      const res = parseImportSettings(env)
+      expect(res.ok).toBe(false)
+      if (!res.ok) expect(res.message).toContain(Object.keys(env)[0])
+    }
   })
 })

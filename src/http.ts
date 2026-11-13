@@ -13,6 +13,8 @@ export interface RetryOptions {
   sleep?: (ms: number) => Promise<void>
   /** Called before each wait caused by a 429. */
   onRateLimited?: (info: { url: string; waitMs: number; attempt: number }) => void
+  /** Aborts the request in flight and any wait between attempts. */
+  signal?: AbortSignal
 }
 
 export const DEFAULT_RETRY = {
@@ -25,6 +27,41 @@ const IDEMPOTENT = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS'])
 const RETRYABLE_5XX = new Set([500, 502, 503, 504])
 
 export const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : Object.assign(new Error('aborted'), { name: 'AbortError' })
+}
+
+/** Resolves after `ms`; rejects at once when `signal` aborts first. */
+export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleep(ms)
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(abortError(signal))
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(abortError(signal))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/** A signal that aborts with `signal` or after `timeoutMs`, whichever is first. */
+function requestSignal(signal: AbortSignal | undefined, timeoutMs: number | undefined): AbortSignal | undefined {
+  const timeout = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined
+  if (!signal || !timeout) return signal ?? timeout
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([signal, timeout])
+  // Node 20.0 to 20.2 (package.json allows them) has no AbortSignal.any.
+  const both = new AbortController()
+  for (const s of [signal, timeout]) {
+    if (s.aborted) both.abort(s.reason)
+    else s.addEventListener('abort', () => both.abort(s.reason), { once: true })
+  }
+  return both.signal
+}
 
 /**
  * Retry-After as milliseconds. Accepts delta-seconds (fractional allowed, as
@@ -71,7 +108,8 @@ export async function fetchWithRetry(
   const maxWaitMs = options.maxWaitMs ?? DEFAULT_RETRY.maxWaitMs
   const baseDelayMs = options.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs
   const doFetch = options.fetchImpl ?? fetch
-  const wait = options.sleep ?? sleep
+  const { signal } = options
+  const wait = (ms: number): Promise<void> => (options.sleep ? options.sleep(ms) : abortableSleep(ms, signal))
   const method = (init.method ?? 'GET').toUpperCase()
   const idempotent = IDEMPOTENT.has(method)
 
@@ -79,11 +117,10 @@ export async function fetchWithRetry(
     const last = attempt >= attempts
     let res: Response
     try {
-      res = await doFetch(url, options.timeoutMs
-        ? { ...init, signal: AbortSignal.timeout(options.timeoutMs) }
-        : init)
+      const attemptSignal = requestSignal(signal, options.timeoutMs)
+      res = await doFetch(url, attemptSignal ? { ...init, signal: attemptSignal } : init)
     } catch (err) {
-      if (last || !idempotent) throw err
+      if (last || !idempotent || signal?.aborted) throw err
       await wait(Math.min(maxWaitMs, baseDelayMs * 2 ** (attempt - 1)))
       continue
     }

@@ -252,6 +252,18 @@ export interface DiscordToHarmonyContext {
   harmonyChannelFor?: (discordChannelId: string) => { id: string; serverId: string; name: string } | null
   /** Discord emoji id → the Harmony server emoji imported from it. */
   harmonyEmojiFor?: (discordEmojiId: string) => { id: string; name: string; url: string | null } | null
+  /** Discord sticker id → the Harmony server sticker synced from it. */
+  harmonyStickerFor?: (discordStickerId: string) => { id: string; url: string; name: string; description: string } | null
+  /**
+   * Whether a Discord user is opted out of the bridge. A mention of one is written as the text
+   * the author's message shows, with no id or username.
+   */
+  isOptedOut?: (discordUserId: string) => boolean
+  /**
+   * History import: nothing in the result names a Harmony member or role. A plain `@name` stays
+   * text with no member lookup, and @everyone, @here and role pings are written as text.
+   */
+  quiet?: boolean
 }
 
 /** Bridge state the Harmony → Discord translation consults. */
@@ -519,7 +531,8 @@ export class MessageTranslator {
 
     const parts: any[] = [{ type: 'text', text: '*↪ Forwarded*\n' }]
     for (const snapshot of snapshots) {
-      parts.push(...this.messageBody(snapshot, discordMsg, ctx, snapshot.content))
+      // Only the message's own stickers are ever native; a snapshot's stay images.
+      parts.push(...this.messageBody(snapshot, discordMsg, { ...ctx, harmonyStickerFor: undefined }, snapshot.content))
     }
     if (own.length > 0) parts.push({ type: 'text', text: '\n' }, ...own)
     return parts
@@ -549,7 +562,18 @@ export class MessageTranslator {
       })
     }
 
+    let nativeSticker = false
     for (const sticker of collectionValues(msg.stickers)) {
+      const linked = nativeSticker ? null : ctx.harmonyStickerFor?.(sticker.id) ?? null
+      if (linked) {
+        nativeSticker = true
+        const ext = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(linked.url)?.[1]?.toLowerCase() ?? 'png'
+        parts.push(
+          { type: 'sticker', id: linked.id, url: linked.url, name: linked.name, description: linked.description },
+          { type: 'file', fileType: 'image', stickerId: linked.id, url: linked.url, fileName: `${linked.name}.${ext}`, altText: linked.description },
+        )
+        continue
+      }
       const url = stickerImageUrl(sticker)
       if (url) {
         parts.push({ type: 'file', url, fileName: `${sticker.name || 'sticker'}.${url.endsWith('.gif') ? 'gif' : 'png'}`, fileType: 'image' })
@@ -606,7 +630,9 @@ export class MessageTranslator {
         const id = match[4]
         const member = msg.guild?.members?.cache?.get(id)
         const user = msg.mentions?.users?.get(id) ?? member?.user
-        if (user) {
+        if (user && ctx.isOptedOut?.(id)) {
+          parts.push({ type: 'text', text: `@${member?.displayName || user.globalName || user.username}`, literal: true })
+        } else if (user) {
           parts.push({
             type: 'mention',
             userId: id,
@@ -625,7 +651,7 @@ export class MessageTranslator {
         const id = match[5]
         const pinged = msg.mentions?.roles?.get(id)
         const role = pinged ?? msg.guild?.roles?.cache?.get(id)
-        const harmonyRoleId = pinged ? ctx.harmonyRoleFor?.(id) : undefined
+        const harmonyRoleId = pinged && !ctx.quiet ? ctx.harmonyRoleFor?.(id) : undefined
         if (harmonyRoleId) {
           const color = typeof role?.hexColor === 'string' && role.hexColor !== '#000000' ? role.hexColor : null
           parts.push({ type: 'role_mention', roleId: harmonyRoleId, roleName: role?.name ?? 'role', roleColor: color })
@@ -656,7 +682,7 @@ export class MessageTranslator {
         out.push(part)
         continue
       }
-      if (part.literal) {
+      if (part.literal || ctx.quiet) {
         out.push({ type: 'text', text: part.text })
         continue
       }

@@ -126,3 +126,37 @@ export function planLaunch(env: NodeJS.ProcessEnv, legacyConfigPath: string | nu
 
   return { kind: 'error', message: NOT_CONFIGURED }
 }
+
+/** History import tuning (BRIDGE_IMPORT_*). Self-run mode only. */
+export interface ImportSettings {
+  /** How often the bridge asks Harmony for import jobs while import is enabled. */
+  pollMs: number
+  /** Pause after each page of Discord history, which also lets live relay through. At most 10 s is waited. */
+  pageDelayMs: number
+}
+
+export const DEFAULT_IMPORT_SETTINGS: ImportSettings = { pollMs: 10_000, pageDelayMs: 1_000 }
+
+/** Non-negative integer from env; unset → fallback; anything else → 'invalid'. */
+function parseCount(raw: string | null, fallback: number, min: number): number | 'invalid' {
+  if (raw === null) return fallback
+  if (!/^\d+$/.test(raw)) return 'invalid'
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n >= min ? n : 'invalid'
+}
+
+/** BRIDGE_IMPORT_POLL_MS (default 10000, min 1000), BRIDGE_IMPORT_PAGE_DELAY_MS (default 1000, min 0). */
+export function parseImportSettings(env: NodeJS.ProcessEnv): { ok: true; settings: ImportSettings } | { ok: false; message: string } {
+  const d = DEFAULT_IMPORT_SETTINGS
+  const fields = [
+    ['BRIDGE_IMPORT_POLL_MS', d.pollMs, 1000],
+    ['BRIDGE_IMPORT_PAGE_DELAY_MS', d.pageDelayMs, 0],
+  ] as const
+  const out: number[] = []
+  for (const [key, fallback, min] of fields) {
+    const n = parseCount(value(env, key), fallback, min)
+    if (n === 'invalid') return { ok: false, message: `${key}="${env[key]}" must be a whole number of at least ${min}.` }
+    out.push(n)
+  }
+  return { ok: true, settings: { pollMs: out[0], pageDelayMs: out[1] } }
+}

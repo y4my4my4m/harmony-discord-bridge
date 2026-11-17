@@ -1,6 +1,6 @@
 {
   "name": "@harmony/discord-bridge",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Discord ↔ Harmony bridge (bot-gateway client)",
   "type": "module",
   "main": "dist/index.js",

@@ -353,7 +353,7 @@ describe('/bridge import-history', () => {
 
   it.each([
     ['instance_off', 'turned off on this Harmony instance'],
-    ['bridge_mode', 'Only a bridge you run yourself can import history'],
+    ['bridge_mode', 'imports history only through bridges their server owner runs'],
   ])('explains a 403 import_disabled with reason %s', async (reason, sentence) => {
     const t = setup({ action: 'status' })
     t.api.listImports.mockRejectedValueOnce(new BridgeApiError('off', 403, 'import_disabled', { reason }))

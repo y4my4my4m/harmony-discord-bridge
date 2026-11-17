@@ -376,16 +376,49 @@ describe('V2Bridge history import', () => {
     await b.stop()
   })
 
-  it('never imports on the instance bot, whatever the configuration says', async () => {
+  it('imports through the instance bot when the configuration enables it', async () => {
     const g = importGateway(true)
+    const runtimes: FakeRuntime[] = []
+    const b = importBridge(g, runtimes, { sharedDiscord: {} as any })
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(g.calls).toContain('PATCH /imports/j1')
+    expect(runtimes[0].opts.hooks!.importApi).toBeDefined()
+    expect(runtimes[0].opts.hooks!.importEnabled!()).toBe(true)
+    await b.stop()
+  })
+
+  it('sends no import request through the instance bot while Harmony refuses its mode', async () => {
+    const g = importGateway(true, { history_import: { enabled: false, reason: 'bridge_mode' } })
     const runtimes: FakeRuntime[] = []
     const b = importBridge(g, runtimes, { sharedDiscord: {} as any })
     await b.start()
     b.kickImports()
     await vi.advanceTimersByTimeAsync(120_000)
     expect(g.calls).toEqual([])
-    expect(runtimes[0].opts.hooks!.importApi).toBeUndefined()
     expect(runtimes[0].opts.hooks!.importEnabled!()).toBe(false)
+    await b.stop()
+  })
+
+  it('runs one import at a time across bridges that share slots', async () => {
+    const slots = new ImportSlots(1)
+    const first = importGateway(true)
+    const second = importGateway(true)
+    let release: (() => void) | null = null
+    // The first bridge's job holds the only slot until released.
+    const held = await slots.acquire()
+    const a = importBridge(first, [], { sharedDiscord: {} as any, import: { slots, settings: { pollMs: 3_600_000, pageDelayMs: 0 } } })
+    const b = importBridge(second, [], { sharedDiscord: {} as any, import: { slots, settings: { pollMs: 3_600_000, pageDelayMs: 0 } } })
+    await a.start()
+    await b.start()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(first.calls).not.toContain('PATCH /imports/j1')
+    expect(second.calls).not.toContain('PATCH /imports/j1')
+    release = held
+    release()
+    await vi.advanceTimersByTimeAsync(50)
+    expect([first.calls.includes('PATCH /imports/j1'), second.calls.includes('PATCH /imports/j1')].filter(Boolean)).toHaveLength(1)
+    await a.stop()
     await b.stop()
   })
 

@@ -22,11 +22,17 @@ interface GuildLike {
   name: string
   iconURL?: (options?: { size?: number }) => string | null
   members: { me: unknown | null }
+  roles?: { everyone?: unknown | null }
   channels: { cache: { values(): Iterable<ChannelLike> } }
 }
 
 export interface ClientLike {
   guilds: { cache: { values(): Iterable<GuildLike> } }
+}
+
+/** @everyone can view the channel and read its history: Harmony counts any other channel as private. */
+function everyoneReads(perms: PermissionsLike | null): boolean {
+  return !!perms?.has(PermissionFlagsBits.ViewChannel) && !!perms.has(PermissionFlagsBits.ReadMessageHistory)
 }
 
 /** Discord channel types (API ChannelType): threads and DMs are never paired. */
@@ -38,6 +44,7 @@ export function collectGuildViews(client: ClientLike, include?: (guildId: string
   for (const guild of client.guilds.cache.values()) {
     if (include && !include(guild.id)) continue
     const me = guild.members.me
+    const everyone = guild.roles?.everyone ?? null
     const channels: DiscordChannelView[] = []
     for (const channel of guild.channels.cache.values()) {
       if (THREAD_OR_DM_TYPES.has(channel.type) || channel.isThread?.()) continue
@@ -52,6 +59,7 @@ export function collectGuildViews(client: ClientLike, include?: (guildId: string
         can_view: canView,
         can_send: canView && !!perms?.has(PermissionFlagsBits.SendMessages),
         can_manage_webhooks: canView && !!perms?.has(PermissionFlagsBits.ManageWebhooks),
+        ...(everyone && channel.permissionsFor ? { everyone_can_view: everyoneReads(channel.permissionsFor(everyone)) } : {}),
       })
     }
     channels.sort((a, b) => a.position - b.position)

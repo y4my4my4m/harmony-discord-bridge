@@ -1,6 +1,6 @@
 import { mkdirSync } from 'fs'
 import { join } from 'path'
-import { BridgeApi, type HostedEntry } from './BridgeApi.js'
+import { BridgeApi, type HostedEntry, type InstanceBridgeEntry } from './BridgeApi.js'
 import { CredentialsError, obtainCredentials, type StoredCredentials } from './credentials.js'
 import { EndpointError, endpointsFor, probeEndpoints, type HarmonyEndpoints } from './endpoints.js'
 import { HostRunner, type HostedInstance } from './HostRunner.js'
@@ -51,10 +51,14 @@ async function untilReachable<T>(
   }
 }
 
-/** History import wiring of a self-run bridge. One bridge runs one job at a time. */
-function importOptions(settings: ImportSettings = DEFAULT_IMPORT_SETTINGS): V2ImportOptions {
-  return { slots: new ImportSlots(1), settings }
+/**
+ * History import wiring of one bridge. A bridge with its own Discord client runs one job at a
+ * time on its own slots; bridges on one shared login pass the same `slots`.
+ */
+function importOptions(settings: ImportSettings = DEFAULT_IMPORT_SETTINGS, slots = new ImportSlots(1)): V2ImportOptions {
+  return { slots, settings }
 }
+
 
 function ensureDataDir(dataDir: string) {
   try {
@@ -165,11 +169,98 @@ const safeDirName = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_')
 const HOSTED_HEALTH_INTERVAL_MS = 5_000
 
 /**
+ * The bridges of host mode. Instance bot bridges share one Discord login and one ImportSlots(1):
+ * one history read on Discord at a time between them. An own-token bridge, inline or in its
+ * worker thread, has slots of its own.
+ */
+export function hostBridgeFactories(ctx: {
+  apiBase: string
+  gatewayUrl: string
+  publicUrl: string | null
+  dataDir: string
+  log: Logger
+  version: string
+  isolation: HostedIsolation
+  importSettings: ImportSettings
+  fetchImpl?: FetchLike
+}): {
+  createInstanceBridge: (entry: InstanceBridgeEntry, shared: SharedDiscordClient) => V2Bridge
+  createHosted: (entry: HostedEntry) => HostedInstance
+} {
+  const { log } = ctx
+  const instanceImportSlots = new ImportSlots(1)
+  const appEmojiDir = join(ctx.dataDir, 'app-emojis')
+
+  const createInstanceBridge = (entry: InstanceBridgeEntry, shared: SharedDiscordClient) => new V2Bridge({
+    label: `[${entry.bridge_id.slice(0, 8)}]`,
+    harmonyToken: entry.harmony_token,
+    apiBase: ctx.apiBase,
+    gatewayUrl: ctx.gatewayUrl,
+    baseUrl: ctx.publicUrl,
+    discordToken: '',
+    sharedDiscord: shared,
+    dataDir: join(ctx.dataDir, 'instance', safeDirName(entry.bridge_id)),
+    appEmojiDir,
+    log,
+    version: ctx.version,
+    authHint: HOSTED_AUTH_HINT,
+    import: importOptions(ctx.importSettings, instanceImportSlots),
+    fetchImpl: ctx.fetchImpl,
+  })
+
+  const createHosted = (entry: HostedEntry): HostedInstance => {
+    const label = `[${entry.bridge_id.slice(0, 8)}]`
+    const dataDir = join(ctx.dataDir, 'hosted', safeDirName(entry.bridge_id))
+    if (ctx.isolation.mode === 'inline') {
+      return new V2Bridge({
+        label,
+        harmonyToken: entry.harmony_token,
+        apiBase: ctx.apiBase,
+        gatewayUrl: ctx.gatewayUrl,
+        baseUrl: ctx.publicUrl,
+        discordToken: entry.discord_token,
+        dataDir,
+        appEmojiDir,
+        log,
+        version: ctx.version,
+        authHint: HOSTED_AUTH_HINT,
+        discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
+        import: importOptions(ctx.importSettings),
+        fetchImpl: ctx.fetchImpl,
+      })
+    }
+    const workerData: HostedWorkerData = {
+      entry,
+      apiBase: ctx.apiBase,
+      gatewayUrl: ctx.gatewayUrl,
+      baseUrl: ctx.publicUrl,
+      dataDir,
+      appEmojiDir,
+      logLevel: log.level,
+      version: ctx.version,
+      healthIntervalMs: HOSTED_HEALTH_INTERVAL_MS,
+      import: ctx.importSettings,
+    }
+    return new WorkerHostedInstance({
+      workerUrl: new URL('./hostedWorker.js', import.meta.url),
+      workerData,
+      heapMb: ctx.isolation.heapMb,
+      log: log.child(label),
+      healthStaleMs: HOSTED_HEALTH_INTERVAL_MS * 6,
+    })
+  }
+
+  return { createInstanceBridge, createHosted }
+}
+
+/**
  * Host mode: every own-token hosted bridge (one Discord client each) and
  * every instance bot bridge (one shared Discord client), reconciled every 60 s.
  * With worker isolation each own-token bridge runs in its own thread under a
  * heap limit; instance bot bridges share one login and stay on the main thread.
- * Neither kind imports history; no importer or scheduler is built for them.
+ * Both kinds import history when Harmony's configuration allows it: instance
+ * bot bridges one job at a time between them, each own-token bridge one of its
+ * own. Harmony's running cap bounds the instance as a whole.
  */
 export async function runHost(opts: {
   harmonyUrl: string
@@ -179,6 +270,7 @@ export async function runHost(opts: {
   log: Logger
   version: string
   hostedIsolation?: HostedIsolation
+  import?: ImportSettings
   fetchImpl?: FetchLike
 }): Promise<Launched> {
   const { log } = opts
@@ -199,6 +291,17 @@ export async function runHost(opts: {
   const publicUrl = opts.publicUrl ?? (endpoints.direct ? null : opts.harmonyUrl)
 
   const instanceLog = log.child('[instance]')
+  const factories = hostBridgeFactories({
+    apiBase: endpoints.apiBase,
+    gatewayUrl: endpoints.gatewayUrl,
+    publicUrl,
+    dataDir: opts.dataDir,
+    log,
+    version: opts.version,
+    isolation,
+    importSettings: opts.import ?? DEFAULT_IMPORT_SETTINGS,
+    fetchImpl: opts.fetchImpl,
+  })
   const instance = new InstanceHost<SharedDiscordClient>({
     log: instanceLog,
     fetchInstance: () => BridgeApi.hostedInstance(endpoints.apiBase, opts.hostSecret, opts.fetchImpl),
@@ -208,63 +311,9 @@ export async function runHost(opts: {
       log: instanceLog,
       fetchImpl: opts.fetchImpl,
     }),
-    createBridge: (entry, shared) => new V2Bridge({
-      label: `[${entry.bridge_id.slice(0, 8)}]`,
-      harmonyToken: entry.harmony_token,
-      apiBase: endpoints.apiBase,
-      gatewayUrl: endpoints.gatewayUrl,
-      baseUrl: publicUrl,
-      discordToken: '',
-      sharedDiscord: shared,
-      dataDir: join(opts.dataDir, 'instance', safeDirName(entry.bridge_id)),
-      appEmojiDir: join(opts.dataDir, 'app-emojis'),
-      log,
-      version: opts.version,
-      authHint: HOSTED_AUTH_HINT,
-      fetchImpl: opts.fetchImpl,
-    }),
+    createBridge: factories.createInstanceBridge,
   })
-
-  const createHosted = (entry: HostedEntry): HostedInstance => {
-    const label = `[${entry.bridge_id.slice(0, 8)}]`
-    const dataDir = join(opts.dataDir, 'hosted', safeDirName(entry.bridge_id))
-    const appEmojiDir = join(opts.dataDir, 'app-emojis')
-    if (isolation.mode === 'inline') {
-      return new V2Bridge({
-        label,
-        harmonyToken: entry.harmony_token,
-        apiBase: endpoints.apiBase,
-        gatewayUrl: endpoints.gatewayUrl,
-        baseUrl: publicUrl,
-        discordToken: entry.discord_token,
-        dataDir,
-        appEmojiDir,
-        log,
-        version: opts.version,
-        authHint: HOSTED_AUTH_HINT,
-        discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
-        fetchImpl: opts.fetchImpl,
-      })
-    }
-    const workerData: HostedWorkerData = {
-      entry,
-      apiBase: endpoints.apiBase,
-      gatewayUrl: endpoints.gatewayUrl,
-      baseUrl: publicUrl,
-      dataDir,
-      appEmojiDir,
-      logLevel: log.level,
-      version: opts.version,
-      healthIntervalMs: HOSTED_HEALTH_INTERVAL_MS,
-    }
-    return new WorkerHostedInstance({
-      workerUrl: new URL('./hostedWorker.js', import.meta.url),
-      workerData,
-      heapMb: isolation.heapMb,
-      log: log.child(label),
-      healthStaleMs: HOSTED_HEALTH_INTERVAL_MS * 6,
-    })
-  }
+  const createHosted = factories.createHosted
 
   const runner = new HostRunner({
     log,

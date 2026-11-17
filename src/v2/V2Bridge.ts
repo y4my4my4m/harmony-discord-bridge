@@ -43,8 +43,9 @@ export interface RuntimeLike {
 }
 
 /**
- * History import wiring, for a self-run bridge. A hosted bridge and the instance bot never
- * import, and Harmony refuses them (`history_import.reason: 'bridge_mode'`).
+ * History import wiring. Harmony decides per bridge through `history_import`: under the instance
+ * setting self_run only a self-run bridge imports (`reason: 'bridge_mode'` for the others), under
+ * all every bridge does. `slots` is shared by every bridge on one Discord login.
  */
 export interface V2ImportOptions {
   slots: ImportSlots
@@ -184,9 +185,9 @@ export class V2Bridge {
     this.scheduler?.restart(restarted)
   }
 
-  /** Whether this bridge may import at all: self-run, with its own Discord client. */
+  /** Whether this bridge was built with import wiring. */
   private importCapable(): boolean {
-    return this.opts.import !== undefined && this.opts.sharedDiscord === undefined
+    return this.opts.import !== undefined
   }
 
   private importEnabled(): boolean {

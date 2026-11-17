@@ -266,7 +266,7 @@ and is counted in the log the same way.
 - `/bridge sync-emojis [mode] [dry_run]`: copy the Discord server's emoji to Harmony and keep them up to date (Harmony 1.9.7+).
 - `/bridge sync-stickers [mode] [dry_run]`: the same for stickers (Harmony 1.9.7+). Lottie stickers, names under 2 characters and files Harmony refuses (over 512 KB, over 320 × 320, animation over 5 s, unsupported image) are skipped and listed. A dry run cannot tell which files Harmony will refuse. If "max stickers per server" is 0, server stickers are off and nothing happens.
 - `/bridge sync-sounds [mode] [dry_run]`: the same for the soundboard (Harmony 1.9.7+). Harmony allows 48 sounds per server. A sound's custom emoji is carried over when that emoji is on Harmony; run `/bridge import-emojis` first.
-- `/bridge import-history`: import a channel's old Discord messages into Harmony (Harmony 1.9.7+, self-run bridges only; see below). `action:` is `start` (default; asks before it begins), `status` or `cancel`; `scope:` is `channel` (default; inside a thread, its parent channel) or `all` bridged channels.
+- `/bridge import-history`: import a channel's old Discord messages into Harmony (Harmony 1.9.7+; see below). `action:` is `start` (default; asks before it begins), `status` or `cancel`; `scope:` is `channel` (default; inside a thread, its parent channel) or `all` bridged channels.
 - `/bridge-privacy opt-out | opt-in | status | erase`: for every member, about their own messages (Harmony 1.9.7+; see [Privacy](#privacy)).
 
 `/bridge` needs the Discord **Administrator** permission. `/bridge-privacy` needs none.
@@ -317,9 +317,15 @@ Messages written before a channel was bridged can be copied into Harmony.
 **Requirements**
 
 - Harmony 1.9.7 or later, with history import turned on by the instance
-  administrator (it is off by default).
-- A bridge you run yourself. A hosted bridge and the instance's bot never
-  import, and show no import command.
+  administrator (it is off by default). The setting has two levels: bridges
+  run by their server's owner with their own Discord application, or every
+  bridge (Harmony 1.9.8 and bridge 2.8.0), the instance's bot and own-bot
+  hosted bridges included. A bridge Harmony does not admit shows no import
+  command.
+- In host mode the instance bot's bridges import one channel at a time between
+  them, on their one Discord login; each own-bot hosted bridge imports one at
+  a time of its own. `BRIDGE_IMPORT_POLL_MS` and `BRIDGE_IMPORT_PAGE_DELAY_MS`
+  apply to every bridge of the process.
 - The channel's pair brings Discord messages to Harmony (direction "both" or
   "Discord → Harmony"), and the Harmony channel is not encrypted.
 - The bot has the **Message Content** intent and can read the channel's
@@ -336,16 +342,19 @@ Messages written before a channel was bridged can be copied into Harmony.
   `action:cancel` stops it.
 - In Harmony: Server settings → Discord Bridge, for one channel or all paired
   channels. A channel whose history @everyone cannot read on Discord (no View
-  Channel or no Read Message History) is not imported this way: the job fails
-  with `discord_approval_required`, and someone who can read it starts it with
-  the Discord command instead.
+  Channel or no Read Message History) is private: Harmony marks it with a lock
+  and its start asks for a second confirmation naming the private channels.
+  Without that confirmation (or from a Harmony before 1.9.8) the job fails with
+  `discord_approval_required`; `/bridge import-history scope:all` on Discord
+  then starts every channel the person running it can read, in one command.
 
 When an import starts, the bot posts and pins one notice in the Discord
 channel: the channel is bridged to Harmony, older messages are being copied,
-and `/bridge-privacy` opts out or erases. Each job posts it once; a job that
-finds the bot's notice among the pins posts none, so with Pin Messages a channel
-keeps one notice. The import runs all the same when the bot cannot post or pin
-(the log says so).
+and `/bridge-privacy` opts out or erases. The notice is sent silently (no push
+notification), and the bot deletes Discord's "pinned a message" line its pin
+adds. Each job posts it once; a job that finds the bot's notice among the pins
+posts none, so with Pin Messages a channel keeps one notice. The import runs
+all the same when the bot cannot post or pin (the log says so).
 
 There is no undo button. What is imported stays on Harmony until it is deleted
 there, or until its author erases their own messages with `/bridge-privacy erase`.
@@ -541,7 +550,7 @@ settings). Set the same `BRIDGE_HOST_SECRET` on bot-gateway and here:
 | `HARMONY_MEDIA_ORIGIN` | Kong as the container reaches it, e.g. `http://supabase-kong:8000` on the Docker network or `http://127.0.0.1:8000`. Files and emoji whose address starts with the public Harmony address are downloaded from here instead (same path and signed query). Kong routes by path, so the different host name does not matter. |
 | `BRIDGE_HOSTED_ISOLATION` | `worker` (default): each own-bot bridge runs in its own thread. `inline`: all on the main thread. |
 | `BRIDGE_HOSTED_HEAP_MB` | Memory limit of each own-bot bridge thread, in MB. Default `256`, minimum `64`. |
-| `DATA_DIR`, `LOG_LEVEL`, `HEALTH_PORT`, `MAX_UPLOAD_MB` | As above. |
+| `DATA_DIR`, `LOG_LEVEL`, `HEALTH_PORT`, `MAX_UPLOAD_MB`, `BRIDGE_IMPORT_POLL_MS`, `BRIDGE_IMPORT_PAGE_DELAY_MS` | As above. |
 
 The container can run on any machine that reaches `HARMONY_URL`. The lists
 are re-read every 60 s: new bridges start, removed ones stop, changed tokens

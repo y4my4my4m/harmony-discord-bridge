@@ -38,7 +38,7 @@ function fakeClient(guilds: ReturnType<typeof fakeGuild>[]) {
   return { guilds: { cache: new Map(guilds.map(g => [g.id, g])) } }
 }
 
-const { ViewChannel, SendMessages, ManageWebhooks } = PermissionFlagsBits
+const { ViewChannel, SendMessages, ManageWebhooks, ReadMessageHistory } = PermissionFlagsBits
 
 describe('collectGuildViews', () => {
   it('reads per-channel permissions of the bot', () => {
@@ -55,6 +55,27 @@ describe('collectGuildViews', () => {
     expect(guild.channels[0]).toMatchObject({ can_view: true, can_send: true, can_manage_webhooks: true })
     expect(guild.channels[1]).toMatchObject({ can_view: true, can_send: false, can_manage_webhooks: false })
     expect(guild.channels[2]).toMatchObject({ can_view: false, can_send: false, can_manage_webhooks: false })
+    expect(guild.channels[0]).not.toHaveProperty('everyone_can_view')
+  })
+
+  it('marks channels whose history @everyone cannot read', () => {
+    const everyone = { id: 'g1' }
+    const reads: Record<string, bigint[]> = {
+      open: [ViewChannel, ReadMessageHistory],
+      hidden: [],
+      'no-history': [ViewChannel],
+    }
+    const g = fakeGuild('g1', Object.keys(reads).map(id => ({ id, name: id, perms: [ViewChannel] })))
+    for (const channel of g.channels.cache.values()) {
+      const own = channel.permissionsFor
+      channel.permissionsFor = (member: unknown) => member === everyone
+        ? { has: (flag: bigint) => reads[channel.id].includes(flag) }
+        : own(member)
+    }
+    const [guild] = collectGuildViews(fakeClient([{ ...g, roles: { everyone } } as any]))
+    expect(Object.fromEntries(guild.channels.map(c => [c.id, c.everyone_can_view]))).toEqual({
+      open: true, hidden: false, 'no-history': false,
+    })
   })
 })
 

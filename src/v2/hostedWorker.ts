@@ -1,5 +1,7 @@
 import { parentPort, workerData } from 'worker_threads'
 import { V2Bridge } from './V2Bridge.js'
+import { ImportSlots } from '../runtime/importScheduler.js'
+import { DEFAULT_IMPORT_SETTINGS } from '../env.js'
 import { HOSTED_AUTH_HINT, HOSTED_DISCORD_TOKEN_HINT } from './hints.js'
 import { Logger, errorText } from '../log.js'
 import type { FromWorker, HostedWorkerData, ToWorker } from './hostedWorkerProtocol.js'
@@ -33,6 +35,7 @@ const bridge = new V2Bridge({
   version: data.version,
   authHint: HOSTED_AUTH_HINT,
   discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
+  import: { slots: new ImportSlots(1), settings: data.import ?? DEFAULT_IMPORT_SETTINGS },
 })
 
 const pushHealth = () => send({ type: 'health', report: bridge.health() })

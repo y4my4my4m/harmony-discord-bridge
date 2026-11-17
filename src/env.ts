@@ -160,7 +160,7 @@ export function parseHostedIsolation(env: NodeJS.ProcessEnv): HostedIsolation | 
   return { mode, heapMb }
 }
 
-/** History import tuning (BRIDGE_IMPORT_*). Self-run mode only. */
+/** History import tuning (BRIDGE_IMPORT_*), for every v2 bridge this process runs. */
 export interface ImportSettings {
   /** How often the bridge asks Harmony for import jobs while import is enabled. */
   pollMs: number

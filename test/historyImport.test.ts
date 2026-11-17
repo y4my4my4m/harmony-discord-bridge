@@ -469,6 +469,24 @@ describe('HistoryImporter Discord-side approval and notice', () => {
     expect(posts.flat()).toHaveLength(3)
   })
 
+  it('imports a hidden channel when the start from Harmony consented to private channels', async () => {
+    const { importer, posts, everyoneCanView, ensureNotice, j } = setup({
+      all: history(3), everyoneCanView: false, jobOver: { requested_via: 'harmony', private_approved: true },
+    })
+    expect(await run(importer, j)).toBe('done')
+    expect(posts.flat()).toHaveLength(3)
+    expect(everyoneCanView).not.toHaveBeenCalled()
+    expect(ensureNotice).toHaveBeenCalledTimes(1)
+  })
+
+  it('still asks for Discord approval when private_approved is false', async () => {
+    const { importer, patches, j } = setup({
+      all: history(3), everyoneCanView: false, jobOver: { requested_via: 'harmony', private_approved: false },
+    })
+    expect(await run(importer, j)).toBe('failed')
+    expect(patches.at(-1)).toEqual({ state: 'failed', error: 'discord_approval_required' })
+  })
+
   it('imports a hidden channel when the job was started on Discord', async () => {
     const { importer, posts, everyoneCanView, j } = setup({ all: history(3), everyoneCanView: false, jobOver: { requested_via: 'discord' } })
     expect(await run(importer, j)).toBe('done')

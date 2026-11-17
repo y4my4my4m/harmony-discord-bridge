@@ -1108,7 +1108,7 @@ function importErrorText(code: string): string {
     case 'pair_not_importable': return "the pair no longer brings Discord messages to Harmony"
     case 'channel_encrypted': return 'channel is now encrypted'
     case 'import_disabled': return 'history import was turned off'
-    case 'discord_approval_required': return 'the Discord channel or its history is hidden from @everyone: run `/bridge import-history` in it on Discord'
+    case 'discord_approval_required': return 'the Discord channel or its history is hidden from @everyone: run `/bridge import-history scope:All bridged channels` once on Discord, or start it again in Harmony with private channels included'
     case 'discord_channel_unsupported': return 'this kind of Discord channel cannot be imported'
     case 'discord_access_lost': return 'the bot lost access to the Discord channel'
     case 'bridge_stalled': return 'the import stopped making progress'
@@ -1120,7 +1120,7 @@ function importErrorText(code: string): string {
 /** Why the import routes refuse this bridge, for the person who ran the command. */
 function importDisabledText(err: BridgeApiError): string {
   return err.details.reason === 'bridge_mode'
-    ? '❌ Only a bridge you run yourself can import history; a hosted bridge and the instance bot cannot.'
+    ? '❌ This Harmony instance imports history only through bridges their server owner runs with their own Discord application. An instance admin can allow every bridge.'
     : '❌ History import is turned off on this Harmony instance. An instance admin can turn it on.'
 }
 
@@ -1137,7 +1137,7 @@ function memberCanReadHistory(channel: unknown, member: unknown): boolean {
 async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
   const api = rt.hooks.importApi
   if (!api || rt.hooks.importEnabled?.() !== true) {
-    await command.reply({ content: '❌ History import is not available for this bridge. It needs a bridge you run yourself, Harmony 1.9.7 or later, and the instance setting turned on.', flags: MessageFlags.Ephemeral })
+    await command.reply({ content: '❌ History import is not available for this bridge. It needs Harmony 1.9.7 or later with the instance setting turned on; a hosted bridge or the instance bot also needs Harmony 1.9.8 with every bridge allowed.', flags: MessageFlags.Ephemeral })
     return
   }
   const action = command.options.getString('action', false) ?? 'start'

@@ -259,11 +259,12 @@ export class HistoryImporter {
       run.started = true
       if (state.cancel_requested) await this.cancel(run)
 
-      // A channel whose history @everyone cannot read is imported only when someone on Discord asked for it.
-      if (state.requested_via === 'harmony') {
+      // A channel whose history @everyone cannot read is imported when someone on Discord asked
+      // for it, or when the Harmony-side start carried consent for private channels.
+      if (state.requested_via === 'harmony' && state.private_approved !== true) {
         const open = await this.discordCall(run, () => this.deps.everyoneCanView(state.discord_channel_id))
         if (!open) {
-          this.deps.log.warn(`History import ${state.id}: Discord channel ${state.discord_channel_id} or its history is hidden from @everyone; it needs /bridge import-history on Discord`)
+          this.deps.log.warn(`History import ${state.id}: Discord channel ${state.discord_channel_id} or its history is hidden from @everyone, and the start from Harmony did not include private channels`)
           await this.fail(run, 'discord_approval_required')
         }
       }

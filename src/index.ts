@@ -64,7 +64,6 @@ async function main() {
     if (plan.kind === 'v1') {
       launched = await runV1(plan.configPath, log)
     } else if (plan.kind === 'self') {
-      // Only self-run mode imports: a bad BRIDGE_IMPORT_* value is fatal here and nowhere else.
       const importSettings = parseImportSettings(process.env)
       if (!importSettings.ok) fatal(importSettings.message)
       launched = await runSelf({
@@ -78,6 +77,8 @@ async function main() {
         import: importSettings.settings,
       })
     } else {
+      const importSettings = parseImportSettings(process.env)
+      if (!importSettings.ok) fatal(importSettings.message)
       launched = await runHost({
         harmonyUrl: plan.harmonyUrl,
         hostSecret: plan.hostSecret,
@@ -86,6 +87,7 @@ async function main() {
         log,
         version,
         hostedIsolation: plan.hostedIsolation,
+        import: importSettings.settings,
       })
     }
   } catch (err) {

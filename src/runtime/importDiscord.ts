@@ -1,4 +1,4 @@
-import { PermissionFlagsBits, type Client, type GuildMember, type Message as DiscordMessage } from 'discord.js'
+import { MessageFlags, MessageType, PermissionFlagsBits, type Client, type GuildMember, type Message as DiscordMessage } from 'discord.js'
 import { isPrivateThread, supportsThreads } from './threadSync.js'
 import { importUnsupported, type ImportThreadLike, type ThreadListPage } from './historyImport.js'
 
@@ -46,6 +46,25 @@ export function canReadHistory(permissions: { has(flag: bigint): boolean } | nul
     && permissions.has(PermissionFlagsBits.ReadMessageHistory) === true
 }
 
+/**
+ * Deletes the "pinned a message" line Discord posts after the bot pins `noticeId`. The notice
+ * itself stays pinned; a line that cannot be found or deleted is left.
+ */
+async function removePinAnnouncement(channel: any, noticeId: string, botId: string | undefined): Promise<void> {
+  try {
+    const after = await channel.messages.fetch({ after: noticeId, limit: 10, cache: false })
+    for (const message of after.values()) {
+      if (message?.type !== MessageType.ChannelPinnedMessage) continue
+      if (message.reference?.messageId !== noticeId) continue
+      if (botId && message.author?.id !== botId) continue
+      await message.delete()
+      return
+    }
+  } catch {
+    // The notice is pinned; the announcement line is cosmetic.
+  }
+}
+
 /** Wait for the gateway's answer to one membership request. */
 const MEMBER_FETCH_TIMEOUT_MS = 20_000
 
@@ -57,7 +76,7 @@ export interface DiscordImportAccess {
   everyoneCanView(channelId: string): Promise<boolean>
   ensureNotice(channelId: string): Promise<void>
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
-  hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
+  starterMessageAuthor(channelId: string, threadId: string): Promise<string | null>
   fetchThread(channelId: string, threadId: string): Promise<ImportThreadLike | null>
 }
 
@@ -152,8 +171,14 @@ export function discordImportAccess(getClient: () => Client | null, guildId: () 
           if (message?.author?.id === botId && typeof message.content === 'string' && message.content.startsWith(IMPORT_NOTICE_MARKER)) return
         }
       }
-      const notice = await channel.send({ content: IMPORT_NOTICE_TEXT, allowedMentions: { parse: [] } })
+      // @silent: members are told without a push notification in every imported channel.
+      const notice = await channel.send({
+        content: IMPORT_NOTICE_TEXT,
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressNotifications,
+      })
       await notice.pin()
+      await removePinAnnouncement(channel, notice.id, botId)
     },
 
     async listThreads(channelId, rawCursor) {
@@ -204,13 +229,13 @@ export function discordImportAccess(getClient: () => Client | null, guildId: () 
       return thread as ImportThreadLike
     },
 
-    async hasStarterMessage(channelId, threadId) {
+    async starterMessageAuthor(channelId, threadId) {
       const channel = await pairChannel(channelId)
       try {
-        await channel.messages.fetch({ message: threadId, cache: false, force: true })
-        return true
+        const message = await channel.messages.fetch({ message: threadId, cache: false, force: true })
+        return typeof message?.author?.id === 'string' ? message.author.id : null
       } catch (err) {
-        if (discordCode(err) === UNKNOWN_MESSAGE) return false
+        if (discordCode(err) === UNKNOWN_MESSAGE) return null
         throw err
       }
     },

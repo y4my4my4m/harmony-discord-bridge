@@ -350,12 +350,22 @@ describe('MessageTranslator.discordToHarmonyParts', () => {
     t.setHarmonyMemberLookup((username) => (username === 'bob' ? { id: 'h-bob', username: 'bob', displayName: 'Bob', domain: null, isLocal: true } : null))
     const parts = t.discordToHarmonyParts(discordMessage({ content: 'mail bob@example.com or (@bob), @alice@mastodon.social, @everyone' }))
     const mentions = parts.filter((p: any) => p.type === 'mention')
-    expect(mentions.map((m: any) => [m.username, m.domain])).toEqual([['bob', 'har.mony.lol'], ['alice', 'mastodon.social']])
+    expect(mentions.map((m: any) => [m.username, m.domain])).toEqual([['bob', 'har.mony.lol']])
     expect(parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('')).toContain('mail bob@example.com or (')
     expect(parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('')).toContain('@everyone')
 
     const url = t.discordToHarmonyParts(discordMessage({ content: 'see https://mastodon.social/@bob/123' }))
     expect(url.some((p: any) => p.type === 'mention')).toBe(false)
+  })
+
+  it('keeps a handle that names no Harmony member as the text typed, domain included', () => {
+    const t = translator()
+    t.setHarmonyMemberLookup((username) => (username === 'bob' ? { id: 'h-bob', username: 'bob', displayName: 'Bob', domain: null, isLocal: true } : null))
+    const parts = t.discordToHarmonyParts(discordMessage({ content: 'ask @alice@mastodon.social or @carol, not @bob' }))
+    expect(parts).toEqual([
+      { type: 'text', text: 'ask @alice@mastodon.social or @carol, not ' },
+      { type: 'mention', userId: 'h-bob', username: 'bob', domain: 'har.mony.lol', isLocal: true, displayName: 'Bob' },
+    ])
   })
 
   it('marks voice messages and audio attachments as audio', () => {

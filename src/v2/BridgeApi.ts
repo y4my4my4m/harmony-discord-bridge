@@ -27,8 +27,9 @@ export interface BridgeV2Config {
   /** Read when present; the contract does not list it. */
   base_url?: string
   /**
-   * Whether this bridge may import history now (Harmony 1.9.7). `bridge_mode`: hosted or the
-   * instance bot, which never import. `instance_off`: the instance setting. Absent from an
+   * Whether this bridge may import history now (Harmony 1.9.7). `instance_off`: the instance
+   * setting is off. `bridge_mode`: the setting admits self-run bridges only and this one is hosted
+   * or the instance bot (Harmony 1.9.8 adds the setting that admits every bridge). Absent from an
    * older gateway, read as disabled.
    */
   history_import?: { enabled: boolean; reason: 'instance_off' | 'bridge_mode' | null }
@@ -98,6 +99,11 @@ export interface ImportJob {
   automod_skipped?: number
   /** The Discord member who ran the command. */
   requested_by_remote?: { id: string; username?: string } | null
+  /**
+   * The Harmony-side start consented to Discord channels hidden from @everyone (Harmony 1.9.8).
+   * Absent from an older gateway, read as false.
+   */
+  private_approved?: boolean
   created_at: string
   updated_at: string
   finished_at: string | null
@@ -157,6 +163,8 @@ export interface ImportThreadBody {
   name: string
   created_at: string
   starter_discord_message_id?: string | null
+  /** Author of the starter message; Harmony 1.9.8 titles the thread Thread for an opted-out one. */
+  starter_discord_user_id?: string | null
   discord_user?: Record<string, unknown> | null
   archived: boolean
   locked: boolean

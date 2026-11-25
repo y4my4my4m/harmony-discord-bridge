@@ -190,6 +190,34 @@ describe('Discord → Harmony threads', () => {
     await runtime.stop()
   })
 
+  it('tells Harmony when the thread was created and who wrote a starter message it has no copy of', async () => {
+    const { rt, runtime, client, channel, h } = await setup()
+    // Started on a message of an opted-out member, which the bridge left out of Harmony.
+    const onLeftOut = fakeThread(client, channel, '1500000000000000300', { name: 'Dana says hi', ownerId: 'du-9' })
+    onLeftOut.createdTimestamp = Date.UTC(2026, 10, 20, 10, 0, 0)
+    onLeftOut.fetchStarterMessage = vi.fn(async () => ({ id: '1500000000000000300', author: { id: 'du-dana' } }))
+    await rt.onDiscordThreadCreate(onLeftOut)
+    expect(h.createThread).toHaveBeenLastCalledWith('h1', 'Dana says hi', {
+      messageId: null,
+      discordThreadId: '1500000000000000300',
+      createdAt: '2026-11-20T10:00:00.000Z',
+      starterDiscordUserId: 'du-dana',
+    })
+
+    // A bridged starter names its author on Harmony; a thread from before 2022 has its id's time.
+    rt.discordToHarmonyMessages.set('1500000000000000400', 'hm-400')
+    const onBridged = fakeThread(client, channel, '1500000000000000400', { name: 'Plans', ownerId: 'du-9' })
+    onBridged.fetchStarterMessage = vi.fn(async () => ({ id: '1500000000000000400', author: { id: 'du-erin' } }))
+    await rt.onDiscordThreadCreate(onBridged)
+    expect(h.createThread).toHaveBeenLastCalledWith('h1', 'Plans', {
+      messageId: 'hm-400',
+      discordThreadId: '1500000000000000400',
+      createdAt: new Date(Number((1500000000000000400n >> 22n) + 1420070400000n)).toISOString(),
+    })
+    expect(onBridged.fetchStarterMessage).not.toHaveBeenCalled()
+    await runtime.stop()
+  })
+
   it('routes edits and reactions in a Discord thread through the parent pair', async () => {
     const { rt, runtime, client, channel } = await setup()
     const dThread = fakeThread(client, channel, 'dt-1')

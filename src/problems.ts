@@ -161,6 +161,8 @@ export interface DiscordChannelView {
   can_view: boolean
   can_send: boolean
   can_manage_webhooks: boolean
+  /** @everyone has View Channel and Read Message History. Absent when the @everyone role is unknown. */
+  everyone_can_view?: boolean
 }
 
 export interface DiscordGuildView {

@@ -504,7 +504,13 @@ export class HarmonyClient extends EventEmitter {
   async createThread(
     channelId: string,
     name: string,
-    opts: { messageId?: string | null; discordThreadId?: string | null; discordUser?: Record<string, unknown> | null } = {},
+    opts: {
+      messageId?: string | null
+      discordThreadId?: string | null
+      discordUser?: Record<string, unknown> | null
+      createdAt?: string | null
+      starterDiscordUserId?: string | null
+    } = {},
   ): Promise<HarmonyThread> {
     return this.sendJson('POST', `/channels/${channelId}/threads`, {
       name,
@@ -512,6 +518,10 @@ export class HarmonyClient extends EventEmitter {
       ...(opts.discordThreadId ? { discord_thread_id: opts.discordThreadId } : {}),
       // The member who started the Discord thread names the Harmony notice (Harmony 1.7.6).
       ...(opts.discordUser ? { discord_user: opts.discordUser } : {}),
+      // Harmony 1.9.8 titles the thread Thread when its starter, or the author of the message it
+      // starts on, opted out, or opted back in after writing; earlier versions ignore both.
+      ...(opts.createdAt ? { created_at: opts.createdAt } : {}),
+      ...(opts.starterDiscordUserId ? { starter_discord_user_id: opts.starterDiscordUserId } : {}),
     }, 'Failed to create thread')
   }
 

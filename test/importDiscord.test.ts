@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ChannelType, Collection, PermissionFlagsBits } from 'discord.js'
+import { ChannelType, Collection, MessageFlags, MessageType, PermissionFlagsBits } from 'discord.js'
 import { discordImportAccess, IMPORT_NOTICE_MARKER, IMPORT_NOTICE_TEXT } from '../src/runtime/importDiscord.js'
 import { FakeDiscordClient, discordError } from './fakeDiscord.js'
 
@@ -65,7 +65,7 @@ describe('discordImportAccess.fetchPage', () => {
     const { channel, access } = setup()
     channel.messages = { fetch: vi.fn(async () => new Collection()) }
     await access.fetchPage('c1', undefined)
-    await access.hasStarterMessage('c1', SNOW(5))
+    await access.starterMessageAuthor('c1', SNOW(5))
     expect(channel.messages.fetch.mock.calls.map((c: any[]) => c[0].cache)).toEqual([false, false])
   })
 })
@@ -140,19 +140,27 @@ describe('discordImportAccess.everyoneCanView', () => {
 })
 
 describe('discordImportAccess.ensureNotice', () => {
-  function noticeSetup(pins: any[]) {
+  function noticeSetup(pins: any[], after: any[] = []) {
     const t = setup()
     const sent: any[] = []
     const pin = vi.fn(async () => {})
-    t.channel.messages = { fetchPins: vi.fn(async () => ({ items: pins.map(message => ({ message, pinnedTimestamp: 1 })), hasMore: false })) }
+    t.channel.messages = {
+      fetchPins: vi.fn(async () => ({ items: pins.map(message => ({ message, pinnedTimestamp: 1 })), hasMore: false })),
+      fetch: vi.fn(async () => new Collection(after.map(m => [m.id, m]))),
+    }
     t.channel.send = vi.fn(async (payload: any) => { sent.push(payload); return { id: 'n1', pin } })
     return { ...t, sent, pin }
   }
 
-  it('posts the notice without pings and pins it when the channel has none', async () => {
+  const pinLine = (over: Record<string, unknown> = {}) => ({
+    id: 'p1', type: MessageType.ChannelPinnedMessage, author: { id: 'bot-user' }, reference: { messageId: 'n1' },
+    delete: vi.fn(async () => {}), ...over,
+  })
+
+  it('posts the notice silently without pings and pins it when the channel has none', async () => {
     const { access, sent, pin } = noticeSetup([{ author: { id: 'someone' }, content: 'pinned by a member' }])
     await access.ensureNotice('c1')
-    expect(sent).toEqual([{ content: IMPORT_NOTICE_TEXT, allowedMentions: { parse: [] } }])
+    expect(sent).toEqual([{ content: IMPORT_NOTICE_TEXT, allowedMentions: { parse: [] }, flags: MessageFlags.SuppressNotifications }])
     expect(pin).toHaveBeenCalledTimes(1)
     expect(IMPORT_NOTICE_TEXT.startsWith(IMPORT_NOTICE_MARKER)).toBe(true)
     expect(IMPORT_NOTICE_TEXT).toContain('bridged to Harmony')
@@ -171,6 +179,29 @@ describe('discordImportAccess.ensureNotice', () => {
     const { access, channel } = noticeSetup([{ author: { id: 'someone' }, content: IMPORT_NOTICE_TEXT }])
     await access.ensureNotice('c1')
     expect(channel.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('deletes the "pinned a message" line its own pin posted, and no other message', async () => {
+    const own = pinLine()
+    const other = pinLine({ id: 'p2', reference: { messageId: 'someone-else' } })
+    const member = { id: 'm1', type: MessageType.Default, author: { id: 'someone' }, delete: vi.fn() }
+    const { access, channel } = noticeSetup([], [member, other, own])
+    await access.ensureNotice('c1')
+    expect(channel.messages.fetch).toHaveBeenCalledWith({ after: 'n1', limit: 10, cache: false })
+    expect(own.delete).toHaveBeenCalledTimes(1)
+    expect(other.delete).not.toHaveBeenCalled()
+    expect(member.delete).not.toHaveBeenCalled()
+  })
+
+  it('keeps the pinned notice when the pin line cannot be read or deleted', async () => {
+    const line = pinLine({ delete: vi.fn(async () => { throw discordError(50013, 'Missing Permissions') }) })
+    const failing = noticeSetup([], [line])
+    await expect(failing.access.ensureNotice('c1')).resolves.toBeUndefined()
+    expect(failing.pin).toHaveBeenCalledTimes(1)
+
+    const unreadable = noticeSetup([])
+    unreadable.channel.messages.fetch = vi.fn(async () => { throw discordError(50001, 'Missing Access') })
+    await expect(unreadable.access.ensureNotice('c1')).resolves.toBeUndefined()
   })
 
   it('rejects when the notice cannot be pinned', async () => {
@@ -279,13 +310,13 @@ describe('discordImportAccess threads', () => {
     expect(t.calls).toHaveLength(0)
   })
 
-  it('hasStarterMessage: true when the message with the thread id exists, false on 10008', async () => {
+  it('starterMessageAuthor: the author of the message with the thread id, null on 10008', async () => {
     const { channel, access } = setup()
-    channel.messages = { fetch: vi.fn(async () => ({ id: '5' })) }
-    expect(await access.hasStarterMessage('c1', '5')).toBe(true)
+    channel.messages = { fetch: vi.fn(async () => ({ id: '5', author: { id: '77' } })) }
+    expect(await access.starterMessageAuthor('c1', '5')).toBe('77')
     channel.messages = { fetch: vi.fn(async () => { throw discordError(10008) }) }
-    expect(await access.hasStarterMessage('c1', '5')).toBe(false)
+    expect(await access.starterMessageAuthor('c1', '5')).toBeNull()
     channel.messages = { fetch: vi.fn(async () => { throw discordError(50001) }) }
-    await expect(access.hasStarterMessage('c1', '5')).rejects.toMatchObject({ code: 50001 })
+    await expect(access.starterMessageAuthor('c1', '5')).rejects.toMatchObject({ code: 50001 })
   })
 })

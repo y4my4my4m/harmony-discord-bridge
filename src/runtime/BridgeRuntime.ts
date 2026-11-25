@@ -421,6 +421,7 @@ export class BridgeRuntime {
       discordMessageFor: (harmonyId, harmonyChannelId) => this.resolveParentDiscordId(harmonyId, harmonyChannelId),
       forgetHarmonyMessage: harmonyId => this.forgetHarmonyMessage(harmonyId),
       threadStarter: thread => this.discordThreadStarter(thread),
+      starterMessageAuthor: thread => this.discordStarterMessageAuthor(thread),
       postAnchor: (parent, author) => this.postThreadAnchor(parent, author),
       log: this.log,
     })
@@ -2178,6 +2179,21 @@ export class BridgeRuntime {
     const member = guild ? await guild.members.fetch(ownerId).catch(() => null) : null
     if (!member?.user) return null
     return buildDiscordUserMetadata(member.user, member, this.discordMemberDetails.get(ownerId)).discord_user
+  }
+
+  /**
+   * The Discord id of the author of the message a thread starts on. Null for a thread without
+   * one, or when Discord does not answer: Harmony then judges the title by the thread's starter.
+   */
+  private async discordStarterMessageAuthor(thread: { id: string }): Promise<string | null> {
+    const fetchStarter = (thread as Partial<AnyThreadChannel>).fetchStarterMessage
+    if (typeof fetchStarter !== 'function') return null
+    try {
+      const message = await fetchStarter.call(thread, { cache: false })
+      return message?.author?.id ?? null
+    } catch {
+      return null
+    }
   }
 
   /** A new Discord thread under a paired channel gets its Harmony thread at once. */

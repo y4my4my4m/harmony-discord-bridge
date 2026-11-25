@@ -483,28 +483,14 @@ export class MessageTranslator {
     this.harmonyMemberLookup = lookup
   }
 
-  private buildHarmonyMentionPart(
-    username: string,
-    domain: string | null,
-    lookup: HarmonyMentionLookup | null,
-  ) {
-    if (lookup) {
-      return {
-        type: 'mention',
-        userId: lookup.id,
-        username: lookup.username,
-        domain: lookup.domain || this.getHarmonyDomain(),
-        isLocal: lookup.isLocal,
-        displayName: lookup.displayName,
-      }
-    }
+  private harmonyMentionPart(lookup: HarmonyMentionLookup) {
     return {
       type: 'mention',
-      userId: `unresolved-${username}`,
-      username,
-      domain: domain || null,
-      isLocal: !domain,
-      displayName: username,
+      userId: lookup.id,
+      username: lookup.username,
+      domain: lookup.domain || this.getHarmonyDomain(),
+      isLocal: lookup.isLocal,
+      displayName: lookup.displayName,
     }
   }
 
@@ -709,11 +695,13 @@ export class MessageTranslator {
         last = PLAIN_MENTION_RE.lastIndex
         continue
       }
-      if (m.index > last) out.push({ type: 'text', text: text.substring(last, m.index) })
       const domain = m[2] || null
       const lookup = this.harmonyMemberLookup?.(username, domain) ?? null
       this.log.debug(`D→H plain mention: @${username}${domain ? `@${domain}` : ''}${lookup ? ` → ${lookup.id}` : ' (unresolved)'}`)
-      out.push(this.buildHarmonyMentionPart(username, domain, lookup))
+      // A handle naming no member stays in the surrounding text as typed.
+      if (!lookup) continue
+      if (m.index > last) out.push({ type: 'text', text: text.substring(last, m.index) })
+      out.push(this.harmonyMentionPart(lookup))
       last = PLAIN_MENTION_RE.lastIndex
     }
     if (last < text.length) out.push({ type: 'text', text: text.substring(last) })

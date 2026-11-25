@@ -76,7 +76,7 @@ export interface DiscordImportAccess {
   everyoneCanView(channelId: string): Promise<boolean>
   ensureNotice(channelId: string): Promise<void>
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
-  hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
+  starterMessageAuthor(channelId: string, threadId: string): Promise<string | null>
   fetchThread(channelId: string, threadId: string): Promise<ImportThreadLike | null>
 }
 
@@ -229,13 +229,13 @@ export function discordImportAccess(getClient: () => Client | null, guildId: () 
       return thread as ImportThreadLike
     },
 
-    async hasStarterMessage(channelId, threadId) {
+    async starterMessageAuthor(channelId, threadId) {
       const channel = await pairChannel(channelId)
       try {
-        await channel.messages.fetch({ message: threadId, cache: false, force: true })
-        return true
+        const message = await channel.messages.fetch({ message: threadId, cache: false, force: true })
+        return typeof message?.author?.id === 'string' ? message.author.id : null
       } catch (err) {
-        if (discordCode(err) === UNKNOWN_MESSAGE) return false
+        if (discordCode(err) === UNKNOWN_MESSAGE) return null
         throw err
       }
     },

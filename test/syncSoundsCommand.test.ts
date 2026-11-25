@@ -304,6 +304,27 @@ describe('runBridgeSyncSounds', () => {
     expect(t.last()).toContain('horn: clip download failed')
   })
 
+  it('reports a sound a person deleted on Harmony as left removed, not as a failure', async () => {
+    const t = setup({ mode: 'merge', discord: [discordSound('d1', 'horn'), discordSound('d2', 'bell')] })
+    t.rt.harmony.importDiscordSound.mockImplementation(async (_s: string, sound: any): Promise<any> => {
+      if (sound.name === 'horn') throw new HarmonyHttpError('SOUND_REMOVED: a person deleted this sound on Harmony', 403, 'SOUND_REMOVED')
+      return { status: 'created' }
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.last()).toContain('✅ Soundboard sync (merge)')
+    expect(t.last()).toContain('• Added: 1')
+    expect(t.last()).toContain('• Left removed (a person deleted them on Harmony): 1')
+    expect(t.last()).not.toContain('failure')
+  })
+
+  it('still reports any other 403 of an import as a failure', async () => {
+    const t = setup({ mode: 'merge', discord: [discordSound('d1', 'horn')] })
+    t.rt.harmony.importDiscordSound.mockRejectedValue(new HarmonyHttpError('Bot is not the Discord bridge of this server', 403))
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.last()).toContain('1 failure(s)')
+    expect(t.last()).not.toContain('Left removed')
+  })
+
   it('mirror replace deletes first when the soundboard is at its cap', async () => {
     const filler = Array.from({ length: 47 }, (_, i) => harmonyRow(`f${i}`, `f${i}`, `fd${i}`))
     const t = setup({

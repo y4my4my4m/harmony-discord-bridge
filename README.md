@@ -295,7 +295,9 @@ an instance upgrade the new commands appear on the bridge's next connection.
   Discord stays on Harmony until someone runs the sync with `mode:mirror`.
 - **What a person removed stays removed.** An emoji a Harmony moderator removed
   is not restored; one the bridge itself removed (mirror) comes back when the
-  Discord emoji still exists.
+  Discord emoji still exists. A sticker or sound a person deleted on Harmony,
+  and an emoji an instance admin purged, are not copied again (Harmony 1.9.8+);
+  the sync lists them as "left removed".
 - Harmony enforces both rules as well and the bridge reports its refusals as
   "kept", not as failures.
 - Removed emoji keep showing in old messages, and an instance administrator can

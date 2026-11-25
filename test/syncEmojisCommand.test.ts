@@ -256,6 +256,27 @@ describe('runBridgeSyncEmojis', () => {
     expect(last(t)).not.toContain('failure')
   })
 
+  it('reports a new emoji the gateway refuses as purged as left removed, not as a failure', async () => {
+    const t = setup({ mode: 'merge', discord: [dEmoji('1', 'rude'), dEmoji('2', 'fine')] })
+    t.rt.harmony.importDiscordEmoji.mockImplementation(async (_s: string, e: any): Promise<any> => {
+      if (e.name === 'rude') throw new HarmonyHttpError('EMOJI_REMOVED: an instance admin purged this emoji', 403, 'EMOJI_REMOVED')
+      return { status: 'created' }
+    })
+    await runBridgeSyncEmojis(t.rt, t.command)
+    expect(last(t)).toContain('✅ Emoji sync (merge)')
+    expect(last(t)).toContain('• Added: 1')
+    expect(last(t)).toContain('• Left removed (a person removed them on Harmony): 1')
+    expect(last(t)).not.toContain('failure')
+  })
+
+  it('lists an emoji Harmony lists as purged as left removed, and sends nothing for it', async () => {
+    const purged = { id: 'p1', name: 'rude', url: null, discord_emoji_id: '1', removed: true, imported: false, restorable: false }
+    const t = setup({ mode: 'mirror', discord: [dEmoji('1', 'rude')], harmony: [purged] })
+    await runBridgeSyncEmojis(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    expect(last(t)).toContain('Left removed: 1 emoji (a person removed it on Harmony)')
+  })
+
   it('plans one emoji per name when Discord has two of a name, the older one', async () => {
     const t = setup({ mode: 'merge', limit: 1, discord: [dEmoji('20', 'Dup'), dEmoji('10', 'dup')] })
     await runBridgeSyncEmojis(t.rt, t.command)

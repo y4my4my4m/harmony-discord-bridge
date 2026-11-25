@@ -136,7 +136,8 @@ function setup(opts: {
       reply_to_discord_message_id: null,
     })),
     listThreads,
-    hasStarterMessage: vi.fn(async (_c: string, threadId: string) => opts.starters?.has(threadId) ?? false),
+    // The starter messages of `starters` are u8's.
+    starterMessageAuthor: vi.fn(async (_c: string, threadId: string) => (opts.starters?.has(threadId) ? 'u8' : null)),
     fetchThread,
     threadStarter: opts.threadStarter ?? vi.fn(async (t: any) => ({ discordUser: t.ownerId ? { id: t.ownerId } : null, plainTitle: false })),
     ...(optOuts ? { optOuts } : {}),
@@ -789,9 +790,9 @@ describe('HistoryImporter threads and replies phases', () => {
 
     expect(api.importThread.mock.calls.map(c => c[1])).toEqual([
       { discord_thread_id: T1, name: `thread ${T1}`, created_at: new Date(DAY0 + 5000).toISOString(),
-        starter_discord_message_id: T1, discord_user: { id: 'u9' }, archived: true, locked: false },
+        starter_discord_message_id: T1, starter_discord_user_id: 'u8', discord_user: { id: 'u9' }, archived: true, locked: false },
       { discord_thread_id: T2, name: 'Thread', created_at: new Date(DAY0 + 5000).toISOString(),
-        starter_discord_message_id: null, discord_user: null, archived: false, locked: true },
+        starter_discord_message_id: null, starter_discord_user_id: null, discord_user: null, archived: false, locked: true },
     ])
     const threadPosts = posts.slice(1)
     expect(threadPosts.map(p => p.length)).toEqual([3, 2])
@@ -845,9 +846,23 @@ describe('HistoryImporter threads and replies phases', () => {
     expect(patches.at(-1)).toEqual({ state: 'done', thread_cursor: null })
   })
 
+  it('passes over a thread deleted in Harmony without counting it as left out', async () => {
+    const { importer, api, patches, log, j } = setup({ all: [], threadPages: [[thread(T1), thread(T2)]], threadMessages: { [T1]: threadMsgs(800, 2) } })
+    const warn = vi.spyOn(log, 'warn')
+    const info = vi.spyOn(log, 'info')
+    api.importThread.mockRejectedValueOnce(new BridgeApiError('bad thread', 400, 'invalid_thread', { code: 'invalid_thread', reason: 'thread_deleted' }))
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread).toHaveBeenCalledTimes(2)
+    expect(api.postImportMessages).not.toHaveBeenCalled()
+    expect(patches.filter(p => 'threads_done' in p).map(p => p.threads_done)).toEqual([1, 2])
+    expect(info).toHaveBeenCalledWith(expect.stringContaining(`thread ${T1} was deleted in Harmony`))
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('skipping thread'))
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('left out'))
+  })
+
   it('fails the job when the parent channel is lost while looking for a thread starter', async () => {
     const { importer, api, patches, j } = setup({ all: [], threadPages: [[thread(T1), thread(T2)]] })
-    ;((importer as any).deps.hasStarterMessage as ReturnType<typeof vi.fn>).mockRejectedValue(discordError(50001))
+    ;((importer as any).deps.starterMessageAuthor as ReturnType<typeof vi.fn>).mockRejectedValue(discordError(50001))
     expect(await run(importer, j)).toBe('failed')
     expect(api.importThread).not.toHaveBeenCalled()
     expect(patches.at(-1)).toEqual({ state: 'failed', error: 'discord_access_lost' })

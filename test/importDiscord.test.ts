@@ -65,7 +65,7 @@ describe('discordImportAccess.fetchPage', () => {
     const { channel, access } = setup()
     channel.messages = { fetch: vi.fn(async () => new Collection()) }
     await access.fetchPage('c1', undefined)
-    await access.hasStarterMessage('c1', SNOW(5))
+    await access.starterMessageAuthor('c1', SNOW(5))
     expect(channel.messages.fetch.mock.calls.map((c: any[]) => c[0].cache)).toEqual([false, false])
   })
 })
@@ -310,13 +310,13 @@ describe('discordImportAccess threads', () => {
     expect(t.calls).toHaveLength(0)
   })
 
-  it('hasStarterMessage: true when the message with the thread id exists, false on 10008', async () => {
+  it('starterMessageAuthor: the author of the message with the thread id, null on 10008', async () => {
     const { channel, access } = setup()
-    channel.messages = { fetch: vi.fn(async () => ({ id: '5' })) }
-    expect(await access.hasStarterMessage('c1', '5')).toBe(true)
+    channel.messages = { fetch: vi.fn(async () => ({ id: '5', author: { id: '77' } })) }
+    expect(await access.starterMessageAuthor('c1', '5')).toBe('77')
     channel.messages = { fetch: vi.fn(async () => { throw discordError(10008) }) }
-    expect(await access.hasStarterMessage('c1', '5')).toBe(false)
+    expect(await access.starterMessageAuthor('c1', '5')).toBeNull()
     channel.messages = { fetch: vi.fn(async () => { throw discordError(50001) }) }
-    await expect(access.hasStarterMessage('c1', '5')).rejects.toMatchObject({ code: 50001 })
+    await expect(access.starterMessageAuthor('c1', '5')).rejects.toMatchObject({ code: 50001 })
   })
 })

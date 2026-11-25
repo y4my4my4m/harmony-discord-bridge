@@ -1580,6 +1580,8 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
   const failures: string[] = []
   const keptByHarmony: string[] = []
   const skippedFull: string[] = []
+  /** SOUND_REMOVED (Harmony 1.9.8): a person deleted the copy on Harmony, and it stays deleted. */
+  const leftRemoved: string[] = []
   const counts = { deleted: 0, created: 0, updated: 0, replaced: 0, existing: 0 }
   const applied: DesiredSound[] = []
   let full = false
@@ -1602,6 +1604,8 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
       if (err instanceof HarmonyHttpError && err.code === 'SOUND_LIMIT') {
         full = true
         skippedFull.push(d.name)
+      } else if (isRefusal(err, 'SOUND_REMOVED')) {
+        leftRemoved.push(d.name)
       } else {
         failures.push(oldDeleted
           ? `${d.name}: the old Harmony sound was deleted but the Discord one could not be copied (${errorText(err)})`
@@ -1658,13 +1662,14 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
       else counts.updated++
       applied.push(d)
     } catch (err) {
-      failures.push(`${d.name}: ${errorText(err)}`)
+      if (isRefusal(err, 'SOUND_REMOVED')) leftRemoved.push(d.name)
+      else failures.push(`${d.name}: ${errorText(err)}`)
     }
   }
 
   const kept = plan.kept.length + keptByHarmony.length
   skippedFull.unshift(...plan.overLimit.map(d => d.name))
-  rt.log.info(`/bridge sync-sounds (${mode}) by ${command.user.id} in guild ${guild.id}: added ${counts.created}, updated ${counts.updated}, replaced ${counts.replaced}, deleted ${counts.deleted}, kept ${kept}, skipped ${skippedFull.length}, failed ${failures.length}`)
+  rt.log.info(`/bridge sync-sounds (${mode}) by ${command.user.id} in guild ${guild.id}: added ${counts.created}, updated ${counts.updated}, replaced ${counts.replaced}, deleted ${counts.deleted}, kept ${kept}, left removed ${leftRemoved.length}, skipped ${skippedFull.length}, failed ${failures.length}`)
 
   const lines = [
     failures.length > 0
@@ -1676,6 +1681,7 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
     `• Deleted: ${counts.deleted}`,
     ...(counts.existing > 0 ? [`• Already there: ${counts.existing}`] : []),
     ...(kept > 0 ? [`• Kept (not copied from Discord): ${kept}`] : []),
+    ...(leftRemoved.length > 0 ? [`• Left removed (a person deleted them on Harmony): ${leftRemoved.length}`] : []),
     ...(plan.outdated > 0 ? [`• Not updated (add mode): ${plan.outdated}; use merge or mirror to update`] : []),
   ]
   lines.push(...namedList(`⚠️ ${skippedFull.length} skipped: the Harmony soundboard is full (${HARMONY_SOUND_LIMIT} sounds per server)`, skippedFull, n => n))
@@ -1854,7 +1860,9 @@ async function syncEmojis(rt: BridgeRuntime, command: ChatInputCommandInteractio
       else if (replacing) counts.replaced++
       else counts.created++
     } catch (err) {
-      failures.push(replacing
+      // Harmony 1.9.8: an emoji an instance admin purged is never copied again.
+      if (isRefusal(err, 'EMOJI_REMOVED')) leftRemoved.push(d.name)
+      else failures.push(replacing
         ? `:${d.name}: the old Harmony emoji was removed but the Discord one could not be copied (${errorLine(err)}); an instance administrator can restore the old one`
         : `:${d.name}: ${errorLine(err)}`)
     }
@@ -2068,7 +2076,13 @@ async function syncStickers(rt: BridgeRuntime, command: ChatInputCommandInteract
 
   const failures: string[] = []
   const keptByHarmony: string[] = []
+  /** STICKER_REMOVED (Harmony 1.9.8): a person deleted the copy on Harmony, and it stays deleted. */
+  const leftRemoved: string[] = []
   const fail = (d: { name: string }, err: unknown, afterRemoval = false) => {
+    if (isRefusal(err, 'STICKER_REMOVED')) {
+      leftRemoved.push(d.name)
+      return
+    }
     let fileReason: string | null = null
     if (err instanceof HarmonyHttpError && err.status === 422 && err.code === 'STICKER_FILE') {
       const reason = String(err.details.reason ?? '')
@@ -2145,7 +2159,7 @@ async function syncStickers(rt: BridgeRuntime, command: ChatInputCommandInteract
   }
 
   const kept = plan.kept.length + keptByHarmony.length
-  rt.log.info(`/bridge sync-stickers (${mode}) by ${command.user.id} in guild ${guild.id}: added ${counts.created}, updated ${counts.updated}, restored ${counts.restored}, replaced ${counts.replaced}, removed ${counts.removed}, kept ${kept}, failed ${failures.length}`)
+  rt.log.info(`/bridge sync-stickers (${mode}) by ${command.user.id} in guild ${guild.id}: added ${counts.created}, updated ${counts.updated}, restored ${counts.restored}, replaced ${counts.replaced}, removed ${counts.removed}, kept ${kept}, left removed ${leftRemoved.length}, failed ${failures.length}`)
 
   const lines = [
     failures.length > 0
@@ -2158,6 +2172,7 @@ async function syncStickers(rt: BridgeRuntime, command: ChatInputCommandInteract
     `• Removed: ${counts.removed}`,
     ...(counts.existing > 0 ? [`• Already there: ${counts.existing}`] : []),
     ...(kept > 0 ? [`• Kept (not copied from Discord): ${kept}`] : []),
+    ...(leftRemoved.length > 0 ? [`• Left removed (a person deleted them on Harmony): ${leftRemoved.length}`] : []),
     ...(plan.outdated > 0 ? [`• Not updated (add mode): ${plan.outdated}; use merge or mirror to update`] : []),
     ...skipLines(),
   ]

@@ -75,8 +75,11 @@ export interface HistoryImporterDeps {
    * importer and records which list it is in and the `before` timestamp; null starts from the top.
    */
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
-  /** Whether the thread was started from a message of the channel, i.e. a message with the thread's id exists. */
-  hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
+  /**
+   * The Discord id of the author of the channel's message the thread was started from (the
+   * message with the thread's id); null when the thread has none.
+   */
+  starterMessageAuthor(channelId: string, threadId: string): Promise<string | null>
   /** A thread of the channel by id; null when it is gone, private or another channel's. */
   fetchThread?(channelId: string, threadId: string): Promise<ImportThreadLike | null>
   /** Who started the thread, as Harmony gets it. Rejects when Discord could not say. */
@@ -179,7 +182,8 @@ const NO_PINS: ReadonlySet<string> = new Set()
 
 /** A thread's own Discord history is unreachable (deleted, no access): skip that thread, keep the job. */
 class ThreadSkip extends Error {
-  constructor(readonly reason: string) {
+  /** `deleted`: a person deleted the thread's Harmony copy; the skip is the intended outcome. */
+  constructor(readonly reason: string, readonly deleted = false) {
     super(`thread skipped: ${reason}`)
   }
 }
@@ -346,6 +350,10 @@ export class HistoryImporter {
         await this.importThread(run, thread, resumeBefore, walkedFor(thread.id))
       } catch (error) {
         if (!(error instanceof ThreadSkip)) throw error
+        if (error.deleted) {
+          log.info(`History import ${job.id}: thread ${thread.id} was deleted in Harmony; not importing it again`)
+          return
+        }
         run.threadsSkipped++
         log.warn(`History import ${job.id}: skipping thread ${thread.id} (${error.reason}); ${run.threadsSkipped} skipped so far`)
       }
@@ -451,7 +459,7 @@ export class HistoryImporter {
     const { job, signal } = run
     const channelId = job.discord_channel_id
     // A read of the parent channel: losing access there ends the job, not this thread.
-    const hasStarter = await this.discordCall(run, () => this.deps.hasStarterMessage(channelId, thread.id))
+    const starterAuthor = await this.discordCall(run, () => this.deps.starterMessageAuthor(channelId, thread.id))
     const starter = await this.discordCall(run, () => this.deps.threadStarter(thread))
     const invalidThread = (e: BridgeApiError) => e.status === 400 && e.code === 'invalid_thread'
     let harmonyThreadId: string
@@ -460,13 +468,20 @@ export class HistoryImporter {
         discord_thread_id: thread.id,
         name: starter.plainTitle ? 'Thread' : threadName(thread.name),
         created_at: (thread.createdAt ?? snowflakeTime(thread.id)).toISOString(),
-        starter_discord_message_id: hasStarter ? thread.id : null,
+        starter_discord_message_id: starterAuthor !== null ? thread.id : null,
+        // Discord titles a thread on a message from the message: Harmony 1.9.8 weighs its author's
+        // opt-out when the import left the message out.
+        starter_discord_user_id: starterAuthor,
         discord_user: starter.discordUser,
         archived: thread.archived ?? false,
         locked: thread.locked ?? false,
       }, { signal }), invalidThread)
     } catch (error) {
-      if (error instanceof BridgeApiError && invalidThread(error)) throw new ThreadSkip('Harmony refused the thread')
+      if (error instanceof BridgeApiError && invalidThread(error)) {
+        // Harmony 1.9.8: a thread a person deleted there answers invalid_thread with this reason.
+        if (error.details.reason === 'thread_deleted') throw new ThreadSkip('deleted in Harmony', true)
+        throw new ThreadSkip('Harmony refused the thread')
+      }
       throw error
     }
     // A thread starts below the recency cutoff, or below where an earlier run's walk stopped.

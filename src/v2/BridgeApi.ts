@@ -163,6 +163,8 @@ export interface ImportThreadBody {
   name: string
   created_at: string
   starter_discord_message_id?: string | null
+  /** Author of the starter message; Harmony 1.9.8 titles the thread Thread for an opted-out one. */
+  starter_discord_user_id?: string | null
   discord_user?: Record<string, unknown> | null
   archived: boolean
   locked: boolean

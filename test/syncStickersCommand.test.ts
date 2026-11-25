@@ -249,6 +249,18 @@ describe('runBridgeSyncStickers', () => {
     expect(text).not.toContain('failure')
   })
 
+  it('a sticker a person deleted on Harmony is left removed, on create and on restore, not a failure', async () => {
+    const t = setup({ mode: 'merge', discord: [dSticker('1', 'wave'), dSticker('2', 'nod')], harmony: [hRow('h2', 'nod', '2', true)] })
+    t.rt.harmony.importDiscordSticker.mockRejectedValue(
+      new HarmonyHttpError('STICKER_REMOVED: a person deleted this sticker on Harmony', 403, 'STICKER_REMOVED'),
+    )
+    await runBridgeSyncStickers(t.rt, t.command)
+    const text = last(t)
+    expect(text.startsWith('✅')).toBe(true)
+    expect(text).toContain('• Left removed (a person deleted them on Harmony): 2')
+    expect(text).not.toContain('failure')
+  })
+
   it('a mirror replace whose create is file-refused is a failure naming the removal', async () => {
     const t = setup({ mode: 'mirror', discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn', '9')] })
     t.rt.harmony.importDiscordSticker.mockRejectedValue(

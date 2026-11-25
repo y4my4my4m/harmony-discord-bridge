@@ -20,7 +20,19 @@ export interface ThreadAnchor {
   remove(): Promise<unknown>
 }
 
-type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId' | 'type'>
+type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId' | 'type'> & {
+  createdTimestamp?: number | null
+}
+
+/** Discord's epoch, 2015-01-01T00:00:00Z, in Unix ms: a snowflake holds ms since it above bit 22. */
+const DISCORD_EPOCH_MS = 1420070400000n
+
+/** When a Discord thread was created: Discord's timestamp, or its id's time for threads before 2022. */
+function threadCreatedAt(thread: DiscordThreadLike): string | null {
+  if (typeof thread.createdTimestamp === 'number') return new Date(thread.createdTimestamp).toISOString()
+  if (!/^[0-9]{1,20}$/.test(thread.id)) return null
+  return new Date(Number((BigInt(thread.id) >> 22n) + DISCORD_EPOCH_MS)).toISOString()
+}
 
 /**
  * Whether threads can exist in a Discord channel. Voice and stage channels have a text chat
@@ -44,6 +56,8 @@ export interface ThreadSyncDeps {
   harmony: Pick<HarmonyClient, 'createThread' | 'lookupThreadByDiscordId' | 'getThread' | 'pairThread'>
   /** The Harmony discord_user of the member who started a Discord thread, or null. */
   threadStarter?(thread: DiscordThreadLike): Promise<Record<string, unknown> | null>
+  /** The Discord id of the author of the message a Discord thread starts on, or null. */
+  starterMessageAuthor?(thread: DiscordThreadLike): Promise<string | null>
   /** Posts a standalone thread's starting message as `author`; null when it cannot. */
   postAnchor?(parent: TextChannel, author: ThreadAuthor): Promise<ThreadAnchor | null>
   /** The Harmony message a Discord message was bridged to, or null. */
@@ -105,11 +119,19 @@ export class ThreadSync {
       }
       let starter = await this.deps.harmonyMessageFor(thread.id, harmonyChannelId)
       const discordUser = await this.deps.threadStarter?.(thread).catch(() => null) ?? null
-      const create = (messageId: string | null) => this.deps.harmony.createThread(harmonyChannelId, threadName(thread.name), {
-        messageId,
-        discordThreadId: thread.id,
-        ...(discordUser ? { discordUser } : {}),
-      })
+      const createdAt = threadCreatedAt(thread)
+      // Discord titles a thread on a message from the message. Its Harmony copy names its author;
+      // a message the bridge left out (an opted-out author's) is named here.
+      const create = async (messageId: string | null) => {
+        const starterDiscordUserId = messageId ? null : await this.deps.starterMessageAuthor?.(thread).catch(() => null) ?? null
+        return this.deps.harmony.createThread(harmonyChannelId, threadName(thread.name), {
+          messageId,
+          discordThreadId: thread.id,
+          ...(discordUser ? { discordUser } : {}),
+          ...(createdAt ? { createdAt } : {}),
+          ...(starterDiscordUserId ? { starterDiscordUserId } : {}),
+        })
+      }
       let created
       try {
         created = await create(starter)
